@@ -1,0 +1,15 @@
+# 运行时状态文件 (含节点密码, 严禁入库)
+data/*.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 容器/工具产物
+.mimosa/
+.video_agent/
+.zcode/
+.graphflow/
+.taste-skill/

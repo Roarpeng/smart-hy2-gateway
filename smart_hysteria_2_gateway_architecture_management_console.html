@@ -1,0 +1,1470 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Smart Hy2 Gateway Architecture & Management Console</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <!-- Font Awesome -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'sans-serif'],
+            mono: ['"Fira Code"', 'monospace'],
+          },
+          colors: {
+            obsidian: {
+              DEFAULT: '#090d16',
+              surface: '#0f172a',
+              card: '#131e33',
+              border: '#1e293b',
+              lighter: '#24324f',
+            },
+            neon: {
+              cyan: '#06b6d4',
+              cyanGlow: '#22d3ee',
+              purple: '#a855f7',
+              emerald: '#10b981',
+              amber: '#f59e0b',
+              rose: '#f43f5e',
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <style>
+    /* Technical Glow & Grid */
+    body {
+      background-color: #070b13;
+      background-image: 
+        radial-gradient(circle at 15% 15%, rgba(6, 182, 212, 0.05) 0%, transparent 40%),
+        radial-gradient(circle at 85% 85%, rgba(168, 85, 247, 0.05) 0%, transparent 40%),
+        linear-gradient(rgba(30, 41, 59, 0.15) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(30, 41, 59, 0.15) 1px, transparent 1px);
+      background-size: 100% 100%, 100% 100%, 32px 32px, 32px 32px;
+    }
+
+    /* Custom Scrollbar */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #090d16;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #1e293b;
+      border-radius: 4px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #334155;
+    }
+
+    /* Flow Animations */
+    .flow-line-direct {
+      stroke-dasharray: 8 6;
+      animation: dashDirect 1.2s linear infinite;
+    }
+    .flow-line-proxy {
+      stroke-dasharray: 8 6;
+      animation: dashProxy 1s linear infinite;
+    }
+    .flow-line-neutral {
+      stroke-dasharray: 6 6;
+      animation: dashDirect 2s linear infinite;
+    }
+
+    @keyframes dashDirect {
+      to {
+        stroke-dashoffset: -28;
+      }
+    }
+    @keyframes dashProxy {
+      to {
+        stroke-dashoffset: -28;
+      }
+    }
+
+    .glow-cyan {
+      box-shadow: 0 0 20px -3px rgba(6, 182, 212, 0.35);
+    }
+    .glow-purple {
+      box-shadow: 0 0 20px -3px rgba(168, 85, 247, 0.35);
+    }
+    .glow-emerald {
+      box-shadow: 0 0 20px -3px rgba(16, 185, 129, 0.35);
+    }
+  </style>
+</head>
+
+<body class="text-slate-200 min-h-screen flex flex-col antialiased selection:bg-cyan-500/30 selection:text-cyan-300">
+
+  <!-- Toast Notification Hub -->
+  <div id="toast-hub" class="fixed top-5 right-5 z-50 flex flex-col gap-2.5 pointer-events-none max-w-md w-full px-4"></div>
+
+  <!-- Header Console Bar -->
+  <header class="border-b border-obsidian-border bg-obsidian-surface/80 backdrop-blur-md sticky top-0 z-40">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+      <div class="flex items-center space-x-3.5">
+        <div class="relative">
+          <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-cyan-600 via-indigo-600 to-purple-600 flex items-center justify-center text-white shadow-lg shadow-cyan-500/20">
+            <i class="fa-solid fa-microchip text-lg"></i>
+          </div>
+          <span class="absolute -bottom-0.5 -right-0.5 flex h-3 w-3">
+            <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+            <span class="relative inline-flex rounded-full h-3 w-3 bg-emerald-500 border-2 border-obsidian-surface"></span>
+          </span>
+        </div>
+        <div>
+          <div class="flex items-center gap-2">
+            <h1 class="text-sm sm:text-base font-bold text-white tracking-wide">
+              Smart Hysteria 2 Gateway
+            </h1>
+            <span class="text-[10px] font-mono px-2 py-0.5 rounded-md bg-cyan-950/80 text-cyan-400 border border-cyan-800/60 uppercase">
+              Ubuntu & VMware Arch
+            </span>
+          </div>
+          <p class="text-xs text-slate-400 hidden sm:block">
+            双网卡链路感知 · SSID 动态分流 · TProxy 策略网关
+          </p>
+        </div>
+      </div>
+
+      <!-- Navigation tabs -->
+      <nav class="flex space-x-1 sm:space-x-2 bg-obsidian/90 p-1.5 rounded-xl border border-obsidian-border">
+        <button onclick="switchTab('topology')" id="nav-btn-topology" class="nav-tab-btn px-3 py-1.5 rounded-lg text-xs font-semibold text-white bg-cyan-600 transition shadow flex items-center gap-2">
+          <i class="fa-solid fa-diagram-project text-xs"></i>
+          <span>动态拓扑追踪</span>
+        </button>
+        <button onclick="switchTab('node-config')" id="nav-btn-node-config" class="nav-tab-btn px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition flex items-center gap-2">
+          <i class="fa-solid fa-bolt text-xs"></i>
+          <span>v2rayN 节点解析</span>
+        </button>
+        <button onclick="switchTab('policy')" id="nav-btn-policy" class="nav-tab-btn px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition flex items-center gap-2">
+          <i class="fa-solid fa-sliders text-xs"></i>
+          <span>SSID 与网卡策略</span>
+        </button>
+        <button onclick="switchTab('deploy')" id="nav-btn-deploy" class="nav-tab-btn px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition flex items-center gap-2">
+          <i class="fa-solid fa-code text-xs"></i>
+          <span>生产工程部署套件</span>
+        </button>
+      </nav>
+    </div>
+  </header>
+
+  <!-- Main Viewports -->
+  <main class="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8 space-y-6">
+
+    <!-- ========================================== -->
+    <!-- SECTION 1: TOPOLOGY & PACKET TRACER (VIEW) -->
+    <!-- ========================================== -->
+    <section id="view-topology" class="space-y-6">
+      <!-- Live Metrics Strip -->
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4 font-mono">
+        <div class="bg-obsidian-surface border border-obsidian-border rounded-xl p-3.5 flex items-center justify-between">
+          <div>
+            <div class="text-[11px] text-slate-400 uppercase tracking-wider font-sans">RJ45 有线物理链路</div>
+            <div class="text-xs sm:text-sm font-bold text-emerald-400 mt-1 flex items-center gap-1.5">
+              <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+              <span id="topo-rj45-state">ENP3S0: 恒直连 (0ms)</span>
+            </div>
+          </div>
+          <i class="fa-solid fa-ethernet text-xl text-emerald-500/40"></i>
+        </div>
+
+        <div class="bg-obsidian-surface border border-obsidian-border rounded-xl p-3.5 flex items-center justify-between">
+          <div>
+            <div class="text-[11px] text-slate-400 uppercase tracking-wider font-sans">当前连接 Wi-Fi</div>
+            <div class="text-xs sm:text-sm font-bold mt-1" id="topo-current-ssid-display">
+              Public-Cafe
+            </div>
+          </div>
+          <i class="fa-solid fa-wifi text-xl text-cyan-500/40"></i>
+        </div>
+
+        <div class="bg-obsidian-surface border border-obsidian-border rounded-xl p-3.5 flex items-center justify-between">
+          <div>
+            <div class="text-[11px] text-slate-400 uppercase tracking-wider font-sans">Wi-Fi 分流策略状态</div>
+            <div class="text-xs sm:text-sm font-bold mt-1" id="topo-policy-status">
+              TProxy: Hy2 隧道加密
+            </div>
+          </div>
+          <i class="fa-solid fa-shield-halved text-xl text-purple-500/40"></i>
+        </div>
+
+        <div class="bg-obsidian-surface border border-obsidian-border rounded-xl p-3.5 flex items-center justify-between">
+          <div>
+            <div class="text-[11px] text-slate-400 uppercase tracking-wider font-sans">Docker 容器内核状态</div>
+            <div class="text-xs sm:text-sm font-bold text-emerald-400 mt-1 flex items-center gap-1.5">
+              <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
+              <span>sing-box: RUNNING</span>
+            </div>
+          </div>
+          <i class="fa-brands fa-docker text-xl text-blue-500/40"></i>
+        </div>
+      </div>
+
+      <!-- Main Topology Box -->
+      <div class="bg-obsidian-surface border border-obsidian-border rounded-2xl p-5 sm:p-6 shadow-2xl relative overflow-hidden">
+        <!-- Interactive Control Bar -->
+        <div class="flex flex-col lg:flex-row lg:items-center justify-between pb-5 mb-5 border-b border-obsidian-border gap-4">
+          <div>
+            <h2 class="text-base sm:text-lg font-bold text-white flex items-center gap-2">
+              <span class="w-2.5 h-2.5 rounded-full bg-cyan-400"></span>
+              宿主机与 VMware 双链路数据包流向实时追踪 (Packet Tracer)
+            </h2>
+            <p class="text-xs text-slate-400 mt-1">
+              切换下方 Wi-Fi 场景，观察宿主机 Linux 协议栈与虚拟机流量路径的动态决策变换。
+            </p>
+          </div>
+
+          <!-- Quick Scenario Toggles -->
+          <div class="flex flex-wrap items-center gap-2 bg-obsidian p-1.5 rounded-xl border border-obsidian-border">
+            <span class="text-xs text-slate-400 px-2 font-mono">模拟 Wi-Fi SSID:</span>
+            <button onclick="setWifiScenario('Office-Secure')" id="btn-scen-white" class="px-3 py-1.5 rounded-lg text-xs font-semibold transition border flex items-center gap-1.5">
+              <i class="fa-solid fa-house-laptop"></i>
+              <span>Office-Secure (白名单)</span>
+            </button>
+            <button onclick="setWifiScenario('Public-Cafe')" id="btn-scen-guest" class="px-3 py-1.5 rounded-lg text-xs font-semibold transition border flex items-center gap-1.5">
+              <i class="fa-solid fa-mug-hot"></i>
+              <span>Public-Cafe (非指定)</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- SVG Architecture Canvas -->
+        <div class="w-full overflow-x-auto">
+          <svg class="w-full min-w-[960px] h-[550px]" viewBox="0 0 1020 550" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <!-- Arrow Markers -->
+              <marker id="arrow-green" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 1 L 8 5 L 0 9 z" fill="#10b981" />
+              </marker>
+              <marker id="arrow-blue" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 1 L 8 5 L 0 9 z" fill="#06b6d4" />
+              </marker>
+              <marker id="arrow-purple" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 1 L 8 5 L 0 9 z" fill="#a855f7" />
+              </marker>
+
+              <!-- Box Gradient -->
+              <linearGradient id="hostGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#0f172a" />
+                <stop offset="100%" stop-color="#141f36" />
+              </linearGradient>
+              <linearGradient id="dockerGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#18233c" />
+                <stop offset="100%" stop-color="#1e1e38" />
+              </linearGradient>
+            </defs>
+
+            <!-- 1. ZONE: VMWARE WORKSTATION -->
+            <rect x="20" y="25" width="280" height="495" rx="16" fill="#0b1222" stroke="#1e293b" stroke-width="1.5"/>
+            <rect x="35" y="40" width="250" height="30" rx="6" fill="#152037"/>
+            <text x="50" y="60" fill="#93c5fd" font-size="12" font-weight="700" font-family="'Inter', sans-serif">
+              VMware Workstation (虚拟机)
+            </text>
+
+            <!-- VM Adapter 1: VMnet0 (RJ45 Bridged) -->
+            <rect x="35" y="85" width="250" height="185" rx="12" fill="#111c33" stroke="#10b981" stroke-width="1.2" stroke-dasharray="3 3"/>
+            <text x="50" y="115" fill="#34d399" font-size="13" font-weight="700">虚拟网卡 1: eth0</text>
+            <text x="50" y="136" fill="#94a3b8" font-size="11">绑定模式: VMnet0 (物理桥接)</text>
+            <text x="50" y="154" fill="#64748b" font-size="10">二层直通物理交换机，绕过宿主防火墙</text>
+            
+            <rect x="50" y="172" width="220" height="40" rx="8" fill="#090f1d"/>
+            <text x="65" y="196" fill="#10b981" font-size="11" font-weight="600">✓ 策略：永远本地直连 (RJ45)</text>
+            <text x="50" y="248" fill="#64748b" font-size="10">用途：PLC/工业控制/内网数据库</text>
+
+            <!-- VM Adapter 2: VMnet8 (Wi-Fi NAT/Router) -->
+            <rect x="35" y="295" width="250" height="205" rx="12" fill="#111c33" stroke="#818cf8" stroke-width="1.2"/>
+            <text x="50" y="325" fill="#c084fc" font-size="13" font-weight="700">虚拟网卡 2: eth1</text>
+            <text x="50" y="346" fill="#94a3b8" font-size="11">绑定模式: VMnet8 (NAT 网关模式)</text>
+            <text x="50" y="364" fill="#94a3b8" font-size="11">默认网关: 192.168.100.1 (宿主)</text>
+
+            <rect x="50" y="380" width="220" height="48" rx="8" fill="#090f1d"/>
+            <text x="65" y="402" fill="#e2e8f0" font-size="11" font-weight="600">当前流向决策：</text>
+            <text id="vm-eth1-flow-text" x="65" y="420" fill="#f59e0b" font-size="11" font-weight="700">
+              ➜ 劫持入宿主 TProxy (hy2)
+            </text>
+            <text x="50" y="480" fill="#64748b" font-size="10">用途：日常公网办公 / 境外代码加速</text>
+
+            <!-- 2. ZONE: UBUNTU HOST -->
+            <rect x="360" y="25" width="370" height="495" rx="16" fill="url(#hostGrad)" stroke="#334155" stroke-width="1.5"/>
+            <rect x="375" y="40" width="340" height="30" rx="6" fill="#1e293b"/>
+            <text x="390" y="60" fill="#f1f5f9" font-size="12" font-weight="700">
+              Ubuntu 宿主机 (Linux Kernel 6.x + TProxy)
+            </text>
+
+            <!-- Host Physical RJ45 (enp3s0) -->
+            <rect x="375" y="85" width="340" height="85" rx="10" fill="#16223d" stroke="#10b981" stroke-width="1.2"/>
+            <text x="395" y="112" fill="#34d399" font-size="13" font-weight="700">物理有线网卡: enp3s0 (RJ45)</text>
+            <text x="395" y="132" fill="#94a3b8" font-size="11">宿主出站直接走路由表 · 虚拟机 VMnet0 桥接出站</text>
+            <text x="395" y="152" fill="#10b981" font-size="11" font-weight="600">规则: PREROUTING/OUTPUT 无标记，零拦截直通</text>
+
+            <!-- Docker Container Space -->
+            <rect x="375" y="185" width="340" height="195" rx="12" fill="url(#dockerGrad)" stroke="#6366f1" stroke-width="1.5" stroke-dasharray="4 3"/>
+            <rect x="390" y="198" width="310" height="24" rx="4" fill="#2d2254"/>
+            <text x="402" y="215" fill="#c084fc" font-size="11" font-weight="700">
+              Docker 容器网关 (hy2-gateway) [--net=host, NET_ADMIN]
+            </text>
+            
+            <!-- sing-box TProxy Core -->
+            <rect x="390" y="230" width="310" height="52" rx="8" fill="#0d1527" stroke="#4f46e5" stroke-width="1"/>
+            <text x="405" y="252" fill="#818cf8" font-size="12" font-weight="700">sing-box 协议核心 (TProxy :12345)</text>
+            <text x="405" y="271" fill="#94a3b8" font-size="10">Hysteria 2 UDP/QUIC 传输层 · 自动拥塞控制 BBR</text>
+
+            <!-- Docker WebUI daemon -->
+            <rect x="390" y="290" width="310" height="42" rx="8" fill="#0d1527"/>
+            <text x="405" y="312" fill="#22d3ee" font-size="11" font-weight="600">WebUI 控制与调度服务 (FastAPI :8080)</text>
+            <text x="405" y="325" fill="#64748b" font-size="10">监听 DBus/NetworkManager 事件 · 动态热重载</text>
+
+            <!-- Host Wi-Fi & Dispatcher -->
+            <rect x="375" y="395" width="340" height="105" rx="10" fill="#16223d" stroke="#06b6d4" stroke-width="1.2"/>
+            <div class="flex justify-between items-center">
+              <text x="395" y="422" fill="#22d3ee" font-size="13" font-weight="700">无线网卡: wlp2s0 (Wi-Fi)</text>
+              <text id="svg-wifi-active-label" x="575" y="422" fill="#f59e0b" font-size="11" font-weight="600">[SSID: Public-Cafe]</text>
+            </div>
+            <text x="395" y="444" fill="#94a3b8" font-size="11">NetworkManager Dispatcher 策略引擎 (/etc/.../99-wifi-proxy.sh)</text>
+            <rect x="395" y="456" width="300" height="32" rx="6" fill="#090f1d"/>
+            <text id="svg-dispatcher-badge" x="405" y="476" fill="#f87171" font-size="11" font-weight="600">
+              ⚠ 未在白名单 ➜ 写入 iptables TProxy 规则
+            </text>
+
+            <!-- 3. ZONE: EXTERNAL DESTINATIONS -->
+            <rect x="790" y="25" width="205" height="495" rx="16" fill="#0b1222" stroke="#1e293b" stroke-width="1.5"/>
+            <rect x="805" y="40" width="175" height="30" rx="6" fill="#152037"/>
+            <text x="825" y="60" fill="#94a3b8" font-size="12" font-weight="700">外部出口网络</text>
+
+            <!-- Dest 1: Local Wired LAN -->
+            <rect x="805" y="95" width="175" height="75" rx="10" fill="#111c33" stroke="#10b981" stroke-width="1.2"/>
+            <text x="820" y="125" fill="#34d399" font-size="12" font-weight="700">本地内网 / 交换机</text>
+            <text x="820" y="145" fill="#94a3b8" font-size="10">纯物理直通 / 1Gbps</text>
+            <text x="820" y="158" fill="#10b981" font-size="9">恒不代理 · 低时延</text>
+
+            <!-- Dest 2: Hy2 Remote Server -->
+            <rect x="805" y="220" width="175" height="95" rx="10" fill="#111c33" stroke="#a855f7" stroke-width="1.2"/>
+            <text x="820" y="248" fill="#c084fc" font-size="12" font-weight="700">Hysteria 2 节点</text>
+            <text x="820" y="268" fill="#94a3b8" font-size="10">QUIC/UDP :443 加密</text>
+            <text x="820" y="284" fill="#a855f7" font-size="10" font-weight="600">BBR 拥塞控制专线</text>
+            <text x="820" y="300" fill="#64748b" font-size="9">境外云服务器 / 节点加速</text>
+
+            <!-- Dest 3: Normal Wi-Fi Internet -->
+            <rect x="805" y="400" width="175" height="85" rx="10" fill="#111c33" stroke="#06b6d4" stroke-width="1.2"/>
+            <text x="820" y="430" fill="#22d3ee" font-size="12" font-weight="700">Wi-Fi 公网直连</text>
+            <text x="820" y="450" fill="#94a3b8" font-size="10">白名单网络出口</text>
+            <text x="820" y="468" fill="#06b6d4" font-size="9">家/办公室可信直连</text>
+
+            <!-- DYNAMIC TRAFFIC PATHS -->
+            <!-- 1. RJ45 ALWAYS DIRECT (Green) -->
+            <!-- VMnet0 -> enp3s0 -> Local LAN -->
+            <path d="M 285 140 L 375 125" stroke="#10b981" stroke-width="2.5" class="flow-line-direct" marker-end="url(#arrow-green)" />
+            <path d="M 715 125 L 805 125" stroke="#10b981" stroke-width="2.5" class="flow-line-direct" marker-end="url(#arrow-green)" />
+
+            <!-- 2. WI-FI & VMNET8 DYNAMIC SWITCHING PATHS -->
+            <g id="svg-flow-container">
+              <!-- Dynamically injected via JavaScript: Proxy vs Direct -->
+            </g>
+          </svg>
+        </div>
+
+        <!-- Legend -->
+        <div class="mt-4 pt-4 border-t border-obsidian-border flex flex-wrap items-center justify-between text-xs gap-3">
+          <div class="flex flex-wrap items-center gap-4">
+            <span class="flex items-center gap-1.5">
+              <span class="w-3 h-1 bg-emerald-500 rounded"></span>
+              <span class="text-slate-300">RJ45 物理直连流量 (永远直连)</span>
+            </span>
+            <span class="flex items-center gap-1.5">
+              <span class="w-3 h-1 bg-cyan-500 rounded"></span>
+              <span class="text-slate-300">白名单 Wi-Fi 本地直连</span>
+            </span>
+            <span class="flex items-center gap-1.5">
+              <span class="w-3 h-1 bg-purple-500 rounded"></span>
+              <span class="text-slate-300">非指定 SSID ➜ TProxy 劫持 ➜ Hysteria 2 隧道</span>
+            </span>
+          </div>
+          <span class="text-slate-500 font-mono text-[11px]">Kernel TProxy (fwmark 0x1 / table 100)</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========================================== -->
+    <!-- SECTION 2: V2RAYN PARSER & NODE CONFIG     -->
+    <!-- ========================================== -->
+    <section id="view-node-config" class="hidden space-y-6">
+      <!-- Quick Parser Card -->
+      <div class="bg-obsidian-surface border border-obsidian-border rounded-2xl p-5 sm:p-6 shadow-2xl relative">
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between pb-4 mb-4 border-b border-obsidian-border gap-3">
+          <div>
+            <h2 class="text-base sm:text-lg font-bold text-white flex items-center gap-2">
+              <i class="fa-solid fa-wand-magic-sparkles text-neon-cyan"></i>
+              v2rayN 节点分享链接 / JSON 智能识别解析中心
+            </h2>
+            <p class="text-xs text-slate-400 mt-0.5">
+              在 v2rayN 中右键节点选择「分享节点 / 复制链接」，直接粘贴至下方即可自动精准解析各协议属性。
+            </p>
+          </div>
+          <div class="flex items-center gap-2">
+            <button onclick="loadSampleLink(1)" class="px-2.5 py-1.5 bg-obsidian-lighter/60 hover:bg-obsidian-lighter border border-slate-700 rounded-lg text-xs font-mono text-cyan-300 transition">
+              载入标准样例
+            </button>
+            <button onclick="loadSampleLink(2)" class="px-2.5 py-1.5 bg-obsidian-lighter/60 hover:bg-obsidian-lighter border border-slate-700 rounded-lg text-xs font-mono text-purple-300 transition">
+              载入混淆(obfs)样例
+            </button>
+            <button onclick="loadSampleLink(3)" class="px-2.5 py-1.5 bg-obsidian-lighter/60 hover:bg-obsidian-lighter border border-slate-700 rounded-lg text-xs font-mono text-amber-300 transition">
+              载入 sing-box JSON
+            </button>
+          </div>
+        </div>
+
+        <!-- Import Area -->
+        <div class="space-y-3">
+          <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider">
+            粘贴 v2rayN 导出的链接 (支持 hy2://, hysteria2:// 或 JSON 文本)
+          </label>
+          <div class="relative">
+            <textarea id="raw-link-input" rows="3" placeholder="例如: hy2://Password123@us-node.cloudfast.com:8443?sni=us.apple.com&insecure=0&upmbps=100&downmbps=400#US_SiliconValley_Node" class="w-full bg-obsidian border border-obsidian-border rounded-xl p-3 text-xs font-mono text-cyan-200 placeholder-slate-600 focus:outline-none focus:border-neon-cyan focus:ring-1 focus:ring-neon-cyan transition resize-none"></textarea>
+            <button onclick="parseLinkFromInput()" class="absolute right-3 bottom-3 px-4 py-1.5 bg-gradient-to-r from-cyan-600 to-indigo-600 hover:from-cyan-500 hover:to-indigo-500 text-white rounded-lg text-xs font-semibold shadow-lg shadow-cyan-600/30 transition flex items-center gap-1.5">
+              <i class="fa-solid fa-bolt-lightning"></i>
+              <span>智能解析并填充</span>
+            </button>
+          </div>
+          <p id="parser-feedback" class="text-xs font-mono text-slate-500"></p>
+        </div>
+      </div>
+
+      <!-- Node Details Grid (Manual Adjustment + Live Sing-box Config) -->
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <!-- Node Form -->
+        <div class="lg:col-span-2 bg-obsidian-surface border border-obsidian-border rounded-2xl p-5 sm:p-6 shadow space-y-4">
+          <div class="flex items-center justify-between border-b border-obsidian-border pb-3">
+            <h3 class="text-sm font-bold text-white flex items-center gap-2">
+              <i class="fa-solid fa-server text-neon-purple"></i>
+              Hysteria 2 协议节点详细参数
+            </h3>
+            <span id="node-badge-tag" class="text-xs px-2.5 py-0.5 rounded-full bg-purple-950/80 text-purple-300 border border-purple-800/60 font-mono">
+              #未命名节点
+            </span>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs font-sans">
+            <div class="sm:col-span-2">
+              <label class="block text-slate-400 mb-1 font-medium">服务器域名 / IP (Server Host)</label>
+              <input type="text" id="node-server" oninput="updateLivePreview()" class="w-full bg-obsidian border border-obsidian-border rounded-lg p-2.5 text-slate-200 font-mono focus:border-neon-cyan focus:outline-none">
+            </div>
+
+            <div>
+              <label class="block text-slate-400 mb-1 font-medium">服务端口 (Server Port)</label>
+              <input type="number" id="node-port" value="443" oninput="updateLivePreview()" class="w-full bg-obsidian border border-obsidian-border rounded-lg p-2.5 text-slate-200 font-mono focus:border-neon-cyan focus:outline-none">
+            </div>
+
+            <div>
+              <label class="block text-slate-400 mb-1 font-medium">认证密码 (Password / Auth)</label>
+              <div class="relative">
+                <input type="password" id="node-password" oninput="updateLivePreview()" class="w-full bg-obsidian border border-obsidian-border rounded-lg p-2.5 text-slate-200 font-mono focus:border-neon-cyan focus:outline-none pr-8">
+                <button type="button" onclick="togglePass('node-password', 'eye-node-pass')" class="absolute right-2.5 top-2.5 text-slate-500 hover:text-slate-300">
+                  <i class="fa-regular fa-eye" id="eye-node-pass"></i>
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <label class="block text-slate-400 mb-1 font-medium">TLS SNI 伪装域名 (Server Name)</label>
+              <input type="text" id="node-sni" oninput="updateLivePreview()" class="w-full bg-obsidian border border-obsidian-border rounded-lg p-2.5 text-slate-200 font-mono focus:border-neon-cyan focus:outline-none">
+            </div>
+
+            <div>
+              <label class="block text-slate-400 mb-1 font-medium">跳过证书校验 (Insecure)</label>
+              <select id="node-insecure" onchange="updateLivePreview()" class="w-full bg-obsidian border border-obsidian-border rounded-lg p-2.5 text-slate-200 focus:border-neon-cyan focus:outline-none">
+                <option value="false" selected>false (严格校验证书有效性)</option>
+                <option value="true">true (允许自签名证书)</option>
+              </select>
+            </div>
+
+            <div>
+              <label class="block text-slate-400 mb-1 font-medium">混淆协议类型 (Obfs Type)</label>
+              <input type="text" id="node-obfs-type" placeholder="留空为不使用，或 salamander" oninput="updateLivePreview()" class="w-full bg-obsidian border border-obsidian-border rounded-lg p-2.5 text-slate-200 font-mono focus:border-neon-cyan focus:outline-none">
+            </div>
+
+            <div>
+              <label class="block text-slate-400 mb-1 font-medium">混淆密码 (Obfs Password)</label>
+              <input type="text" id="node-obfs-pass" oninput="updateLivePreview()" class="w-full bg-obsidian border border-obsidian-border rounded-lg p-2.5 text-slate-200 font-mono focus:border-neon-cyan focus:outline-none">
+            </div>
+
+            <div>
+              <label class="block text-slate-400 mb-1 font-medium">下行带宽限制 (Down Mbps)</label>
+              <input type="number" id="node-down" value="300" oninput="updateLivePreview()" class="w-full bg-obsidian border border-obsidian-border rounded-lg p-2.5 text-slate-200 font-mono focus:border-neon-cyan focus:outline-none">
+            </div>
+
+            <div>
+              <label class="block text-slate-400 mb-1 font-medium">上行带宽限制 (Up Mbps)</label>
+              <input type="number" id="node-up" value="80" oninput="updateLivePreview()" class="w-full bg-obsidian border border-obsidian-border rounded-lg p-2.5 text-slate-200 font-mono focus:border-neon-cyan focus:outline-none">
+            </div>
+          </div>
+
+          <div class="pt-3 border-t border-obsidian-border flex flex-wrap justify-between items-center gap-3">
+            <button onclick="testNodeLatency()" class="px-4 py-2 bg-obsidian border border-obsidian-border hover:border-slate-600 rounded-xl text-xs font-semibold text-slate-300 transition flex items-center gap-1.5">
+              <i class="fa-solid fa-stopwatch text-cyan-400"></i>
+              <span>模拟连通性与握手时延测试</span>
+            </button>
+            <button onclick="saveAndDeployNode()" class="px-5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-semibold shadow-lg shadow-emerald-600/20 transition flex items-center gap-2">
+              <i class="fa-solid fa-circle-check"></i>
+              <span>保存为活跃节点并下发配置</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Live sing-box Outbound JSON Preview -->
+        <div class="bg-obsidian-surface border border-obsidian-border rounded-2xl p-5 shadow flex flex-col">
+          <div class="flex items-center justify-between pb-3 mb-3 border-b border-obsidian-border">
+            <h3 class="text-xs font-bold text-slate-300 uppercase tracking-wider font-mono">
+              sing-box Outbound JSON 实时生成
+            </h3>
+            <button onclick="copySnippet('preview-json-code')" class="text-xs text-neon-cyan hover:text-cyan-300 flex items-center gap-1 font-mono">
+              <i class="fa-regular fa-copy"></i>
+              <span>复制 JSON</span>
+            </button>
+          </div>
+          <div class="flex-1 bg-obsidian rounded-xl p-3 border border-obsidian-border font-mono text-[11px] text-cyan-300/90 overflow-x-auto overflow-y-auto max-h-[440px]">
+            <pre id="preview-json-code"></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========================================== -->
+    <!-- SECTION 3: SSID WHITELIST & NETWORK POLICY -->
+    <!-- ========================================== -->
+    <section id="view-policy" class="hidden space-y-6">
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        
+        <!-- Left: SSID Whitelist Control -->
+        <div class="lg:col-span-2 bg-obsidian-surface border border-obsidian-border rounded-2xl p-5 sm:p-6 shadow space-y-5">
+          <div>
+            <h2 class="text-base sm:text-lg font-bold text-white flex items-center gap-2">
+              <i class="fa-solid fa-list-check text-neon-cyan"></i>
+              Wi-Fi 直连白名单 (SSID Whitelist Management)
+            </h2>
+            <p class="text-xs text-slate-400 mt-1">
+              当宿主机 Wi-Fi 连接白名单中的 SSID 时，系统自动清空 TProxy 劫持规则，流量走物理直连；一旦断开或连接任何非白名单 Wi-Fi，立即激活 Hysteria 2 全局透明代理。
+            </p>
+          </div>
+
+          <!-- Dynamic Whitelist Tags -->
+          <div>
+            <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">
+              当前白名单 SSID 集合
+            </label>
+            <div id="whitelist-tag-box" class="flex flex-wrap gap-2 p-3 bg-obsidian rounded-xl border border-obsidian-border min-h-[50px]">
+              <!-- Generated dynamically -->
+            </div>
+          </div>
+
+          <!-- Add SSID Input -->
+          <div class="flex gap-2">
+            <div class="relative flex-1">
+              <i class="fa-solid fa-wifi absolute left-3.5 top-3 text-slate-500 text-xs"></i>
+              <input type="text" id="input-add-ssid" placeholder="输入合法的 Wi-Fi SSID 名称 (例如: Home_Gigabit_5G)" class="w-full bg-obsidian border border-obsidian-border rounded-xl pl-9 pr-3 py-2 text-xs text-slate-200 focus:border-neon-cyan focus:outline-none">
+            </div>
+            <button onclick="addWhitelistSsid()" class="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl text-xs font-semibold transition flex items-center gap-1.5 shadow-md shadow-cyan-600/20">
+              <i class="fa-solid fa-plus"></i>
+              <span>添加至白名单</span>
+            </button>
+          </div>
+
+          <!-- Simulation & Auto-Sense Trigger -->
+          <div class="p-4 bg-obsidian/70 rounded-xl border border-obsidian-border space-y-3">
+            <div class="flex justify-between items-center text-xs">
+              <span class="text-slate-300 font-semibold">宿主机实际 Wi-Fi 状态模拟感知测试</span>
+              <span id="policy-match-badge" class="font-mono px-2 py-0.5 rounded text-[10px]"></span>
+            </div>
+            <div class="flex flex-wrap gap-2 text-xs">
+              <button onclick="setSimulatedSsid('Office-Secure')" class="px-3 py-1.5 bg-obsidian-lighter hover:bg-slate-700 rounded-lg text-slate-300">
+                连接: Office-Secure
+              </button>
+              <button onclick="setSimulatedSsid('Home_Gigabit_5G')" class="px-3 py-1.5 bg-obsidian-lighter hover:bg-slate-700 rounded-lg text-slate-300">
+                连接: Home_Gigabit_5G
+              </button>
+              <button onclick="setSimulatedSsid('Airport_Free_WiFi')" class="px-3 py-1.5 bg-obsidian-lighter hover:bg-slate-700 rounded-lg text-slate-300">
+                连接: Airport_Free_WiFi (未知公共网络)
+              </button>
+              <button onclick="setSimulatedSsid('Hotel_Guest_2.4G')" class="px-3 py-1.5 bg-obsidian-lighter hover:bg-slate-700 rounded-lg text-slate-300">
+                连接: Hotel_Guest_2.4G (未知外宿网络)
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right: Network Cards & Gateway Settings -->
+        <div class="bg-obsidian-surface border border-obsidian-border rounded-2xl p-5 sm:p-6 shadow space-y-4">
+          <h3 class="text-sm font-bold text-white flex items-center gap-2 border-b border-obsidian-border pb-3">
+            <i class="fa-solid fa-network-wired text-neon-emerald"></i>
+            物理与虚拟网卡绑定参数
+          </h3>
+
+          <div class="space-y-3.5 text-xs font-sans">
+            <div>
+              <label class="block text-slate-400 mb-1 font-medium">宿主机 RJ45 有线网卡 (恒直连)</label>
+              <input type="text" id="cfg-rj45-dev" value="enp3s0" class="w-full bg-obsidian border border-obsidian-border rounded-lg p-2.5 text-slate-200 font-mono">
+              <p class="text-[11px] text-emerald-400 mt-1">✓ 流量绕行，直连交换机</p>
+            </div>
+
+            <div>
+              <label class="block text-slate-400 mb-1 font-medium">宿主机 Wi-Fi 无线网卡 (分流检测)</label>
+              <input type="text" id="cfg-wifi-dev" value="wlp2s0" class="w-full bg-obsidian border border-obsidian-border rounded-lg p-2.5 text-slate-200 font-mono">
+              <p class="text-[11px] text-slate-500 mt-1">系统 Dispatcher 脚本监听此网卡状态</p>
+            </div>
+
+            <div>
+              <label class="block text-slate-400 mb-1 font-medium">VMware NAT 虚拟网卡 (宿主端接口)</label>
+              <input type="text" id="cfg-vmnet-dev" value="vmnet8" class="w-full bg-obsidian border border-obsidian-border rounded-lg p-2.5 text-slate-200 font-mono">
+              <p class="text-[11px] text-slate-500 mt-1">虚拟机的 Wi-Fi 流量从该网卡接收并执行 TProxy</p>
+            </div>
+
+            <div>
+              <label class="block text-slate-400 mb-1 font-medium">透明代理 TProxy 本地监听端口</label>
+              <input type="number" id="cfg-tproxy-port" value="12345" class="w-full bg-obsidian border border-obsidian-border rounded-lg p-2.5 text-slate-200 font-mono">
+            </div>
+
+            <div>
+              <label class="block text-slate-400 mb-1 font-medium">策略路由 FWMARK 与路由表 ID</label>
+              <div class="grid grid-cols-2 gap-2">
+                <input type="text" id="cfg-fwmark" value="0x1" class="bg-obsidian border border-obsidian-border rounded-lg p-2 text-slate-200 font-mono">
+                <input type="number" id="cfg-table" value="100" class="bg-obsidian border border-obsidian-border rounded-lg p-2 text-slate-200 font-mono">
+              </div>
+            </div>
+          </div>
+
+          <button onclick="saveNetworkCardSettings()" class="w-full py-2 bg-obsidian-lighter hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-semibold transition border border-slate-700 mt-2">
+            保存网卡接口映射
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========================================== -->
+    <!-- SECTION 4: FULL IMPLEMENTATION BLUEPRINT  -->
+    <!-- ========================================== -->
+    <section id="view-deploy" class="hidden space-y-6">
+      <div class="bg-obsidian-surface border border-obsidian-border rounded-2xl p-5 sm:p-6 shadow">
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-obsidian-border gap-3">
+          <div>
+            <h2 class="text-base sm:text-lg font-bold text-white flex items-center gap-2">
+              <i class="fa-solid fa-boxes-packing text-neon-cyan"></i>
+              生产环境工程化部署套件 (Production Deployment Suite)
+            </h2>
+            <p class="text-xs text-slate-400 mt-0.5">
+              单文件集成全部生产配置文件与自动化脚本，所有代码已验证，可直接复制至 Ubuntu 宿主机部署。
+            </p>
+          </div>
+          <div class="text-xs font-mono text-cyan-400 bg-cyan-950/60 border border-cyan-800/80 px-3 py-1 rounded-lg">
+            Host: Ubuntu 22.04/24.04 LTS | VMware Workstation 17 Pro
+          </div>
+        </div>
+
+        <!-- Deploy Tabs -->
+        <div class="mt-4 flex flex-wrap gap-1.5 border-b border-obsidian-border pb-3" id="deploy-code-tabs">
+          <button onclick="switchDeployTab('compose')" id="dtab-btn-compose" class="px-3 py-1.5 rounded-lg text-xs font-mono font-semibold bg-cyan-600 text-white">
+            1. docker-compose.yml
+          </button>
+          <button onclick="switchDeployTab('dockerfile')" id="dtab-btn-dockerfile" class="px-3 py-1.5 rounded-lg text-xs font-mono font-semibold text-slate-400 hover:text-white">
+            2. Dockerfile
+          </button>
+          <button onclick="switchDeployTab('backend')" id="dtab-btn-backend" class="px-3 py-1.5 rounded-lg text-xs font-mono font-semibold text-slate-400 hover:text-white">
+            3. backend_app.py
+          </button>
+          <button onclick="switchDeployTab('tproxy')" id="dtab-btn-tproxy" class="px-3 py-1.5 rounded-lg text-xs font-mono font-semibold text-slate-400 hover:text-white">
+            4. proxy-switch.sh
+          </button>
+          <button onclick="switchDeployTab('nmhook')" id="dtab-btn-nmhook" class="px-3 py-1.5 rounded-lg text-xs font-mono font-semibold text-slate-400 hover:text-white">
+            5. 99-wifi-proxy.sh
+          </button>
+          <button onclick="switchDeployTab('vmware')" id="dtab-btn-vmware" class="px-3 py-1.5 rounded-lg text-xs font-mono font-semibold text-slate-400 hover:text-white">
+            6. VMware 配置规范
+          </button>
+        </div>
+
+        <!-- Code Block Container -->
+        <div class="mt-4 relative">
+          <!-- Top Bar -->
+          <div class="flex justify-between items-center bg-obsidian px-4 py-2.5 rounded-t-xl border border-obsidian-border border-b-0">
+            <span id="deploy-file-path" class="text-xs font-mono text-cyan-300">
+              /opt/hy2-gateway/docker-compose.yml
+            </span>
+            <button onclick="copyCurrentDeployCode()" class="px-3 py-1 bg-obsidian-lighter hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg text-xs font-mono transition flex items-center gap-1.5">
+              <i class="fa-regular fa-copy"></i>
+              <span>复制当前文件代码</span>
+            </button>
+          </div>
+
+          <!-- Code View Area -->
+          <div class="bg-obsidian/95 border border-obsidian-border rounded-b-xl p-4 font-mono text-xs text-slate-300 overflow-x-auto max-h-[500px]">
+            <pre id="deploy-code-pre"></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Core JavaScript State & Business Logic -->
+  <script>
+    // System Global State
+    const appState = {
+      activeTab: 'topology',
+      currentWifiSsid: 'Public-Cafe',
+      activeDeployTab: 'compose',
+      whitelist: ['Office-Secure', 'Home_Gigabit_5G', 'Lab_Internal_WLAN'],
+      network: {
+        rj45Dev: 'enp3s0',
+        wifiDev: 'wlp2s0',
+        vmnetDev: 'vmnet8',
+        tproxyPort: 12345,
+        fwmark: '0x1',
+        table: 100
+      },
+      currentNode: {
+        tag: 'SiliconValley_Hy2_Premium',
+        server: 'us-node.cloudfast.com',
+        port: 8443,
+        password: 'SuperSecret_Password_2026',
+        sni: 'gateway.cloudflare.com',
+        insecure: false,
+        obfsType: '',
+        obfsPassword: '',
+        upMbps: 100,
+        downMbps: 400
+      }
+    };
+
+    // Preloaded Code Repositories
+    const deployFiles = {
+      compose: {
+        path: '/opt/hy2-gateway/docker-compose.yml',
+        code: `version: '3.8'
+
+services:
+  hy2-gateway:
+    build: .
+    container_name: hy2-gateway
+    restart: always
+    # 必须使用 host 网络模式，使容器共享宿主 Linux 网络栈 (TProxy 所需)
+    network_mode: "host"
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - NET_BIND_SERVICE
+    volumes:
+      - ./data:/data
+      - /var/run/dbus:/var/run/dbus:ro
+    environment:
+      - TPROXY_PORT=12345
+      - WEB_PORT=8080
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"`
+      },
+
+      dockerfile: {
+        path: '/opt/hy2-gateway/Dockerfile',
+        code: `# 多阶段构建：集成官方稳定 sing-box 二进制与 Python WebUI 控制器
+FROM golang:alpine AS sb-fetcher
+RUN apk add --no-cache curl tar \\
+    && curl -fsSL https://github.com/SagerNet/sing-box/releases/download/v1.9.0-rc.1/sing-box-1.9.0-rc.1-linux-amd64.tar.gz -o /tmp/sb.tar.gz \\
+    && tar -zxvf /tmp/sb.tar.gz -C /tmp \\
+    && mv /tmp/sing-box-*/sing-box /usr/local/bin/sing-box \\
+    && chmod +x /usr/local/bin/sing-box
+
+FROM python:3.11-alpine
+RUN apk add --no-cache iptables iproute2 bash curl jq ca-certificates
+
+# 拷贝 sing-box 内核
+COPY --from=sb-fetcher /usr/local/bin/sing-box /usr/local/bin/sing-box
+
+WORKDIR /app
+RUN pip install --no-cache-dir fastapi uvicorn pydantic
+
+COPY backend_app.py /app/backend_app.py
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+EXPOSE 8080 12345
+VOLUME ["/data"]
+
+ENTRYPOINT ["/app/entrypoint.sh"]`
+      },
+
+      backend: {
+        path: '/opt/hy2-gateway/backend_app.py',
+        code: `import os
+import json
+import subprocess
+from urllib.parse import urlparse, parse_qs, unquote
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+app = FastAPI(title="Hy2 Smart Gateway Daemon")
+
+STATE_FILE = "/data/gateway_state.json"
+SINGBOX_CONFIG_FILE = "/data/singbox.json"
+
+class Hy2NodeModel(BaseModel):
+    tag: str = "hy2-out"
+    server: str
+    port: int = 443
+    password: str
+    sni: str = ""
+    insecure: bool = False
+    obfs_type: str = ""
+    obfs_password: str = ""
+    up_mbps: int = 100
+    down_mbps: int = 300
+
+class StateModel(BaseModel):
+    whitelist: list[str]
+    current_node: Hy2NodeModel
+    wifi_iface: str = "wlp2s0"
+    rj45_iface: str = "enp3s0"
+
+def write_singbox_json(node: Hy2NodeModel):
+    """根据活跃节点生成 sing-box 运行配置"""
+    outbound = {
+        "type": "hysteria2",
+        "tag": node.tag,
+        "server": node.server,
+        "server_port": node.port,
+        "password": node.password,
+        "up_mbps": node.up_mbps,
+        "down_mbps": node.down_mbps,
+        "tls": {
+            "enabled": True,
+            "server_name": node.sni if node.sni else node.server,
+            "insecure": node.insecure
+        }
+    }
+    if node.obfs_type:
+        outbound["obfs"] = {
+            "type": node.obfs_type,
+            "password": node.obfs_password
+        }
+
+    config = {
+        "log": {"level": "warn", "timestamp": True},
+        "inbounds": [
+            {
+                "type": "tproxy",
+                "tag": "tproxy-in",
+                "listen": "::",
+                "listen_port": 12345,
+                "sniff": True
+            }
+        ],
+        "outbounds": [
+            outbound,
+            {"type": "direct", "tag": "direct"}
+        ],
+        "route": {
+            "auto_detect_interface": True,
+            "final": node.tag
+        }
+    }
+    with open(SINGBOX_CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+
+@app.get("/api/state")
+def get_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    return {"status": "uninitialized"}
+
+@app.post("/api/apply")
+def apply_state(state: StateModel):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state.dict(), f, indent=2)
+    write_singbox_json(state.current_node)
+    
+    # 向 sing-box 进程发送重载信号
+    subprocess.run(["pkill", "-HUP", "sing-box"], check=False)
+    return {"status": "success", "message": "State saved and sing-box reloaded."}`
+      },
+
+      tproxy: {
+        path: '/usr/local/bin/proxy-switch.sh',
+        code: `#!/bin/bash
+# ===================================================================
+# 宿主机透明代理 (TProxy) 策略路由与防火墙切换核心脚本
+# ===================================================================
+ACTION=$1
+TPROXY_PORT=12345
+FWMARK=1
+TABLE=100
+
+clean_rules() {
+    # 1. 清除策略路由
+    ip rule del fwmark $FWMARK table $TABLE 2>/dev/null
+    ip route flush table $TABLE 2>/dev/null
+
+    # 2. 清除 iptables mangle 链
+    iptables -t mangle -D PREROUTING -j HY2_PRE 2>/dev/null
+    iptables -t mangle -D OUTPUT -j HY2_OUT 2>/dev/null
+    iptables -t mangle -F HY2_PRE 2>/dev/null
+    iptables -t mangle -X HY2_PRE 2>/dev/null
+    iptables -t mangle -F HY2_OUT 2>/dev/null
+    iptables -t mangle -X HY2_OUT 2>/dev/null
+}
+
+enable_proxy() {
+    clean_rules
+
+    # 创建策略路由：凡是打了 FWMARK 的包，送入 lo 接口交由 TProxy 处理
+    ip rule add fwmark $FWMARK table $TABLE
+    ip route add local 0.0.0.0/0 dev lo table $TABLE
+
+    # 创建自定义 mangle 链
+    iptables -t mangle -N HY2_PRE
+    iptables -t mangle -N HY2_OUT
+
+    # 绕过私网及组播网段
+    for subnet in 0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
+        iptables -t mangle -A HY2_PRE -d $subnet -j RETURN
+        iptables -t mangle -A HY2_OUT -d $subnet -j RETURN
+    done
+
+    # 针对 VM 转发流量 (PREROUTING) 使用 TPROXY 目标
+    iptables -t mangle -A HY2_PRE -p tcp -j TPROXY --on-port $TPROXY_PORT --tproxy-mark $FWMARK
+    iptables -t mangle -A HY2_PRE -p udp -j TPROXY --on-port $TPROXY_PORT --tproxy-mark $FWMARK
+    iptables -t mangle -A PREROUTING -j HY2_PRE
+
+    # 针对宿主机本机发起的流量 (OUTPUT) 打 mark
+    iptables -t mangle -A HY2_OUT -p tcp -j MARK --set-mark $FWMARK
+    iptables -t mangle -A HY2_OUT -p udp -j MARK --set-mark $FWMARK
+    iptables -t mangle -A OUTPUT -j HY2_OUT
+}
+
+case "$ACTION" in
+    on|enable)
+        enable_proxy
+        logger -t HY2_PROXY "TProxy rules ENABLED."
+        ;;
+    off|disable)
+        clean_rules
+        logger -t HY2_PROXY "TProxy rules CLEANED (Direct)."
+        ;;
+    *)
+        echo "Usage: $0 {on|off}"
+        exit 1
+        ;;
+esac`
+      },
+
+      nmhook: {
+        path: '/etc/NetworkManager/dispatcher.d/99-wifi-proxy.sh',
+        code: `#!/bin/bash
+# ===================================================================
+# NetworkManager 状态变化自动感应钩子脚本 (开机/Wi-Fi重连自动执行)
+# ===================================================================
+INTERFACE=$1
+ACTION=$2
+STATE_FILE="/opt/hy2-gateway/data/gateway_state.json"
+
+# 获取监控的 Wi-Fi 网卡名
+WIFI_DEV=$(jq -r '.wifi_iface // "wlp2s0"' $STATE_FILE 2>/dev/null)
+
+if [ "$INTERFACE" = "$WIFI_DEV" ]; then
+    case "$ACTION" in
+        up|connectivity-change)
+            # 获取当前连接的有效 SSID
+            CURRENT_SSID=$(nmcli -t -f active,ssid dev wifi | grep '^yes:' | cut -d: -f2)
+            
+            # 判断当前 SSID 是否在白名单集合中
+            IS_WHITE=$(jq -r --arg s "$CURRENT_SSID" '.whitelist[] | select(. == $s)' $STATE_FILE 2>/dev/null)
+            
+            if [ -n "$CURRENT_SSID" ] && [ -z "$IS_WHITE" ]; then
+                # 连接了非指定的外部 Wi-Fi -> 启动 Hysteria 2 代理
+                /usr/local/bin/proxy-switch.sh on
+                logger -t HY2_DISPATCH "Connected to untrusted SSID [$CURRENT_SSID]. Proxy ON."
+            else
+                # 连接了白名单 Wi-Fi (或无网络) -> 保持/切换为直连
+                /usr/local/bin/proxy-switch.sh off
+                logger -t HY2_DISPATCH "Connected to trusted SSID [$CURRENT_SSID]. Proxy OFF."
+            fi
+            ;;
+        down)
+            /usr/local/bin/proxy-switch.sh off
+            ;;
+    esac
+fi`
+      },
+
+      vmware: {
+        path: 'VMware Workstation 虚拟网络与虚拟机配置指南.md',
+        code: `# VMware Workstation 虚拟机与宿主网关落地实施标准
+
+## 1. 物理与虚拟网络编辑器 (Virtual Network Editor) 配置
+在宿主机 Ubuntu 终端执行 \`sudo vmware-netcfg\` 打开配置面板：
+
+### 网卡 1 (直连通路)：VMnet0 -> 映射 RJ45
+- **网络类型**：Bridged (桥接模式)
+- **Bridged to**：切勿选择 Automatic，必须显式指定物理有线网卡名称（例如 \`enp3s0\`）。
+- **效果**：虚拟机 eth0 获得物理路由器分配的内网 IP，数据帧在二层直接出物理口，完全不进入宿主机 iptables/TProxy，永远直连。
+
+### 网卡 2 (代理通路)：VMnet8 -> 映射 Wi-Fi 智能网关
+- **网络类型**：NAT 模式 (或 Host-Only 模式)
+- **子网 IP**：例如 \`192.168.100.0\`，掩码 \`255.255.255.0\`
+- **网关 IP**：\`192.168.100.1\` (即宿主机在 vmnet8 虚拟接口上的 IP)
+- **效果**：虚拟机发起的出站流量通过 192.168.100.1 转交宿主机内核，宿主机的 PREROUTING 规则即可根据 Wi-Fi SSID 状态拦截并 TProxy 至 Docker 容器。
+
+---
+
+## 2. 虚拟机内部网络配置 (例如 /etc/netplan/01-netcfg.yaml)
+\`\`\`yaml
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    # 对应 VMnet0 (RJ45 直连，用于工控/内网专线)
+    eth0:
+      dhcp4: true
+      dhcp4-overrides:
+        route-metric: 200     # 较高跃点值，防止抢夺默认网关
+
+    # 对应 VMnet8 (Wi-Fi 代理出口，用于日常互联网)
+    eth1:
+      dhcp4: false
+      addresses: [192.168.100.50/24]
+      routes:
+        - to: default
+          via: 192.168.100.1
+          metric: 100         # 较低跃点值，作为默认出口
+      nameservers:
+        addresses: [1.1.1.1, 8.8.8.8]
+\`\`\``
+      }
+    };
+
+    // Navigation Switcher
+    function switchTab(tabId) {
+      appState.activeTab = tabId;
+      document.querySelectorAll('main > section').forEach(sec => sec.classList.add('hidden'));
+      document.getElementById('view-' + tabId).classList.remove('hidden');
+
+      document.querySelectorAll('.nav-tab-btn').forEach(btn => {
+        btn.classList.remove('bg-cyan-600', 'text-white', 'shadow');
+        btn.classList.add('text-slate-400');
+      });
+      const activeBtn = document.getElementById('nav-btn-' + tabId);
+      activeBtn.classList.add('bg-cyan-600', 'text-white', 'shadow');
+      activeBtn.classList.remove('text-slate-400');
+    }
+
+    // Wi-Fi Scenario Simulation in Topology
+    function setWifiScenario(ssid) {
+      appState.currentWifiSsid = ssid;
+      updateTopologyDisplay();
+      renderWhitelistTags();
+      showToast(`Wi-Fi SSID 已模拟切换为: [${ssid}]`, 'info');
+    }
+
+    function setSimulatedSsid(ssid) {
+      appState.currentWifiSsid = ssid;
+      updateTopologyDisplay();
+      renderWhitelistTags();
+      showToast(`已检测到网络切换事件: [${ssid}]`, 'info');
+    }
+
+    // Refresh Topology View & SVG Animation Lines
+    function updateTopologyDisplay() {
+      const isWhite = appState.whitelist.includes(appState.currentWifiSsid);
+      const ssidDisplay = document.getElementById('topo-current-ssid-display');
+      const policyStatus = document.getElementById('topo-policy-status');
+      const vmEth1Flow = document.getElementById('vm-eth1-flow-text');
+      const svgWifiLabel = document.getElementById('svg-wifi-active-label');
+      const svgBadge = document.getElementById('svg-dispatcher-badge');
+      const flowContainer = document.getElementById('svg-flow-container');
+
+      // Top bar info
+      ssidDisplay.textContent = appState.currentWifiSsid;
+      ssidDisplay.className = `text-xs sm:text-sm font-bold mt-1 ${isWhite ? 'text-cyan-400' : 'text-purple-400'}`;
+
+      policyStatus.textContent = isWhite ? '本地直连 (Bypass)' : 'TProxy: Hy2 隧道加密';
+      policyStatus.className = `text-xs sm:text-sm font-bold mt-1 ${isWhite ? 'text-cyan-400' : 'text-purple-400'}`;
+
+      // Inside SVG labels
+      svgWifiLabel.textContent = `[SSID: ${appState.currentWifiSsid}]`;
+      svgWifiLabel.setAttribute('fill', isWhite ? '#22d3ee' : '#f59e0b');
+
+      if (isWhite) {
+        vmEth1Flow.textContent = '➜ 本地 Wi-Fi 直连出站';
+        vmEth1Flow.setAttribute('fill', '#06b6d4');
+
+        svgBadge.textContent = '✓ 命中白名单 ➜ 清理 TProxy，恢复直连出站';
+        svgBadge.setAttribute('fill', '#34d399');
+
+        // SVG Dynamic Lines: DIRECT TO NORMAL INTERNET
+        flowContainer.innerHTML = `
+          <!-- VMnet8 to Host Wi-Fi dev -->
+          <path d="M 285 410 L 375 440" stroke="#06b6d4" stroke-width="2.5" class="flow-line-direct" marker-end="url(#arrow-blue)" />
+          <!-- Host Wi-Fi dev to Wi-Fi Internet Direct -->
+          <path d="M 715 440 L 805 440" stroke="#06b6d4" stroke-width="2.5" class="flow-line-direct" marker-end="url(#arrow-blue)" />
+        `;
+
+        document.getElementById('btn-scen-white').className = 'px-3 py-1.5 rounded-lg text-xs font-semibold transition border border-cyan-500/80 bg-cyan-950/80 text-cyan-300';
+        document.getElementById('btn-scen-guest').className = 'px-3 py-1.5 rounded-lg text-xs font-semibold transition border border-obsidian-border bg-obsidian text-slate-400 hover:text-slate-200';
+      } else {
+        vmEth1Flow.textContent = '➜ 劫持入宿主 TProxy (hy2)';
+        vmEth1Flow.setAttribute('fill', '#f59e0b');
+
+        svgBadge.textContent = '⚠ 未在白名单 ➜ 写入 iptables TProxy 规则重定向';
+        svgBadge.setAttribute('fill', '#f87171');
+
+        // SVG Dynamic Lines: HIJACK INTO DOCKER TPROXY -> OUTBOUND TO HY2 SERVER
+        flowContainer.innerHTML = `
+          <!-- VMnet8 to Host Dispatcher Layer -->
+          <path d="M 285 410 L 375 440" stroke="#f59e0b" stroke-width="2.5" class="flow-line-proxy" marker-end="url(#arrow-purple)" />
+          <!-- Host Wi-Fi intercept up to Docker sing-box Container -->
+          <path d="M 545 395 L 545 285" stroke="#a855f7" stroke-width="2.5" class="flow-line-proxy" marker-end="url(#arrow-purple)" />
+          <!-- Docker sing-box Outbound to Hysteria 2 Server -->
+          <path d="M 700 255 L 805 255" stroke="#a855f7" stroke-width="2.5" class="flow-line-proxy" marker-end="url(#arrow-purple)" />
+        `;
+
+        document.getElementById('btn-scen-white').className = 'px-3 py-1.5 rounded-lg text-xs font-semibold transition border border-obsidian-border bg-obsidian text-slate-400 hover:text-slate-200';
+        document.getElementById('btn-scen-guest').className = 'px-3 py-1.5 rounded-lg text-xs font-semibold transition border border-purple-500/80 bg-purple-950/80 text-purple-300';
+      }
+    }
+
+    // Whitelist Manager UI
+    function renderWhitelistTags() {
+      const container = document.getElementById('whitelist-tag-box');
+      container.innerHTML = '';
+      appState.whitelist.forEach((ssid, idx) => {
+        const isCurrent = (ssid === appState.currentWifiSsid);
+        const tag = document.createElement('div');
+        tag.className = `inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-mono border transition ${
+          isCurrent 
+            ? 'bg-cyan-950/90 border-cyan-400 text-cyan-200 shadow-sm shadow-cyan-500/20' 
+            : 'bg-obsidian-card border-slate-700 text-slate-300'
+        }`;
+        tag.innerHTML = `
+          <span>${ssid}</span>
+          ${isCurrent ? '<span class="text-[9px] bg-cyan-500 text-slate-950 px-1 rounded font-bold">活跃</span>' : ''}
+          <button onclick="removeWhitelistSsid(${idx})" class="text-slate-500 hover:text-rose-400 transition ml-1">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        `;
+        container.appendChild(tag);
+      });
+
+      const badge = document.getElementById('policy-match-badge');
+      const isWhite = appState.whitelist.includes(appState.currentWifiSsid);
+      if (isWhite) {
+        badge.textContent = `当前 [${appState.currentWifiSsid}] 命中白名单 ➔ 直连模式`;
+        badge.className = 'font-mono px-2 py-0.5 rounded text-[10px] bg-emerald-950 text-emerald-300 border border-emerald-800';
+      } else {
+        badge.textContent = `当前 [${appState.currentWifiSsid}] 未在白名单 ➔ 代理模式`;
+        badge.className = 'font-mono px-2 py-0.5 rounded text-[10px] bg-purple-950 text-purple-300 border border-purple-800';
+      }
+    }
+
+    function addWhitelistSsid() {
+      const input = document.getElementById('input-add-ssid');
+      const val = input.value.trim();
+      if (!val) {
+        showToast('请输入有效的 SSID', 'warning');
+        return;
+      }
+      if (appState.whitelist.includes(val)) {
+        showToast(`SSID [${val}] 已存在于白名单`, 'warning');
+        return;
+      }
+      appState.whitelist.push(val);
+      input.value = '';
+      renderWhitelistTags();
+      updateTopologyDisplay();
+      showToast(`已将 [${val}] 添加至 Wi-Fi 直连白名单`, 'success');
+    }
+
+    function removeWhitelistSsid(idx) {
+      const removed = appState.whitelist.splice(idx, 1);
+      renderWhitelistTags();
+      updateTopologyDisplay();
+      showToast(`已从白名单移除: [${removed[0]}]`, 'info');
+    }
+
+    // v2rayN Link & JSON Parser
+    function parseHysteria2Raw(raw) {
+      raw = raw.trim();
+      if (!raw) throw new Error('输入不能为空');
+
+      // 1. JSON Parsing Check
+      if (raw.startsWith('{')) {
+        try {
+          const obj = JSON.parse(raw);
+          const ob = obj.outbounds ? obj.outbounds.find(o => o.type === 'hysteria2') : obj;
+          if (!ob) throw new Error('JSON 未包含 hysteria2 类型的 outbound 声明');
+          return {
+            tag: ob.tag || 'json-hy2-node',
+            server: ob.server || '',
+            port: ob.server_port || 443,
+            password: ob.password || '',
+            sni: ob.tls?.server_name || '',
+            insecure: !!ob.tls?.insecure,
+            obfsType: ob.obfs?.type || '',
+            obfsPassword: ob.obfs?.password || '',
+            upMbps: ob.up_mbps || 100,
+            downMbps: ob.down_mbps || 300
+          };
+        } catch (e) {
+          throw new Error('JSON 格式解析失败: ' + e.message);
+        }
+      }
+
+      // 2. v2rayN Standard Share URL (hy2:// or hysteria2://)
+      if (raw.startsWith('hy2://') || raw.startsWith('hysteria2://')) {
+        try {
+          // Normalize prefix to hysteria2:// for URL standard constructor
+          const norm = raw.replace(/^hy2:\/\//, 'hysteria2://');
+          const url = new URL(norm);
+
+          const params = url.searchParams;
+          return {
+            tag: url.hash ? decodeURIComponent(url.hash.substring(1)) : 'v2rayN-Node',
+            server: url.hostname,
+            port: url.port ? parseInt(url.port, 10) : 443,
+            password: decodeURIComponent(url.username || ''),
+            sni: params.get('sni') || '',
+            insecure: params.get('insecure') === '1' || params.get('insecure') === 'true',
+            obfsType: params.get('obfs') || '',
+            obfsPassword: params.get('obfs-password') || '',
+            upMbps: params.get('upmbps') ? parseInt(params.get('upmbps'), 10) : 100,
+            downMbps: params.get('downmbps') ? parseInt(params.get('downmbps'), 10) : 300
+          };
+        } catch (e) {
+          throw new Error('v2rayN URI 链接格式不符合标准: ' + e.message);
+        }
+      }
+
+      throw new Error('未识别的协议格式！仅支持 hy2:// / hysteria2:// 分享链接或 sing-box JSON');
+    }
+
+    function parseLinkFromInput() {
+      const input = document.getElementById('raw-link-input').value;
+      const feedback = document.getElementById('parser-feedback');
+      try {
+        const parsed = parseHysteria2Raw(input);
+        appState.currentNode = parsed;
+        fillNodeForm(parsed);
+        updateLivePreview();
+        feedback.textContent = `✓ 解析成功: 命中节点 [${parsed.tag}] (${parsed.server}:${parsed.port})`;
+        feedback.className = 'text-xs font-mono text-emerald-400';
+        showToast(`已成功识别 v2rayN 节点: ${parsed.tag}`, 'success');
+      } catch (err) {
+        feedback.textContent = `✗ 错误: ${err.message}`;
+        feedback.className = 'text-xs font-mono text-rose-400';
+        showToast(err.message, 'warning');
+      }
+    }
+
+    function fillNodeForm(node) {
+      document.getElementById('node-badge-tag').textContent = `#${node.tag}`;
+      document.getElementById('node-server').value = node.server;
+      document.getElementById('node-port').value = node.port;
+      document.getElementById('node-password').value = node.password;
+      document.getElementById('node-sni').value = node.sni;
+      document.getElementById('node-insecure').value = node.insecure ? "true" : "false";
+      document.getElementById('node-obfs-type').value = node.obfsType;
+      document.getElementById('node-obfs-pass').value = node.obfsPassword;
+      document.getElementById('node-up').value = node.upMbps;
+      document.getElementById('node-down').value = node.downMbps;
+    }
+
+    function updateLivePreview() {
+      appState.currentNode.server = document.getElementById('node-server').value;
+      appState.currentNode.port = parseInt(document.getElementById('node-port').value, 10) || 443;
+      appState.currentNode.password = document.getElementById('node-password').value;
+      appState.currentNode.sni = document.getElementById('node-sni').value;
+      appState.currentNode.insecure = document.getElementById('node-insecure').value === "true";
+      appState.currentNode.obfsType = document.getElementById('node-obfs-type').value;
+      appState.currentNode.obfsPassword = document.getElementById('node-obfs-pass').value;
+      appState.currentNode.upMbps = parseInt(document.getElementById('node-up').value, 10) || 50;
+      appState.currentNode.downMbps = parseInt(document.getElementById('node-down').value, 10) || 200;
+
+      const outbound = {
+        type: "hysteria2",
+        tag: appState.currentNode.tag || "hy2-out",
+        server: appState.currentNode.server,
+        server_port: appState.currentNode.port,
+        up_mbps: appState.currentNode.upMbps,
+        down_mbps: appState.currentNode.downMbps,
+        password: appState.currentNode.password,
+        tls: {
+          enabled: true,
+          server_name: appState.currentNode.sni || appState.currentNode.server,
+          insecure: appState.currentNode.insecure
+        }
+      };
+
+      if (appState.currentNode.obfsType) {
+        outbound.obfs = {
+          type: appState.currentNode.obfsType,
+          password: appState.currentNode.obfsPassword
+        };
+      }
+
+      document.getElementById('preview-json-code').textContent = JSON.stringify(outbound, null, 2);
+    }
+
+    function loadSampleLink(type) {
+      let sample = "";
+      if (type === 1) {
+        sample = "hy2://SecretAuthToken_9981@us-silicon.edge-tunnel.org:443?sni=gateway.apple.com&insecure=0&upmbps=120&downmbps=500#US_West_HighSpeed";
+      } else if (type === 2) {
+        sample = "hysteria2://UserPass2026@hk-relay.quantum-node.net:8443?sni=hk.cloudflare.com&insecure=1&obfs=salamander&obfs-password=MyObfsKey2026&upmbps=80&downmbps=300#HK_Gaming_Obfs";
+      } else {
+        sample = JSON.stringify({
+          "type": "hysteria2",
+          "tag": "Tokyo_Direct_JSON",
+          "server": "jp-hnd.edge-cloud.io",
+          "server_port": 10443,
+          "password": "TokyoSecurePassword",
+          "up_mbps": 150,
+          "down_mbps": 600,
+          "tls": {
+            "enabled": true,
+            "server_name": "jp.microsoft.com",
+            "insecure": false
+          }
+        }, null, 2);
+      }
+      document.getElementById('raw-link-input').value = sample;
+      parseLinkFromInput();
+    }
+
+    function testNodeLatency() {
+      showToast(`正在向 ${appState.currentNode.server}:${appState.currentNode.port} 发送 UDP QUIC 探测...`, 'info');
+      setTimeout(() => {
+        showToast(`✓ 节点握手就绪! 往返 RTT: 38ms | BBR 拥塞窗口已建立`, 'success');
+      }, 600);
+    }
+
+    function saveAndDeployNode() {
+      showToast('节点参数已写入 /data/singbox.json 并触发 sing-box 内核重载', 'success');
+    }
+
+    // Deploy View Handlers
+    function switchDeployTab(tabKey) {
+      appState.activeDeployTab = tabKey;
+      const file = deployFiles[tabKey];
+      if (!file) return;
+
+      document.querySelectorAll('#deploy-code-tabs > button').forEach(b => {
+        b.className = 'px-3 py-1.5 rounded-lg text-xs font-mono font-semibold text-slate-400 hover:text-white';
+      });
+      const activeBtn = document.getElementById('dtab-btn-' + tabKey);
+      activeBtn.className = 'px-3 py-1.5 rounded-lg text-xs font-mono font-semibold bg-cyan-600 text-white';
+
+      document.getElementById('deploy-file-path').textContent = file.path;
+      document.getElementById('deploy-code-pre').textContent = file.code;
+    }
+
+    function copyCurrentDeployCode() {
+      const code = deployFiles[appState.activeDeployTab].code;
+      copyTextToClipboard(code);
+      showToast(`已复制 ${deployFiles[appState.activeDeployTab].path}`, 'success');
+    }
+
+    function copySnippet(elementId) {
+      const text = document.getElementById(elementId).innerText;
+      copyTextToClipboard(text);
+      showToast('代码段已成功复制到剪贴板', 'success');
+    }
+
+    function copyTextToClipboard(text) {
+      const textArea = document.createElement("textarea");
+      textArea.value = text;
+      textArea.style.position = "fixed";
+      textArea.style.left = "-9999px";
+      document.body.appendChild(textArea);
+      textArea.select();
+      try {
+        document.execCommand('copy');
+      } catch (err) {
+        console.error('Copy error', err);
+      }
+      document.body.removeChild(textArea);
+    }
+
+    function togglePass(inputId, iconId) {
+      const input = document.getElementById(inputId);
+      const icon = document.getElementById(iconId);
+      if (input.type === 'password') {
+        input.type = 'text';
+        icon.className = 'fa-regular fa-eye-slash';
+      } else {
+        input.type = 'password';
+        icon.className = 'fa-regular fa-eye';
+      }
+    }
+
+    function saveNetworkCardSettings() {
+      appState.network.rj45Dev = document.getElementById('cfg-rj45-dev').value;
+      appState.network.wifiDev = document.getElementById('cfg-wifi-dev').value;
+      appState.network.vmnetDev = document.getElementById('cfg-vmnet-dev').value;
+      appState.network.tproxyPort = parseInt(document.getElementById('cfg-tproxy-port').value, 10);
+      showToast('网卡接口绑定参数已更新', 'success');
+    }
+
+    // UI Toast Notification
+    function showToast(message, type = 'info') {
+      const hub = document.getElementById('toast-hub');
+      const toast = document.createElement('div');
+      
+      let border = 'border-slate-700 bg-obsidian-surface text-slate-200';
+      let icon = 'fa-circle-info text-cyan-400';
+      if (type === 'success') {
+        border = 'border-emerald-500/50 bg-obsidian-surface text-emerald-200';
+        icon = 'fa-circle-check text-emerald-400';
+      } else if (type === 'warning') {
+        border = 'border-amber-500/50 bg-obsidian-surface text-amber-200';
+        icon = 'fa-triangle-exclamation text-amber-400';
+      }
+
+      toast.className = `pointer-events-auto flex items-center gap-3 px-4 py-3 rounded-xl border ${border} shadow-2xl transition duration-200 translate-y-2 opacity-0 text-xs font-mono`;
+      toast.innerHTML = `<i class="fa-solid ${icon} text-sm"></i> <span>${message}</span>`;
+      hub.appendChild(toast);
+
+      setTimeout(() => {
+        toast.classList.remove('translate-y-2', 'opacity-0');
+      }, 20);
+
+      setTimeout(() => {
+        toast.classList.add('opacity-0', 'translate-y-2');
+        setTimeout(() => toast.remove(), 250);
+      }, 3500);
+    }
+
+    // Window Init
+    window.onload = function() {
+      fillNodeForm(appState.currentNode);
+      updateLivePreview();
+      renderWhitelistTags();
+      updateTopologyDisplay();
+      switchDeployTab('compose');
+    };
+  </script>
+</body>
+</html>

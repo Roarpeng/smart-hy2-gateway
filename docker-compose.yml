@@ -1,0 +1,28 @@
+# Smart Hysteria 2 Gateway - 宿主机部署 (仓库根 = /opt/hy2-gateway)
+services:
+  hy2-gateway:
+    build:
+      context: .
+      args:
+        SINGBOX_VERSION: "1.10.7"
+    container_name: hy2-gateway
+    restart: always
+    # host 网络模式: 容器共享宿主 Linux 网络栈, TProxy 劫持与 iptables 操作所需
+    network_mode: "host"
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - NET_BIND_SERVICE
+    volumes:
+      - ./data:/data
+      # 注: Wi-Fi 事件感知由宿主侧 NetworkManager dispatcher 完成,
+      #     容器无需接触 dbus (只读挂载也无法发起 NM 查询, 徒增挂载失败面)
+    environment:
+      - WEB_PORT=8080
+      # 注: 不注入 TPROXY_PORT —— 后端调用 proxy-switch.sh 时以状态文件
+      #     当前值构造环境变量, 避免与 WebUI 修改的端口脱节
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

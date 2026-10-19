@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Smart Hy2 Gateway · 管理控制台</title>
+
+  <!-- 字体: 断网时整级回退系统字, 控制台始终可用 -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=League+Spartan:wght@700&family=Figtree:wght@400;600;700&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="console.css">
+  <script>document.documentElement.classList.add('js');</script>
+</head>
+
+<body>
+
+  <!-- Toast 通知 -->
+  <div id="toast-hub" aria-live="polite"></div>
+
+  <!-- 顶栏 -->
+  <header class="appbar">
+    <div class="appbar-row">
+      <div class="brand-wrap">
+        <a class="brand" href="/">Smart Hy2 Gateway</a>
+        <p class="tagline">RJ45 恒直连 · Wi-Fi 走代理 (白名单例外)</p>
+      </div>
+      <nav class="tabs" aria-label="主导航">
+        <button type="button" class="tab" id="nav-btn-node" onclick="switchTab('node')">节点配置</button>
+        <button type="button" class="tab" id="nav-btn-nics" onclick="switchTab('nics')">网卡配置</button>
+        <button type="button" class="tab active" id="nav-btn-status" onclick="switchTab('status')">状态</button>
+      </nav>
+      <div class="chip off" id="backend-status-chip" title="后端连接状态">
+        <span class="chip-dot" id="backend-status-dot"></span>
+        <span class="chip-text" id="backend-status-text">检测中</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+
+    <!-- ============ 视图 1: 节点配置 ============ -->
+    <section id="view-node" class="view">
+      <div class="board">
+
+        <div class="tile c12" data-ui>
+          <h2 class="th">节点导入</h2>
+          <p class="tdesc" style="margin-bottom: 10px;">在 v2rayN 中右键节点选择「分享节点 · 复制链接」, 粘贴到下方即自动解析; 也支持粘贴 sing-box JSON</p>
+          <textarea id="raw-link-input" class="textarea" rows="3" placeholder="hy2://your-token@us-node.cloudfast.com:8443?sni=us.apple.com&insecure=0&upmbps=100&downmbps=400#US_SiliconValley_Node"></textarea>
+          <div class="row" style="margin-top: 10px;">
+            <button type="button" class="btn btn-primary" onclick="parseLinkFromInput()">智能解析并填充</button>
+            <button type="button" class="btn btn-small" onclick="loadSampleLink(1)">标准样例</button>
+            <button type="button" class="btn btn-small" onclick="loadSampleLink(2)">混淆 (obfs) 样例</button>
+            <button type="button" class="btn btn-small" onclick="loadSampleLink(3)">sing-box JSON 样例</button>
+          </div>
+          <p id="parser-feedback" class="tdesc" style="margin-top: 8px;"></p>
+        </div>
+
+        <div class="tile c12" data-ui>
+          <div class="row spread" style="margin-bottom: 14px;">
+            <h3 class="th" style="margin-bottom: 0;">节点参数</h3>
+            <span class="badge badge-proxy" id="node-badge-tag">#未命名节点</span>
+          </div>
+          <div class="grid2">
+            <label class="field" style="grid-column: 1 / -1;"><span>服务器域名 / IP (Server Host)</span>
+              <input type="text" id="node-server" class="input" oninput="updateLivePreview()"></label>
+            <label class="field"><span>服务端口 (Server Port)</span>
+              <input type="number" id="node-port" class="input" value="443" oninput="updateLivePreview()"></label>
+            <label class="field"><span>认证口令 (Auth)</span>
+              <span class="row" style="gap: 6px;">
+                <input type="password" id="node-password" class="input" oninput="updateLivePreview()" style="flex:1;">
+                <button type="button" class="btn btn-small" onclick="togglePass('node-password', this)">显示</button>
+              </span></label>
+            <label class="field"><span>TLS SNI 伪装域名 (Server Name)</span>
+              <input type="text" id="node-sni" class="input" oninput="updateLivePreview()"></label>
+            <label class="field"><span>跳过证书校验 (Insecure)</span>
+              <select id="node-insecure" class="select" onchange="updateLivePreview()">
+                <option value="false" selected>false · 严格校验证书</option>
+                <option value="true">true · 允许自签名证书</option>
+              </select></label>
+            <label class="field"><span>混淆协议类型 (Obfs Type)</span>
+              <input type="text" id="node-obfs-type" class="input" placeholder="留空不使用, 或 salamander" oninput="updateLivePreview()"></label>
+            <label class="field"><span>混淆口令 (Obfs Password)</span>
+              <input type="text" id="node-obfs-pass" class="input" oninput="updateLivePreview()"></label>
+            <label class="field"><span>下行带宽 (Down Mbps)</span>
+              <input type="number" id="node-down" class="input" value="300" oninput="updateLivePreview()"></label>
+            <label class="field"><span>上行带宽 (Up Mbps)</span>
+              <input type="number" id="node-up" class="input" value="80" oninput="updateLivePreview()"></label>
+          </div>
+          <div class="row" style="margin-top: 16px; justify-content: flex-end;">
+            <button type="button" class="btn btn-primary" onclick="saveAndDeployNode()">保存为活跃节点并下发配置</button>
+          </div>
+        </div>
+
+        <div class="tile c12">
+          <p class="tl">网络连通性测试 (宿主机视角分段诊断)</p>
+          <div class="row">
+            <input type="text" id="nettest-target" class="input" style="flex: 1;" value="www.google.com" aria-label="连通性测试目标域名" placeholder="目标域名, 可改">
+            <button type="button" class="btn btn-primary" onclick="runNetTest()">开始测试</button>
+          </div>
+          <div id="nettest-panel" class="nettest" hidden></div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ============ 视图 2: 网卡配置 ============ -->
+    <section id="view-nics" class="view">
+      <div class="board">
+
+        <div class="tile c6" data-ui>
+          <p class="tl">通道 A · 有线</p>
+          <div class="stack">
+            <label class="field"><span>RJ45 物理网卡 (VMnet0 桥接目标)</span>
+              <select id="cfg-rj45-dev" class="select"></select></label>
+          </div>
+          <p style="margin-top: 12px;"><span class="badge badge-direct">恒直连 · 不经隧道</span></p>
+          <p class="tdesc" style="margin-top: 10px;">宿主机有线流量与虚拟机 eth0 (工控/内网) 全部直连, 无论代理开关状态</p>
+        </div>
+
+        <div class="tile c6" data-ui>
+          <p class="tl">通道 B · 无线</p>
+          <div class="stack">
+            <label class="field"><span>Wi-Fi 网卡 (分流监听)</span>
+              <select id="cfg-wifi-dev" class="select"></select></label>
+            <label class="field"><span>通道策略</span>
+              <select id="cfg-wifi-policy" class="select">
+                <option value="whitelist" selected>走代理 · 白名单 SSID 例外直连 (默认)</option>
+                <option value="always_proxy">强制代理 · 忽略白名单</option>
+                <option value="always_direct">强制直连 · 不经隧道</option>
+              </select></label>
+          </div>
+          <p class="tdesc" style="margin-top: 10px;">宿主机 Wi-Fi 流量与虚拟机 eth1 (日常互联网) 走此通道</p>
+        </div>
+
+        <div class="tile c12" data-ui>
+          <p class="tl">Wi-Fi 直连白名单 (仅在「白名单例外」策略下生效)</p>
+          <div id="whitelist-tag-box" class="wl-tags"></div>
+          <div class="row" style="margin-top: 12px;">
+            <input type="text" id="input-add-ssid" class="input" style="flex: 1;" placeholder="输入可信 Wi-Fi 的 SSID (例如: Home_Gigabit_5G)" aria-label="新增白名单 SSID">
+            <button type="button" class="btn btn-primary" onclick="addWhitelistSsid()">添加至白名单</button>
+          </div>
+          <p style="margin-top: 14px;"><span id="policy-match-badge" class="badge badge-direct">状态待检测</span></p>
+        </div>
+
+        <div class="tile c12" data-ui>
+          <p class="tl">策略路由参数 (通常无需修改)</p>
+          <div class="grid2" style="grid-template-columns: repeat(3, 1fr);">
+            <label class="field"><span>TProxy 监听端口</span>
+              <input type="number" id="cfg-tproxy-port" class="input" value="12345"></label>
+            <label class="field"><span>策略路由 FWMARK</span>
+              <input type="text" id="cfg-fwmark" class="input" value="0x1"></label>
+            <label class="field"><span>路由表 ID</span>
+              <input type="number" id="cfg-table" class="input" value="100"></label>
+          </div>
+          <button type="button" class="btn btn-primary" style="width: 100%; margin-top: 14px;" onclick="saveNetworkCardSettings()">保存网卡配置</button>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ============ 视图 3: 状态 (默认落地页) ============ -->
+    <section id="view-status" class="view active">
+      <div class="board">
+
+        <div class="tile c3 readout" data-ui>
+          <p class="tl">sing-box 内核</p>
+          <p class="tv big"><span class="dot" id="st-singbox-dot"></span><span id="st-singbox-text">未知</span></p>
+          <p class="tsub">Hysteria 2 · QUIC · Brutal 拥塞控制</p>
+        </div>
+        <div class="tile c3 readout" data-ui>
+          <p class="tl">TProxy 劫持规则</p>
+          <p class="tv big" id="st-tproxy-text">未知</p>
+          <p class="tsub">开启时非白名单流量走隧道</p>
+        </div>
+        <div class="tile c3 readout" data-ui>
+          <p class="tl">无线通道策略</p>
+          <p class="tv big" id="st-policy-text">未知</p>
+          <p class="tsub">通道 B · 由策略与白名单决定</p>
+        </div>
+        <div class="tile c3 readout" data-ui>
+          <p class="tl">Wi-Fi 通道</p>
+          <p class="tv big" id="st-wifi-text">未知</p>
+          <p class="tsub" id="st-wifi-sub">SSID 感知在宿主 dispatcher 侧</p>
+        </div>
+
+        <div class="tile c12" data-ui>
+          <p class="tl">手动干预 (立即生效, 不改通道策略)</p>
+          <div class="row">
+            <button type="button" class="btn btn-warn" style="flex: 1;" onclick="manualProxySwitch('on')">手动启用代理</button>
+            <button type="button" class="btn btn-primary" style="flex: 1;" onclick="manualProxySwitch('off')">手动恢复直连</button>
+          </div>
+        </div>
+
+        <div class="tile dark c12" data-ui>
+          <p class="tl" style="color: var(--panel-muted);">运维速查 (宿主机执行)</p>
+          <div class="codebox">
+            <pre>journalctl -f -t HY2_DISPATCH -t HY2_PROXY   # 实时分流决策日志
+/usr/local/bin/proxy-switch.sh status         # 查看规则状态
+sudo /usr/local/bin/proxy-switch.sh off       # 一键恢复直连 (排障用)
+curl -s http://127.0.0.1:8080/api/status      # 后端健康快照</pre>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="foot">
+    <span>Smart Hy2 Gateway Console v1.1</span><span class="sep">·</span>
+    <span>后端 http://127.0.0.1:8080 · 断网自动演示模式</span><span class="sep">·</span>
+    <span>文档: README.md · docs/deploy.md (仓库内)</span>
+  </footer>
+
+  <script src="console.js"></script>
+</body>
+</html>
