@@ -70,7 +70,7 @@ flowchart TB
 - **TProxy 透明代理**：mangle `HY2_PRE`（PREROUTING）+ `HY2_OUT`（OUTPUT）配合 fwmark 1 / table 100 策略路由，宿主机与虚拟机流量无感接管；UID 930 owner 放行杜绝 sing-box 自身回环。
 - **Hysteria 2 (QUIC) 出站**：sing-box 1.10.x 以专用 UID + `cap_net_admin` 运行，配置经 `sing-box check` 校验通过后才落盘重启，坏配置不破坏运行态。
 - **Web 控制台**（三视图，断网自动演示模式、恢复自动回在线）：
-  - **节点配置**：v2rayN `hy2://` 分享链接 / sing-box JSON 一键解析导入；连通性分段诊断（DNS / 国内·国际直连 TCP / 节点解析 / 节点 UDP 静默探测）
+  - **节点配置**：v2rayN `hy2://` 分享链接 / sing-box JSON 一键解析导入（兼容 `allowInsecure` 别名、`pinSHA256`（sing-box 不支持证书锁定，insecure 下显式忽略）、`mport`/`ports` 端口跳跃；带宽缺省 = BBR 自适应）；连通性分段诊断（DNS / 国内·国际直连 TCP / 节点解析 / 节点 UDP 静默探测）
   - **网卡配置**：宿主真实网卡下拉选择（类型过滤）；通道策略三态切换；白名单管理
   - **状态**：sing-box / TProxy 规则实况 / 通道策略 / Wi-Fi 通道四读数，手动启停，运维速查
 - **REST API**：`/api/state` · `/api/apply` · `/api/status` · `/api/proxy` · `/api/interfaces` · `/api/nettest`

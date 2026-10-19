@@ -83,10 +83,10 @@
               <input type="text" id="node-obfs-type" class="input" placeholder="留空不使用, 或 salamander" oninput="updateLivePreview()"></label>
             <label class="field"><span>混淆口令 (Obfs Password)</span>
               <input type="text" id="node-obfs-pass" class="input" oninput="updateLivePreview()"></label>
-            <label class="field"><span>下行带宽 (Down Mbps)</span>
-              <input type="number" id="node-down" class="input" value="300" oninput="updateLivePreview()"></label>
-            <label class="field"><span>上行带宽 (Up Mbps)</span>
-              <input type="number" id="node-up" class="input" value="80" oninput="updateLivePreview()"></label>
+            <label class="field"><span>下行带宽 (Down Mbps · 留空 = BBR 自动)</span>
+              <input type="number" id="node-down" class="input" placeholder="留空 = BBR 自动" oninput="updateLivePreview()"></label>
+            <label class="field"><span>上行带宽 (Up Mbps · 留空 = BBR 自动)</span>
+              <input type="number" id="node-up" class="input" placeholder="留空 = BBR 自动" oninput="updateLivePreview()"></label>
           </div>
           <div class="row" style="margin-top: 16px; justify-content: flex-end;">
             <button type="button" class="btn btn-primary" onclick="saveAndDeployNode()">保存为活跃节点并下发配置</button>

@@ -32,8 +32,9 @@ const appState = {
     insecure: false,
     obfsType: '',
     obfsPassword: '',
-    upMbps: 100,
-    downMbps: 300
+    upMbps: null,              // null = 不指定 -> BBR (v2rayN 语义)
+    downMbps: null,
+    portHopping: ''            // v2rayN mport/ports -> 端口跳跃
   }
 };
 
@@ -203,8 +204,9 @@ function mapApiStateToApp(data) {
     insecure: !!n.insecure,
     obfsType: n.obfs_type || '',
     obfsPassword: n.obfs_password || '',
-    upMbps: n.up_mbps ?? 100,
-    downMbps: n.down_mbps ?? 300
+    upMbps: n.up_mbps ?? null,
+    downMbps: n.down_mbps ?? null,
+    portHopping: n.port_hopping || ''
   };
 
   appState.network.rj45Dev = data.rj45_iface || appState.network.rj45Dev;
@@ -241,6 +243,7 @@ function parseFwmarkToInt(val) {
 
 // 组装 POST /api/apply 的完整 snake_case payload
 function buildApplyPayload() {
+  const num = (v) => Number.isFinite(parseInt(v, 10)) ? parseInt(v, 10) : null;
   return {
     whitelist: appState.whitelist.slice(),
     current_node: {
@@ -252,8 +255,9 @@ function buildApplyPayload() {
       insecure: !!appState.currentNode.insecure,
       obfs_type: appState.currentNode.obfsType || '',
       obfs_password: appState.currentNode.obfsPassword || '',
-      up_mbps: parseInt(appState.currentNode.upMbps, 10) || 0,
-      down_mbps: parseInt(appState.currentNode.downMbps, 10) || 0
+      up_mbps: num(appState.currentNode.upMbps),        // null = BBR
+      down_mbps: num(appState.currentNode.downMbps),
+      port_hopping: appState.currentNode.portHopping || ''
     },
     wifi_iface: appState.network.wifiDev,
     rj45_iface: appState.network.rj45Dev,
@@ -491,8 +495,9 @@ function parseHysteria2Raw(raw) {
         insecure: !!ob.tls?.insecure,
         obfsType: ob.obfs?.type || '',
         obfsPassword: ob.obfs?.password || '',
-        upMbps: ob.up_mbps || 100,
-        downMbps: ob.down_mbps || 300
+        upMbps: ob.up_mbps ?? null,
+        downMbps: ob.down_mbps ?? null,
+        portHopping: ob.port_hopping || ''
       };
     } catch (e) {
       throw new Error('JSON 格式解析失败: ' + e.message);
@@ -512,11 +517,15 @@ function parseHysteria2Raw(raw) {
         port: url.port ? parseInt(url.port, 10) : 443,
         password: decodeURIComponent(url.username || ''),
         sni: params.get('sni') || '',
-        insecure: params.get('insecure') === '1' || params.get('insecure') === 'true',
+        // v2rayN 兼容: insecure 与 allowInsecure 互为别名 (链接可带其一或都带)
+        insecure: ['1', 'true'].includes(params.get('insecure')) || ['1', 'true'].includes(params.get('allowInsecure')),
+        // pinSHA256 参数: sing-box 不支持证书锁定; insecure=1 时本就跳过校验, 显式忽略
         obfsType: params.get('obfs') || '',
         obfsPassword: params.get('obfs-password') || '',
-        upMbps: params.get('upmbps') ? parseInt(params.get('upmbps'), 10) : 100,
-        downMbps: params.get('downmbps') ? parseInt(params.get('downmbps'), 10) : 300
+        // 带宽缺省不指定 -> BBR; v2rayN 的 mport/ports -> 端口跳跃
+        upMbps: params.get('upmbps') ? parseInt(params.get('upmbps'), 10) : null,
+        downMbps: params.get('downmbps') ? parseInt(params.get('downmbps'), 10) : null,
+        portHopping: params.get('mport') || params.get('ports') || ''
       };
     } catch (e) {
       throw new Error('v2rayN URI 链接格式不符合标准: ' + e.message);
@@ -552,8 +561,8 @@ function fillNodeForm(node) {
   document.getElementById('node-insecure').value = node.insecure ? "true" : "false";
   document.getElementById('node-obfs-type').value = node.obfsType;
   document.getElementById('node-obfs-pass').value = node.obfsPassword;
-  document.getElementById('node-up').value = node.upMbps;
-  document.getElementById('node-down').value = node.downMbps;
+  document.getElementById('node-up').value = node.upMbps ?? '';
+  document.getElementById('node-down').value = node.downMbps ?? '';
 }
 
 function updateLivePreview() {
@@ -564,8 +573,10 @@ function updateLivePreview() {
   appState.currentNode.insecure = document.getElementById('node-insecure').value === "true";
   appState.currentNode.obfsType = document.getElementById('node-obfs-type').value;
   appState.currentNode.obfsPassword = document.getElementById('node-obfs-pass').value;
-  appState.currentNode.upMbps = parseInt(document.getElementById('node-up').value, 10) || 100;
-  appState.currentNode.downMbps = parseInt(document.getElementById('node-down').value, 10) || 300;
+  const upV = parseInt(document.getElementById('node-up').value, 10);
+  const downV = parseInt(document.getElementById('node-down').value, 10);
+  appState.currentNode.upMbps = Number.isFinite(upV) ? upV : null;   // 空 = BBR
+  appState.currentNode.downMbps = Number.isFinite(downV) ? downV : null;
 }
 
 // 样例为无口令演示形态; 真实分享链接由使用者粘贴, 凭据不经过源码

@@ -62,8 +62,11 @@ class Hy2NodeModel(BaseModel):
     insecure: bool = False
     obfs_type: str = ""      # 为空表示无混淆; 有值时通常为 salamander
     obfs_password: str = ""
-    up_mbps: int = Field(default=100, ge=0)
-    down_mbps: int = Field(default=300, ge=0)
+    # 带宽仅显式指定时写入配置; None = 缺省 -> BBR 自适应 (v2rayN 导入语义)
+    up_mbps: Optional[int] = Field(default=None, ge=0)
+    down_mbps: Optional[int] = Field(default=None, ge=0)
+    # v2rayN 的 mport/ports 参数 -> sing-box 端口跳跃, 如 "20000-30000" 或 "443,8443"
+    port_hopping: str = ""
 
 
 class StateModel(BaseModel):
@@ -121,8 +124,6 @@ def build_singbox_config(state: StateModel) -> dict:
         "server": node.server,
         "server_port": node.port,
         "password": node.password,
-        "up_mbps": node.up_mbps,
-        "down_mbps": node.down_mbps,
         "tls": {
             "enabled": True,
             "server_name": node.sni if node.sni else node.server,  # SNI 为空则回退 server
@@ -131,6 +132,15 @@ def build_singbox_config(state: StateModel) -> dict:
     }
     if node.obfs_type:
         hy2_outbound["obfs"] = {"type": node.obfs_type, "password": node.obfs_password}
+    # 带宽仅显式指定时写入: 缺省 = BBR (v2rayN 语义: 链接不带 upmbps/downmbps 即不指定)
+    if node.up_mbps:
+        hy2_outbound["up_mbps"] = node.up_mbps
+    if node.down_mbps:
+        hy2_outbound["down_mbps"] = node.down_mbps
+    if node.port_hopping:
+        # v2rayN mport/ports -> sing-box 端口跳跃
+        hy2_outbound["port_hopping"] = node.port_hopping
+        hy2_outbound["port_hopping_interval"] = "30s"
 
     return {
         "log": {"level": "info", "timestamp": True},
