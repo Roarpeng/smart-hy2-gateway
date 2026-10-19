@@ -74,6 +74,7 @@ flowchart TB
   - **网卡配置**：宿主真实网卡下拉选择（类型过滤）；通道策略三态切换；白名单管理
   - **状态**：sing-box / TProxy 规则实况 / 通道策略 / Wi-Fi 通道四读数，手动启停，运维速查
 - **REST API**：`/api/state` · `/api/apply` · `/api/status` · `/api/proxy` · `/api/interfaces` · `/api/nettest`
+- **地理分流（v2rayN 式「绕过大陆」）**：代理开启时中国域名/IP（geosite-cn / geoip-cn 规则集，随仓库 `ruleset/` 内置、构建与运行零外联下载）自动直连，其余走 Hysteria 2 隧道；DNS 同步拆分——国内域名用 223.5.5.5 解析（CDN 友好），国外域名经隧道解析（防污染）。
 - **Host-Only 虚拟机直连兜底**：代理关闭时脚本确保 `ip_forward` + MASQUERADE，虚拟机不断网。
 
 ## 快速开始
@@ -105,6 +106,7 @@ smart-hy2-gateway/（部署目录 = /opt/hy2-gateway）
 ├── scripts/
 │   ├── proxy-switch.sh              TProxy 开关 (on/off/status, 幂等, RJ45 硬直连)
 │   └── 99-wifi-proxy.sh             NetworkManager dispatcher (wifi_policy 决策)
+├── ruleset/                         地理分流规则集 (geosite/geoip CN 直连, 构建时内置镜像)
 ├── web/                             控制台前端 (零框架, 仅字体走 CDN 且带回退)
 │   ├── index.html · console.css · console.js
 ├── data/                            运行时状态 (含节点口令, 已 gitignore)

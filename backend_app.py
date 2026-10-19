@@ -37,6 +37,7 @@ SINGBOX_CONFIG_FILE = Path("/data/singbox.json")
 WEB_DIR = Path("/app/web")
 SINGBOX_BIN = "sing-box"
 PROXY_SWITCH_SCRIPT = "/usr/local/bin/proxy-switch.sh"
+RULE_SET_DIR = "/usr/local/share/sing-box"   # 地理分流规则集 (镜像构建时内置)
 SINGBOX_UID = 930          # sing-box 进程专用账户 (iptables owner 匹配防回环)
 SINGBOX_GID = 930
 CHECK_TIMEOUT = 15         # sing-box check 超时 (秒)
@@ -133,12 +134,16 @@ def build_singbox_config(state: StateModel) -> dict:
 
     return {
         "log": {"level": "info", "timestamp": True},
+        # DNS 拆分: 国内域名用国内 DNS (CDN 调度友好), 其余经隧道解析 (防污染)
         "dns": {
             "servers": [
+                {"tag": "cn-dns", "address": "udp://223.5.5.5", "detour": "direct"},
                 {"tag": "proxy-dns", "address": "udp://1.1.1.1", "detour": node.tag},
-                {"tag": "local-dns", "address": "local", "detour": "direct"},
             ],
-            "rules": [{"outbound": "any", "server": "local-dns"}],
+            "rules": [
+                {"rule_set": ["geosite-cn"], "server": "cn-dns"},
+                {"outbound": "any", "server": "cn-dns"},   # sing-box 自身解析(节点域名/直连出站)走直连
+            ],
             "final": "proxy-dns",
         },
         "inbounds": [
@@ -151,7 +156,22 @@ def build_singbox_config(state: StateModel) -> dict:
             }
         ],
         "outbounds": [hy2_outbound, {"type": "direct", "tag": "direct"}],
-        "route": {"auto_detect_interface": True, "final": node.tag},
+        # 地理分流 (v2rayN 式"绕过大陆"): 中国域名/IP 直连, 其余走 Hysteria 2 隧道;
+        # 规则集为镜像内置本地文件, 运行时零下载依赖
+        "route": {
+            "auto_detect_interface": True,
+            "rules": [
+                {"rule_set": ["geosite-cn"], "outbound": "direct"},
+                {"rule_set": ["geoip-cn"], "outbound": "direct"},
+            ],
+            "rule_set": [
+                {"type": "local", "tag": "geosite-cn", "format": "binary",
+                 "path": f"{RULE_SET_DIR}/geosite-cn.srs"},
+                {"type": "local", "tag": "geoip-cn", "format": "binary",
+                 "path": f"{RULE_SET_DIR}/geoip-cn.srs"},
+            ],
+            "final": node.tag,
+        },
     }
 
 

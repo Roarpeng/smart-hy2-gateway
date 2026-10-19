@@ -158,11 +158,15 @@ curl http://127.0.0.1:8080/api/interfaces
 curl -X POST http://127.0.0.1:8080/api/nettest -H 'Content-Type: application/json' -d '{"target":"www.google.com"}'
 ```
 
-**虚拟机出口验证**——在虚拟机内执行，出口 IP 应为 Hysteria 2 节点 IP：
+**虚拟机出口验证**——在虚拟机内执行；代理开启时因地理分流，国内与国外出口不同（国内直连、国外经节点）：
 
 ```bash
-curl -s ifconfig.me && echo
+curl -s myip.ipip.net          # 国内服务: 应显示本地运营商出口 (直连)
+curl -s https://api.ipify.org  # 国外服务: 应显示 Hysteria 2 节点 IP (隧道)
+curl -s ifconfig.me && echo    # 同上对照
 ```
+
+> 地理分流规则（geosite-cn / geoip-cn）随仓库 `ruleset/` 目录内置，构建与运行均零外联；更新规则集：从 [sing-geosite](https://gitlab.com/SagerNet/sing-geosite)/[sing-geoip](https://gitlab.com/SagerNet/sing-geoip) 的 rule-set 分支取最新 `.srs` 覆盖后 `docker compose up -d --build`。
 
 ## 5. Wi-Fi 切换自动分流测试
 

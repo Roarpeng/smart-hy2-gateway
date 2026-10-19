@@ -7,9 +7,12 @@ ARG SINGBOX_VERSION=1.10.7
 
 FROM golang:alpine AS sb-fetcher
 ARG SINGBOX_VERSION
+# sing-box 官方 release: ghfast 镜像优先 (国内网络), GitHub 直连为辅; 均带硬超时防爬行卡死
 RUN apk add --no-cache curl tar \
-    && curl -fsSL -o /tmp/sb.tar.gz \
-       "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz" \
+    && { curl -fsSL --connect-timeout 8 -m 240 -o /tmp/sb.tar.gz \
+         "https://ghfast.top/https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz" \
+         || curl -fsSL --connect-timeout 8 -m 240 -o /tmp/sb.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"; } \
     && tar -xzf /tmp/sb.tar.gz -C /tmp \
     && mv "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box \
     && chmod 755 /usr/local/bin/sing-box \
@@ -29,6 +32,8 @@ RUN addgroup -g 930 singbox \
     && adduser -D -H -h /nonexistent -s /sbin/nologin -u 930 -G singbox singbox
 
 COPY --from=sb-fetcher /usr/local/bin/sing-box /usr/local/bin/sing-box
+# 地理分流规则集 (中国域名/IP 直连), 随仓库内置, 构建零外联
+COPY ruleset/ /usr/local/share/sing-box/
 # 文件级能力: 允许非 root 的 sing-box 进程执行 TPROXY 并绑定特权端口
 # 注: 构建沙箱的能力边界集不含 NET_ADMIN, setcap 后不能直接执行该二进制验证,
 #     用 getcap 校验能力位即可; 运行期容器已 cap_add NET_ADMIN, 可正常执行
