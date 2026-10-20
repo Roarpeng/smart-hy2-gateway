@@ -214,6 +214,9 @@ do_on() {
     ensure_forward_rules
 
     log "代理已开启: 全量流量 (本机 + VMnet $VMNET_SUBNET) -> TProxy :$TPROXY_PORT (Hysteria 2)"
+
+    # 决策落盘: 后端 rule-guard 每 30s 对齐此期望态, 规则被意外清除时自动恢复
+    echo "on" > "$(dirname "$STATE_FILE")/last_decision" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
@@ -240,6 +243,9 @@ do_off() {
     ensure_forward_rules
 
     log "已恢复直连: VMnet $VMNET_SUBNET 经 $WIFI_DEV MASQUERADE 出网通路已确保"
+
+    # 决策落盘: 后端 rule-guard 每 30s 对齐此期望态 (见 do_on 注释)
+    echo "off" > "$(dirname "$STATE_FILE")/last_decision" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------

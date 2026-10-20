@@ -229,6 +229,7 @@ nmcli device wifi connect "AnotherNet" password "<密码>"
 |------|------|------|
 | Wi-Fi 已连白名单，但 `ip rule` 仍有 fwmark 0x1，虚拟机流量仍走代理 | TProxy 规则残留（dispatcher 未触发或脚本执行中断）；若 `wifi_policy=always_proxy` 则属预期行为（见下一行） | 手动执行 `sudo /usr/local/bin/proxy-switch.sh off` 清除；再检查 `journalctl -t HY2_DISPATCH --since -10min` 是否有对应事件 |
 | 切了白名单不生效 / 连白名单 SSID 仍走代理 | `wifi_policy` 处于 `always_proxy`（强制代理，忽略白名单） | 控制台策略页切回「白名单例外」（whitelist）模式并「下发」；随后切换一次 Wi-Fi 触发 dispatcher 重新决策 |
+| 国外站突然全打不开（如 YouTube 超时），国内正常 | TProxy 规则被第三方意外清除（容器重建/系统事件），流量全部直连被墙 | **rule-guard 会在 30 秒内自动恢复**，`docker logs hy2-gateway \| grep rule-guard` 可见恢复记录；若未恢复：手动 `sudo /usr/local/bin/proxy-switch.sh on`，并检查 `/opt/hy2-gateway/data/last_decision` 期望态文件 |
 | 容器反复重启或起不来 | 镜像构建失败（sing-box 下载不通）或 privileged/权限不足 | `docker logs hy2-gateway` 查看具体报错；构建阶段下载 sing-box 失败时重跑 `docker compose up -d --build`，或修改 compose 的 `build.args.SINGBOX_VERSION`；确认 `privileged: true` 与 `cap_add: NET_ADMIN` 生效 |
 | 代理关闭（off 态）时虚拟机无法上网 | `ip_forward` 未开启或 MASQUERADE 未生效，Host-Only 流量无人转发 | 重放 `sudo /usr/local/bin/proxy-switch.sh off`（脚本会确保 ip_forward=1 与 MASQUERADE）；检查 `iptables -t nat -S | grep MASQUERADE` 与 `sysctl net.ipv4.ip_forward` |
 | 虚拟机 DNS 解析异常或缓慢 | TProxy 同时截获 UDP，DNS（UDP 53）查询也经 Hysteria 2 隧道由远端解析，属预期行为；若 DNS 服务器位于私网则直连 | 虚拟机 DNS 改用公共地址 `1.1.1.1`、`8.8.8.8`；确认节点侧可正常解析；私网 DNS 会命中 RETURN 规则直连，需保证该网段可达 |

@@ -75,6 +75,7 @@ flowchart TB
   - **状态**：sing-box / TProxy 规则实况 / 通道策略 / Wi-Fi 通道四读数，手动启停，运维速查
 - **REST API**：`/api/state` · `/api/apply` · `/api/status` · `/api/proxy` · `/api/interfaces` · `/api/nettest`
 - **地理分流（v2rayN 式「绕过大陆」）**：代理开启时中国域名/IP（geosite-cn / geoip-cn 规则集，随仓库 `ruleset/` 内置、构建与运行零外联下载）自动直连，其余走 Hysteria 2 隧道；DNS 同步拆分——国内域名用 223.5.5.5 解析（CDN 友好），国外域名经隧道解析（防污染）。
+- **规则守护（rule-guard）**：dispatcher 每次决策落盘期望态，后端每 30s 将 iptables 实况对齐——任何原因（容器重建、系统事件）导致的规则丢失在一个周期内自动恢复；Wi-Fi 波动断连不清规则。
 - **Host-Only 虚拟机直连兜底**：代理关闭时脚本确保 `ip_forward` + MASQUERADE，虚拟机不断网。
 
 ## 快速开始

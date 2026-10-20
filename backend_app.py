@@ -43,6 +43,8 @@ SINGBOX_GID = 930
 CHECK_TIMEOUT = 15         # sing-box check 超时 (秒)
 SWITCH_TIMEOUT = 30        # proxy-switch.sh 执行超时 (秒)
 STABLE_UPTIME = 60         # 存活超过该秒数则重置崩溃退避
+LAST_DECISION_FILE = Path("/data/last_decision")  # proxy-switch on/off 落盘的期望态
+GUARD_INTERVAL = 30        # 规则守护巡检周期 (秒)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 log = logging.getLogger("hy2-gateway")
@@ -148,7 +150,8 @@ def build_singbox_config(state: StateModel) -> dict:
         "dns": {
             "servers": [
                 {"tag": "cn-dns", "address": "udp://223.5.5.5", "detour": "direct"},
-                {"tag": "proxy-dns", "address": "udp://1.1.1.1", "detour": node.tag},
+                # 国外域名经隧道 DoH 解析: 不少节点不放行 UDP 53, TCP 443 必通且更防污染
+                {"tag": "proxy-dns", "address": "https://1.1.1.1/dns-query", "detour": node.tag},
             ],
             "rules": [
                 {"rule_set": ["geosite-cn"], "server": "cn-dns"},
@@ -163,6 +166,11 @@ def build_singbox_config(state: StateModel) -> dict:
                 "listen": "::",                 # 双栈监听, 端口由状态文件驱动
                 "listen_port": state.tproxy_port,
                 "sniff": True,
+                # 嗅探到域名后用本配置的拆分 DNS 重解析并覆盖目标地址:
+                # 系统 resolver 被污染时(如 youtube 返回假 IP), 此开关让连接
+                # 奔向真实 IP (国外经隧道解析 / 国内走 223.5.5.5), 否则隧道
+                # 只是把包送到了污染 IP 上
+                "sniff_override_destination": True,
             }
         ],
         "outbounds": [hy2_outbound, {"type": "direct", "tag": "direct"}],
@@ -347,6 +355,35 @@ def is_proxy_active() -> bool:
     except Exception:
         pass
     return False
+
+
+def rule_guard_loop() -> None:
+    """规则守护: 每 30s 将 iptables 实况对齐到落盘期望态 (last_decision)。
+
+    期望态由 proxy-switch.sh 在每次 on/off 成功后写入 (dispatcher 决策与
+    手动干预都经该脚本, 故始终权威)。任何第三方 (docker 生命周期/系统
+    事件) 意外清除规则时, 一个周期内自动恢复, 不再依赖 Wi-Fi 事件触发。
+    """
+    while True:
+        time.sleep(GUARD_INTERVAL)
+        try:
+            if not LAST_DECISION_FILE.exists():
+                continue
+            expected = LAST_DECISION_FILE.read_text(encoding="utf-8").strip()
+            if expected not in ("on", "off"):
+                continue
+            active = is_proxy_active()
+            if (expected == "on") != active:
+                log.warning("rule-guard: 规则与期望态不一致 (期望=%s 实际=%s), 自动恢复中",
+                            expected, "on" if active else "off")
+                subprocess.run(
+                    [PROXY_SWITCH_SCRIPT, expected],
+                    shell=False,  # argv 列表直传; expected 已限定为 on/off
+                    capture_output=True, text=True, timeout=SWITCH_TIMEOUT,
+                    env=proxy_switch_env(),
+                )
+        except Exception as exc:
+            log.warning("rule-guard: 巡检异常(%s), 下个周期重试", exc)
 
 
 # ---------------- API 路由 (先于静态挂载注册) ----------------
@@ -604,6 +641,9 @@ def main() -> None:
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _handle_signal)
+
+    # 规则守护线程: 兜底任何意外清除的 TProxy 规则 (期望态见 last_decision)
+    threading.Thread(target=rule_guard_loop, name="rule-guard", daemon=True).start()
     signal.signal(signal.SIGINT, _handle_signal)
 
     log.info("WebUI listening on %s:%d", web_host, web_port)

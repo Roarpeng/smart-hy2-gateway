@@ -129,8 +129,11 @@ case "$ACTION" in
         esac
         ;;
     down)
-        # 断开时恢复直连 (任何策略下都一样); off 内部会确保 VMnet MASQUERADE 直连通路
-        proxy_ctl off "$INTERFACE down, 恢复直连"
+        # Wi-Fi 断开: 不再清除 TProxy 规则。
+        # 断网期间规则无害(无流量可劫持), 且 down->off->up 依赖事件恢复,
+        # 在 Wi-Fi 波动场景会造成规则丢失窗口(实测踩坑); 直连通路由
+        # MASQUERADE 常驻规则兜底。清除规则只发生在明确的直连决策时。
+        log "决策: 保持现有规则 ($INTERFACE down, 断网不清规则)"
         ;;
     *)
         # 其他动作不改变代理状态
