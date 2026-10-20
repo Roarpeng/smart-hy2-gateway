@@ -1,5 +1,6 @@
-# 运行时状态文件 (含节点密码, 严禁入库)
-data/*.json
+# 运行时状态文件 (含节点密码与运行时决策, 严禁入库)
+data/*
+!data/.gitkeep
 
 # Python
 __pycache__/
