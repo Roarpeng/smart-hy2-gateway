@@ -4,7 +4,7 @@ services:
     build:
       context: .
       args:
-        SINGBOX_VERSION: "1.10.7"
+        SINGBOX_VERSION: "1.11.15"
     container_name: hy2-gateway
     restart: always
     # host 网络模式: 容器共享宿主 Linux 网络栈, TProxy 劫持与 iptables 操作所需

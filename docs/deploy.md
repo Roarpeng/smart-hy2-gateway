@@ -68,8 +68,8 @@ docker compose up -d --build
 容器要点：
 
 - 容器名 `hy2-gateway`，`network_mode: host` + `privileged` + `NET_ADMIN`，直接操作宿主网络栈。
-- sing-box 1.10.x 以 TProxy `:12345` 接收透明代理流量，Hysteria 2 (QUIC) 出站；以 UID 930 + `setcap cap_net_admin` 运行。
-- FastAPI WebUI 监听 `:8080`，托管 `web/index.html`，提供 `/api/state`、`/api/apply`、`/api/status`、`/api/proxy`、`/api/interfaces`（宿主网卡枚举，供下拉选择）、`/api/nettest`（宿主机视角分段连通性诊断）。
+- sing-box 1.11.x 以 TProxy `:12345` 接收透明代理流量，Hysteria 2 (QUIC) 出站；以 UID 930 + `setcap cap_net_admin` 运行。
+- FastAPI WebUI 监听 `:8080`，托管 `web/index.html`，提供 `/api/state`、`/api/apply`、`/api/status`、`/api/proxy`、`/api/interfaces`（宿主网卡枚举，供下拉选择）、`/api/nettest`（宿主机视角分段连通性诊断），以及节点管理接口 `/api/nodes`、`/api/nodes/import`、`/api/nodes/{id}/activate`、`PATCH/DELETE /api/nodes/{id}`、`/api/nodes/test`。
 - 挂载 `./data:/data`（状态与 sing-box 配置）。Wi-Fi 事件感知在宿主 dispatcher 侧完成，容器不挂载 dbus。
 
 确认容器运行：
@@ -82,17 +82,29 @@ docker logs hy2-gateway
 ## 3. 首次配置
 
 1. 浏览器打开 `http://宿主IP:8080`。
-2. 节点配置页：粘贴 v2rayN 的 `hy2://` 分享链接或节点 JSON，控制台自动解析服务器、端口、密码、SNI、obfs 等字段。
-3. 白名单页：添加可信 Wi-Fi 的 SSID（例如家庭、公司办公网）。
-4. 策略页：选择无线通道策略（默认「走代理·白名单例外」，即 `wifi_policy=whitelist`；可切换「强制代理」`always_proxy` / 「强制直连」`always_direct`）。策略页按双通道分组呈现：通道A（RJ45 有线）恒直连，通道B（Wi-Fi 无线）受 `wifi_policy` 控制。
-5. 点击「下发 / 应用」。后端会：
-   - 将配置写入 `/opt/hy2-gateway/data/gateway_state.json`；
+2. **节点管理页（v2rayN 式）导入节点**，任选一种或组合使用：
+   - 批量粘贴 `hy2://` / `hysteria2://` 分享链接，每行一条；空行与行首 `#` 注释行会被忽略；
+   - 粘贴整段 base64 订阅内容（标准 / URL-safe / 无 padding 均可自动识别）；
+   - 填写订阅 URL（仅 `http/https`，由后端拉取；私网、回环、链路本地地址会被拒绝，见「安全须知」）；
+   - 粘贴 sing-box JSON（完整配置、单个 outbound 或 outbound 数组）。
+
+   导入后在节点列表确认：
+   - 多节点并列展示，输入内重复节点自动去重，标签冲突自动加后缀；
+   - 点「启用」切换当前活跃节点；
+   - 点节点行的「测试」或首屏「测试延迟」，发起真实 Hysteria 2 连通性测试（不是 ICMP ping）；
+   - 可编辑、重命名、删除节点；编辑活跃节点后点「保存修改」会重新校验并重启 sing-box，非活跃节点可直接「保存并启用」。
+
+   > Clash YAML 暂不支持，请先转换为分享链接或 sing-box JSON 再导入。
+3. 「双通道」页 → 可信 Wi-Fi：添加可信 Wi-Fi 的 SSID（例如家庭、公司办公网）。
+4. 「双通道」页 → 通道 B：选择无线通道策略（默认「走代理·白名单例外」，即 `wifi_policy=whitelist`；可切换「强制代理」`always_proxy` / 「强制直连」`always_direct`）。页面按双通道分组呈现：通道A（RJ45 有线）恒直连，通道B（Wi-Fi 无线）受 `wifi_policy` 控制。
+5. 点「保存网卡配置」，或启用/保存节点。后端会：
+   - 将启用节点、节点列表与其余配置写入 `/opt/hy2-gateway/data/gateway_state.json`；
    - 生成 sing-box 配置；
-   - 执行 `sing-box check`，**校验通过后才重启 sing-box**；失败则返回错误信息且不重启，旧配置继续生效。
+   - 执行 `sing-box check`，**校验通过后才重启 sing-box**；失败则返回错误信息且不重启、不改写状态文件，旧配置继续生效。
 6. 后端离线（容器未启动）时，控制台自动进入演示模式：可查看与预填配置，但写操作不下发；后端恢复后控制台自动回到在线模式。
 7. 控制台「当前 Wi-Fi」在线时可能显示「未感知」——SSID 感知在宿主 dispatcher 侧，容器内无 nmcli。真实 SSID 与切换记录以 `journalctl -t HY2_DISPATCH -t HY2_PROXY` 为准。
 
-下发后配置在下一次 Wi-Fi 事件时自动生效；需要立即切换可手动执行：
+双通道策略/网卡变更后，TProxy 决策会在下一次 Wi-Fi 事件时自动生效；节点启用/保存会立即校验并重启 sing-box。需要立即切换可手动执行：
 
 ```bash
 sudo /usr/local/bin/proxy-switch.sh on    # 开启 TProxy 透明代理
@@ -158,6 +170,43 @@ curl http://127.0.0.1:8080/api/interfaces
 curl -X POST http://127.0.0.1:8080/api/nettest -H 'Content-Type: application/json' -d '{"target":"www.google.com"}'
 ```
 
+**节点管理 API**——应返回节点列表、启用状态与标签：
+
+```bash
+curl -s http://127.0.0.1:8080/api/nodes | jq
+```
+
+**批量导入与去重**——在控制台节点管理页依次验证：
+
+- 粘贴多行分享链接 / 整段 base64 / 订阅 URL，列表节点数应正确增加；
+- 再次导入同一批内容，节点总数不变（输入内去重）；
+- 标签冲突自动加后缀，`direct`、`proxy-dns`、`tproxy-in` 等保留 tag 不被节点占用。
+
+**活跃节点切换与延迟测试**：
+
+```bash
+# {id} 替换为 /api/nodes 返回的节点 id
+curl -X POST http://127.0.0.1:8080/api/nodes/{id}/activate
+curl -X POST http://127.0.0.1:8080/api/nodes/test | jq
+```
+
+预期：目标节点在 `/api/nodes` 中变为启用状态；延迟测试对节点发起真实 Hysteria 2 握手，不可达节点返回失败/超时，不依赖 ICMP。
+
+**坏节点不下发（状态文件保护）**：
+
+```bash
+STATE=/opt/hy2-gateway/data/gateway_state.json
+BEFORE=$(sha256sum "$STATE" | cut -d' ' -f1)
+
+# 在控制台编辑活跃节点：改错密码，或把端口改成非法值，然后点「保存修改」或「保存并启用」
+# 预期：/api/apply 返回 sing-box check 失败，旧配置继续生效
+
+AFTER=$(sha256sum "$STATE" | cut -d' ' -f1)
+[ "$BEFORE" = "$AFTER" ] && echo "state unchanged"
+```
+
+若哈希不变且容器未重启，说明坏节点未落盘、未下发，符合预期；修正节点后重新下发即可。
+
 **虚拟机出口验证**——在虚拟机内执行；代理开启时因地理分流，国内与国外出口不同（国内直连、国外经节点）：
 
 ```bash
@@ -202,23 +251,23 @@ nmcli radio wifi on   # 测试完恢复
 
 ### 策略模式验证（wifi_policy）
 
-dispatcher 按顶层状态字段 `wifi_policy` 三态决策：`whitelist` 即上面主流程；`always_proxy` 在 Wi-Fi up / connectivity-change 时恒开代理、忽略白名单（Wi-Fi down 事件仍会关闭代理）；`always_direct` 恒关代理。切换方法：控制台策略页修改 `wifi_policy` →「下发」→ 再切换一次 Wi-Fi 触发 dispatcher 重新决策。
+dispatcher 按顶层状态字段 `wifi_policy` 三态决策：`whitelist` 即上面主流程；`always_proxy` 在 Wi-Fi up / connectivity-change 时恒开代理、忽略白名单（Wi-Fi down 事件仍会关闭代理）；`always_direct` 恒关代理。切换方法：控制台「双通道」页修改通道 B 策略 →「保存网卡配置」→ 再切换一次 Wi-Fi 触发 dispatcher 重新决策。
 
 ```bash
 # 宿主机：实时观察分流日志
 journalctl -f -t HY2_DISPATCH -t HY2_PROXY
 
-# 1. 策略页切「强制代理」(always_proxy) 下发后，连【白名单内】SSID —— 代理应仍为 on
+# 1. 「双通道」页切「强制代理」(always_proxy) 并保存后，连【白名单内】SSID —— 代理应仍为 on
 nmcli device wifi connect "Home-WiFi" password "<密码>"
 # 期望日志：HY2_DISPATCH: 决策: proxy on (SSID 'Home-WiFi' ...)（日志注明策略强制代理、白名单命中被忽略）
 #   此时 ip rule 仍有 fwmark 0x1 lookup 100，虚拟机 curl -s ifconfig.me 出口为节点 IP
 
-# 2. 策略页切「强制直连」(always_direct) 下发后，连【非白名单】SSID —— 代理应仍为 off
+# 2. 「双通道」页切「强制直连」(always_direct) 并保存后，连【非白名单】SSID —— 代理应仍为 off
 nmcli device wifi connect "CoffeeShop-Free" password "<密码>"
 # 期望日志：HY2_DISPATCH: 决策: proxy off (SSID 'CoffeeShop-Free' ...)（日志注明策略强制直连、未命中白名单也不开代理）
 #   此时 ip rule 无 fwmark 0x1 记录，虚拟机出口为本地运营商出口
 
-# 3. 策略页恢复「走代理·白名单例外」(whitelist) 下发后，连另一【非白名单】SSID —— 回到主流程行为
+# 3. 「双通道」页恢复「走代理·白名单例外」(whitelist) 并保存后，连另一【非白名单】SSID —— 回到主流程行为
 nmcli device wifi connect "AnotherNet" password "<密码>"
 # 期望日志：HY2_DISPATCH: 决策: proxy on (SSID 'AnotherNet' 不在白名单, 走 Hysteria 2 隧道)
 ```
@@ -228,12 +277,15 @@ nmcli device wifi connect "AnotherNet" password "<密码>"
 | 症状 | 原因 | 处置 |
 |------|------|------|
 | Wi-Fi 已连白名单，但 `ip rule` 仍有 fwmark 0x1，虚拟机流量仍走代理 | TProxy 规则残留（dispatcher 未触发或脚本执行中断）；若 `wifi_policy=always_proxy` 则属预期行为（见下一行） | 手动执行 `sudo /usr/local/bin/proxy-switch.sh off` 清除；再检查 `journalctl -t HY2_DISPATCH --since -10min` 是否有对应事件 |
-| 切了白名单不生效 / 连白名单 SSID 仍走代理 | `wifi_policy` 处于 `always_proxy`（强制代理，忽略白名单） | 控制台策略页切回「白名单例外」（whitelist）模式并「下发」；随后切换一次 Wi-Fi 触发 dispatcher 重新决策 |
+| 切了白名单不生效 / 连白名单 SSID 仍走代理 | `wifi_policy` 处于 `always_proxy`（强制代理，忽略白名单） | 控制台「双通道」页切回「白名单例外」（whitelist）模式并点「保存网卡配置」；随后切换一次 Wi-Fi 触发 dispatcher 重新决策 |
 | 国外站突然全打不开（如 YouTube 超时），国内正常 | TProxy 规则被第三方意外清除（容器重建/系统事件），流量全部直连被墙 | **rule-guard 会在 30 秒内自动恢复**，`docker logs hy2-gateway \| grep rule-guard` 可见恢复记录；若未恢复：手动 `sudo /usr/local/bin/proxy-switch.sh on`，并检查 `/opt/hy2-gateway/data/last_decision` 期望态文件 |
 | 容器反复重启或起不来 | 镜像构建失败（sing-box 下载不通）或 privileged/权限不足 | `docker logs hy2-gateway` 查看具体报错；构建阶段下载 sing-box 失败时重跑 `docker compose up -d --build`，或修改 compose 的 `build.args.SINGBOX_VERSION`；确认 `privileged: true` 与 `cap_add: NET_ADMIN` 生效 |
 | 代理关闭（off 态）时虚拟机无法上网 | `ip_forward` 未开启或 MASQUERADE 未生效，Host-Only 流量无人转发 | 重放 `sudo /usr/local/bin/proxy-switch.sh off`（脚本会确保 ip_forward=1 与 MASQUERADE）；检查 `iptables -t nat -S | grep MASQUERADE` 与 `sysctl net.ipv4.ip_forward` |
 | 虚拟机 DNS 解析异常或缓慢 | TProxy 同时截获 UDP，DNS（UDP 53）查询也经 Hysteria 2 隧道由远端解析，属预期行为；若 DNS 服务器位于私网则直连 | 虚拟机 DNS 改用公共地址 `1.1.1.1`、`8.8.8.8`；确认节点侧可正常解析；私网 DNS 会命中 RETURN 规则直连，需保证该网段可达 |
-| 控制台点「下发」后节点不生效 | 生成的 sing-box 配置未通过 `sing-box check`，后端拒绝重启 | 查看控制台 `/api/apply` 返回的错误信息定位字段（密码/SNI/端口）；`docker logs hy2-gateway` 查看 check 输出；修正后重新下发 |
+| 订阅 URL 导入失败 / 拉取超时 | 地址命中 SSRF 防护（私网、回环、链路本地）；不是 http/https；目标站要求特定 UA 或宿主网络不通；内容实为 Clash YAML | 改用公网 http/https 订阅；确认宿主机 DNS 与出网；拉取 UA 固定为 `v2rayN/6.60`，服务端有额外校验时改用分享链接或 base64；Clash YAML 不支持，转换后导入 |
+| 导入报 mport / 端口跳跃格式错误 | `mport` 既不是合法区间也不是合法列表，或起止倒置；或镜像内 sing-box < 1.11 | 使用 `20000:30000`（分享链接中的 `20000-30000` 会归一化）；多段用逗号 `443:443,8443:8443`；端口须在 1–65535 且起始不大于结束；本仓库默认 sing-box 1.11.15，端口跳跃需要 1.11+ |
+| 认证失败，但链接能正常导入 | 口令含冒号，复制或百分号编码不完整；或 shell 中未加引号导致 `&` 之后的参数丢失 | 导入会整体解码 userinfo，`roar:pass` 与 `roar%3Apass` 都应还原为完整 `roar:pass`；从 v2rayN 重新导出并完整粘贴，命令行测试时用单引号包住链接 |
+| 启用/保存节点后不生效 | 生成的 sing-box 配置未通过 `sing-box check`，后端拒绝重启 | 查看控制台 `/api/apply` 返回的错误信息定位字段（密码/SNI/端口）；`docker logs hy2-gateway` 查看 check 输出；修正后重新保存或启用 |
 | 虚拟机完全无法连通宿主 192.168.100.1 | VMnet8 子网/掩码配置错误或虚拟机 netplan 未应用 | 按 [vmware-setup.md](vmware-setup.md) 核对 VMnet8 为 Host-Only 192.168.100.0/24；虚拟机内 `sudo netplan apply` 后 `ip route` 复查 |
 | 开机后分流不自动生效 | dispatcher 脚本未安装或不可执行 | `ls -l /etc/NetworkManager/dispatcher.d/99-wifi-proxy.sh` 确认存在且可执行；重跑 `sudo ./install.sh` |
 

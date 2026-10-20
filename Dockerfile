@@ -1,9 +1,10 @@
 # ===================================================================
 # Smart Hysteria 2 Gateway 镜像
-# 阶段 1: 拉取官方 sing-box 稳定版二进制 (1.10.x, legacy DNS schema)
+# 阶段 1: 拉取官方 sing-box 稳定版二进制 (1.11.x, 支持 Hysteria2 端口跳跃,
+#          同时保留 legacy DNS schema; 1.12 起 legacy DNS 弃用, 1.14 移除)
 # 阶段 2: python:3.11-alpine 运行时 (FastAPI WebUI + TProxy 工具链)
 # ===================================================================
-ARG SINGBOX_VERSION=1.10.7
+ARG SINGBOX_VERSION=1.11.15
 
 FROM golang:alpine AS sb-fetcher
 ARG SINGBOX_VERSION
@@ -47,6 +48,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY backend_app.py /app/backend_app.py
+COPY node_parser.py /app/node_parser.py
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod 755 /app/entrypoint.sh
 

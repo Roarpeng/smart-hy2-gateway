@@ -16,12 +16,19 @@ import json
 import logging
 import os
 import re
+import secrets
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -29,6 +36,14 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+
+from node_parser import (
+    fetch_subscription,
+    node_fingerprint,
+    normalize_port_hopping,
+    parse_import_text,
+    sanitize_tag,
+)
 
 # ---------------- 冻结常量 ----------------
 APP_VERSION = "1.0.0"
@@ -56,10 +71,13 @@ app = FastAPI(title="Smart Hysteria 2 Gateway Daemon", version=APP_VERSION)
 class Hy2NodeModel(BaseModel):
     """Hysteria 2 出站节点参数。"""
 
+    id: str = ""             # 节点唯一 ID (n_xxxxxxxx); 旧状态文件为空, 由 normalize 补齐
     tag: str = "hy2-out"
-    server: str = Field(min_length=1)
+    # server/password 允许空: 无节点时 current_node 需要可校验的空占位,
+    # 实际下发前由 _resolve_active_node 拦截 (抛 "未配置可用节点")
+    server: str = ""
     port: int = Field(default=443, ge=1, le=65535)
-    password: str = Field(min_length=1)
+    password: str = ""
     sni: str = ""
     insecure: bool = False
     obfs_type: str = ""      # 为空表示无混淆; 有值时通常为 salamander
@@ -67,15 +85,20 @@ class Hy2NodeModel(BaseModel):
     # 带宽仅显式指定时写入配置; None = 缺省 -> BBR 自适应 (v2rayN 导入语义)
     up_mbps: Optional[int] = Field(default=None, ge=0)
     down_mbps: Optional[int] = Field(default=None, ge=0)
-    # v2rayN 的 mport/ports 参数 -> sing-box 端口跳跃, 如 "20000-30000" 或 "443,8443"
+    # v2rayN 的 mport/ports 参数 -> sing-box 端口跳跃, 如 "20000:30000" 或 "443:443,8443:8443"
     port_hopping: str = ""
+    source: str = ""           # clipboard / subscription / json / legacy
+    created_at: int = 0
 
 
 class StateModel(BaseModel):
     """状态文件 schema (GET/POST /api/state 共用)。"""
 
-    whitelist: list[str]
-    current_node: Hy2NodeModel
+    whitelist: list[str] = Field(default_factory=list)
+    # current_node 保留为"活跃节点镜像", 兼容旧前端 (只传 current_node 也能工作)
+    current_node: Hy2NodeModel = Field(default_factory=Hy2NodeModel)
+    nodes: list[Hy2NodeModel] = Field(default_factory=list)
+    active_node_id: str = ""
     wifi_iface: str = "wlp2s0"
     rj45_iface: str = "enp3s0"
     vmnet_iface: str = "vmnet8"
@@ -88,6 +111,35 @@ class StateModel(BaseModel):
     tproxy_port: int = Field(default=12345, ge=1, le=65535)
     fwmark: int = 1
     table: int = 100
+
+
+class NodePatchModel(BaseModel):
+    """PATCH /api/nodes/{id} 请求体: 所有字段可选, 只更新显式传入的字段。"""
+
+    tag: Optional[str] = None
+    server: Optional[str] = None
+    port: Optional[int] = Field(default=None, ge=1, le=65535)
+    password: Optional[str] = None
+    sni: Optional[str] = None
+    insecure: Optional[bool] = None
+    obfs_type: Optional[str] = None
+    obfs_password: Optional[str] = None
+    up_mbps: Optional[int] = Field(default=None, ge=0)
+    down_mbps: Optional[int] = Field(default=None, ge=0)
+    port_hopping: Optional[str] = None
+
+
+class NodeImportModel(BaseModel):
+    """POST /api/nodes/import 请求体: text 与 url 二选一。"""
+
+    text: str = ""
+    url: str = ""
+
+
+class NodeTestModel(BaseModel):
+    """POST /api/nodes/test 请求体: ids 为空表示测试全部节点。"""
+
+    ids: list[str] = Field(default_factory=list)
 
 
 class ProxyActionModel(BaseModel):
@@ -111,16 +163,188 @@ def atomic_write_json(path: Path, data: dict, mode: int = 0o600, gid: Optional[i
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(json.dumps(data, indent=2, ensure_ascii=False))
     if gid is not None:
-        # 容器内以 root 运行: 授权 singbox 组读取 (sing-box 以 UID 930 运行)
-        os.chown(tmp, 0, gid)
+        # 容器内以 root 运行: 授权 singbox 组读取 (sing-box 以 UID 930 运行);
+        # 非 root 环境 (本机自测) 无法 chown, 保留当前属组即可
+        try:
+            os.chown(tmp, 0, gid)
+        except PermissionError:
+            log.warning("chown gid=%s failed (non-root?), keep current owner: %s", gid, path)
     os.chmod(tmp, mode)
     os.replace(tmp, path)
 
 
-def build_singbox_config(state: StateModel) -> dict:
-    """按状态生成 sing-box 1.10.x (legacy DNS schema) 运行配置。"""
+# ---------------- 多节点状态归一化 ----------------
+NODE_FIELDS = (
+    "tag", "server", "port", "password", "sni", "insecure",
+    "obfs_type", "obfs_password", "up_mbps", "down_mbps", "port_hopping",
+)
+_NODE_DEFAULTS = {
+    "tag": "", "server": "", "port": 443, "password": "", "sni": "",
+    "insecure": False, "obfs_type": "", "obfs_password": "",
+    "up_mbps": None, "down_mbps": None, "port_hopping": "",
+}
+
+# 延迟测试结果缓存 (仅内存, 不落盘)
+_latency_cache: dict[str, dict] = {}
+_latency_lock = threading.Lock()
+
+
+def _empty_current_node() -> dict:
+    return {"tag": "hy2-out", "server": "", "port": 443, "password": ""}
+
+
+def _new_node_id(used: set[str]) -> str:
+    while True:
+        nid = "n_" + secrets.token_hex(4)
+        if nid not in used:
+            return nid
+
+
+def normalize_state_dict(data: dict) -> dict:
+    """归一化状态文件: 兼容单节点旧格式, 补齐 id/tag/active 并回填 current_node 镜像。
+
+    - nodes 为空且 current_node 有 server/password -> 包装为单节点 (生成 id)
+    - 缺失/重复 id 重新生成; active_node_id 非法则取第一个节点
+    - 逐个 sanitize_tag, 避免与内置出站标签冲突或重名
+    - 不修改节点顺序
+    """
+    src = data if isinstance(data, dict) else {}
+    out = dict(src)
+
+    raw_nodes = src.get("nodes")
+    nodes: list[dict] = []
+    if isinstance(raw_nodes, list):
+        for item in raw_nodes:
+            if isinstance(item, dict):
+                nodes.append(dict(item))
+            elif isinstance(item, Hy2NodeModel):
+                nodes.append(item.model_dump())
+
+    raw_current = src.get("current_node")
+    if isinstance(raw_current, dict):
+        current = dict(raw_current)
+    elif isinstance(raw_current, Hy2NodeModel):
+        current = raw_current.model_dump()
+    else:
+        current = {}
+
+    # 旧状态文件: current_node 即唯一节点
+    if not nodes and str(current.get("server") or "").strip() and str(current.get("password") or ""):
+        wrapped = {key: current[key] for key in NODE_FIELDS if key in current}
+        wrapped["source"] = str(current.get("source") or "")
+        try:
+            wrapped["created_at"] = int(current.get("created_at") or 0)
+        except (TypeError, ValueError):
+            wrapped["created_at"] = 0
+        nodes = [wrapped]
+
+    # 补齐 / 去重 id
+    used_ids: set[str] = set()
+    for node in nodes:
+        node["source"] = str(node.get("source") or "")
+        try:
+            node["created_at"] = int(node.get("created_at") or 0)
+        except (TypeError, ValueError):
+            node["created_at"] = 0
+        # 缺字段按模型默认值补齐 (tag 缺失时交给 sanitize_tag 生成 hy2-node)
+        for key, default in _NODE_DEFAULTS.items():
+            if key not in node:
+                node[key] = default
+        nid = str(node.get("id") or "").strip()
+        if not nid or nid in used_ids:
+            nid = _new_node_id(used_ids)
+        node["id"] = nid
+        used_ids.add(nid)
+
+    # active_node_id 必须指向现存节点
+    active = str(src.get("active_node_id") or "").strip()
+    if nodes:
+        if active not in used_ids:
+            active = str(nodes[0]["id"])
+    else:
+        active = ""
+
+    # 标签清洗 (保留顺序; 冲突自动追加 -2/-3)
+    used_tags: set[str] = set()
+    for node in nodes:
+        node["tag"] = sanitize_tag(str(node.get("tag") or ""), used_tags)
+        used_tags.add(node["tag"])
+
+    if nodes:
+        active_node = next(n for n in nodes if n["id"] == active)
+        out["current_node"] = dict(active_node)  # 活跃节点完整镜像
+    else:
+        if not current:
+            current = _empty_current_node()
+        mirror = dict(current)
+        for key in NODE_FIELDS:
+            if key not in mirror:
+                mirror[key] = Hy2NodeModel.model_fields[key].default
+        mirror["tag"] = sanitize_tag(str(mirror.get("tag") or ""))
+        out["current_node"] = mirror
+
+    out["nodes"] = nodes
+    out["active_node_id"] = active
+    return out
+
+
+def _load_state_dict(persist: bool = True) -> dict:
+    """读取并归一化状态文件; persist=True 时把旧格式回写, 保证生成的节点 id 稳定。
+
+    写操作接口传 persist=False: 归一化结果由后续事务统一落盘, 避免校验失败时
+    提前改写状态文件。
+    """
+    if not STATE_FILE.exists():
+        return normalize_state_dict({})
+    try:
+        raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail=f"state file corrupted: {exc}")
+    data = normalize_state_dict(raw)
+    if persist and data != raw:
+        # 旧状态文件 (无 nodes/id) 或标签需清洗: 立即落盘, 否则每次请求都会生成新 id
+        try:
+            atomic_write_json(STATE_FILE, data, mode=0o600)
+        except Exception as exc:
+            log.warning("persist normalized state failed: %s", exc)
+    return data
+
+
+def _resolve_active_node(state: StateModel) -> Optional[Hy2NodeModel]:
+    """按 active_node_id 取活跃节点; 均不可用时回落 current_node。"""
+    for node in state.nodes:
+        if node.id == state.active_node_id and node.server.strip() and node.password.strip():
+            return node
+    for node in state.nodes:
+        if node.server.strip() and node.password.strip():
+            return node
     node = state.current_node
-    hy2_outbound = {
+    if node.server.strip() and node.password.strip():
+        return node
+    return None
+
+
+def _public_node(node: dict) -> dict:
+    """节点对外视图 + 内存延迟测试结果。"""
+    out = dict(node)
+    with _latency_lock:
+        cached = _latency_cache.get(str(node.get("id") or ""))
+    if cached:
+        out["latency_ms"] = cached.get("latency_ms")
+        out["latency_ok"] = cached.get("ok")
+        out["latency_error"] = cached.get("error", "")
+        out["tested_at"] = cached.get("tested_at", 0)
+    else:
+        out["latency_ms"] = None
+        out["latency_ok"] = None
+        out["latency_error"] = ""
+        out["tested_at"] = 0
+    return out
+
+
+def build_hy2_outbound(node: Hy2NodeModel) -> dict:
+    """单个 hysteria2 出站 (主配置与延迟测试临时配置共用)。"""
+    outbound: dict = {
         "type": "hysteria2",
         "tag": node.tag,
         "server": node.server,
@@ -133,16 +357,31 @@ def build_singbox_config(state: StateModel) -> dict:
         },
     }
     if node.obfs_type:
-        hy2_outbound["obfs"] = {"type": node.obfs_type, "password": node.obfs_password}
+        outbound["obfs"] = {"type": node.obfs_type, "password": node.obfs_password}
     # 带宽仅显式指定时写入: 缺省 = BBR (v2rayN 语义: 链接不带 upmbps/downmbps 即不指定)
     if node.up_mbps:
-        hy2_outbound["up_mbps"] = node.up_mbps
+        outbound["up_mbps"] = node.up_mbps
     if node.down_mbps:
-        hy2_outbound["down_mbps"] = node.down_mbps
+        outbound["down_mbps"] = node.down_mbps
     if node.port_hopping:
-        # v2rayN mport/ports -> sing-box 端口跳跃
-        hy2_outbound["port_hopping"] = node.port_hopping
-        hy2_outbound["port_hopping_interval"] = "30s"
+        # v2rayN mport/ports -> sing-box >=1.11 端口跳跃
+        # sing-box 1.11 的 server_ports 要求冒号区间 (如 "20000:30000");
+        # 内部已由 normalize_port_hopping 统一为冒号格式
+        outbound["server_ports"] = [
+            seg.strip()
+            for seg in node.port_hopping.split(",")
+            if seg.strip()
+        ]
+        outbound["hop_interval"] = "30s"
+    return outbound
+
+
+def build_singbox_config(state: StateModel) -> dict:
+    """按状态中的活跃节点生成 sing-box 1.11.x (legacy DNS schema) 运行配置。"""
+    node = _resolve_active_node(state)
+    if node is None:
+        raise ValueError("未配置可用节点")
+    hy2_outbound = build_hy2_outbound(node)
 
     return {
         "log": {"level": "info", "timestamp": True},
@@ -206,6 +445,116 @@ def run_singbox_check(config_file: Optional[Path] = None) -> tuple[bool, str]:
         return False, str(exc)
 
 
+# ---------------- 下发事务 ----------------
+def _write_bytes_atomic(path: Path, data: bytes, mode: int, gid: Optional[int] = None) -> None:
+    """字节级原子写 (回滚用); 与 atomic_write_json 同样的权限策略。"""
+    tmp = path.with_name(path.name + ".rollback")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    if gid is not None:
+        try:
+            os.chown(tmp, 0, gid)
+        except PermissionError:
+            pass
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def _restore_bytes(path: Path, data: Optional[bytes], mode: int, gid: Optional[int] = None) -> None:
+    """回滚文件; data=None 表示原文件不存在 -> 删除。"""
+    try:
+        if data is None:
+            path.unlink(missing_ok=True)
+        else:
+            _write_bytes_atomic(path, data, mode, gid)
+    except Exception as exc:
+        log.error("rollback %s failed: %s", path, exc)
+
+
+def _stderr_summary(output: str) -> str:
+    return " ".join(str(output or "").split())[:500]
+
+
+def _scrub_state_secrets(text: str, state: StateModel) -> str:
+    """防止 check 输出回显配置时把节点密码写进日志/HTTP 错误。"""
+    safe = str(text or "")
+    secrets = set()
+    for node in list(state.nodes) + [state.current_node]:
+        for secret in (node.password, node.obfs_password):
+            if secret:
+                secrets.add(secret)
+    for secret in secrets:
+        safe = safe.replace(secret, "***")
+    return safe
+
+
+def commit_state(state: StateModel, restart: bool = True) -> str:
+    """状态下发事务: 校验通过的配置才落盘, 重启失败自动回滚两个文件。
+
+    1. 构建配置 -> 写 *.new (0640, gid 930) -> sing-box check
+    2. 校验失败: 删除临时文件, 状态文件与运行中的 sing-box 均不动
+    3. 通过: 备份旧状态/旧配置字节 -> 原子写状态 -> 替换配置 -> mark_config(True)
+    4. restart=True: 重启失败回滚两个文件, 并尝试用旧配置重新拉起
+    """
+    data = state.model_dump()
+    active = _resolve_active_node(state)
+    if active is None:
+        # 不生成坏配置, 只更新状态
+        atomic_write_json(STATE_FILE, data, mode=0o600)
+        return "未配置节点，sing-box 配置未更新"
+
+    try:
+        config = build_singbox_config(state)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    tmp_config = SINGBOX_CONFIG_FILE.with_name(SINGBOX_CONFIG_FILE.name + ".new")
+    atomic_write_json(tmp_config, config, mode=0o640, gid=SINGBOX_GID)
+    ok, output = run_singbox_check(tmp_config)
+    if not ok:
+        tmp_config.unlink(missing_ok=True)
+        summary = _scrub_state_secrets(_stderr_summary(output), state)
+        log.error("sing-box check failed: %s", summary)
+        raise HTTPException(
+            status_code=422,
+            detail="sing-box 配置校验失败: " + summary,
+        )
+
+    # 校验通过: 记录旧文件字节用于回滚
+    old_state = STATE_FILE.read_bytes() if STATE_FILE.exists() else None
+    old_config = SINGBOX_CONFIG_FILE.read_bytes() if SINGBOX_CONFIG_FILE.exists() else None
+    prev_valid = singbox_manager.is_config_valid()
+
+    try:
+        atomic_write_json(STATE_FILE, data, mode=0o600)
+        os.replace(tmp_config, SINGBOX_CONFIG_FILE)
+        singbox_manager.mark_config(True)
+    except Exception as exc:
+        tmp_config.unlink(missing_ok=True)
+        _restore_bytes(STATE_FILE, old_state, 0o600)
+        _restore_bytes(SINGBOX_CONFIG_FILE, old_config, 0o640, SINGBOX_GID)
+        singbox_manager.mark_config(prev_valid)
+        raise HTTPException(status_code=500, detail=f"保存配置失败: {exc}")
+
+    if not restart:
+        return "节点配置已保存，sing-box 配置已更新，未重启"
+
+    if not singbox_manager.restart():
+        # 新配置无法拉起 sing-box -> 回滚两个文件并尝试旧配置
+        _restore_bytes(STATE_FILE, old_state, 0o600)
+        _restore_bytes(SINGBOX_CONFIG_FILE, old_config, 0o640, SINGBOX_GID)
+        singbox_manager.mark_config(prev_valid)
+        restored = singbox_manager.restart()
+        log.error("sing-box restart failed, rolled back (old config restored=%s)", restored)
+        detail = "sing-box 重启失败，已回滚到旧配置"
+        if not restored:
+            detail += "；旧配置也未能启动，请检查日志"
+        raise HTTPException(status_code=502, detail=detail)
+
+    return "配置已下发，sing-box 已重启"
+
+
 # ---------------- sing-box 进程守护 ----------------
 class SingBoxManager:
     """sing-box 子进程生命周期管理: root 侧 spawn, UID 930 运行, 崩溃自动拉起。"""
@@ -224,6 +573,9 @@ class SingBoxManager:
 
     def mark_config(self, valid: bool) -> None:
         self._config_valid = valid
+
+    def is_config_valid(self) -> bool:
+        return self._config_valid
 
     def _spawn(self) -> None:
         self._spawned_at = time.monotonic()
@@ -389,13 +741,10 @@ def rule_guard_loop() -> None:
 # ---------------- API 路由 (先于静态挂载注册) ----------------
 @app.get("/api/state")
 def get_state():
-    """返回状态文件完整内容; 未初始化时给出标记。"""
+    """返回归一化后的状态文件完整内容; 未初始化时给出标记。"""
     if not STATE_FILE.exists():
         return {"status": "uninitialized"}
-    try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=500, detail=f"state file corrupted: {exc}")
+    return _load_state_dict()
 
 
 def proxy_switch_env() -> dict:
@@ -429,29 +778,550 @@ def proxy_switch_env() -> dict:
 
 @app.post("/api/apply")
 def apply_state(state: StateModel):
-    """保存状态 -> 渲染新配置 -> check 校验 -> 通过后才落盘并重启 sing-box。"""
-    # 1) 原子落盘状态文件 (含密码 -> 600)
-    atomic_write_json(STATE_FILE, state.model_dump(), mode=0o600)
-    # 2) 渲染到 .new 临时文件并校验; 失败时磁盘保留旧配置,
-    #    运行中的 sing-box 与崩溃自愈能力均不受影响
-    config = build_singbox_config(state)
-    tmp_config = SINGBOX_CONFIG_FILE.with_name(SINGBOX_CONFIG_FILE.name + ".new")
-    atomic_write_json(tmp_config, config, mode=0o640, gid=SINGBOX_GID)
-    ok, output = run_singbox_check(tmp_config)
-    if not ok:
-        tmp_config.unlink(missing_ok=True)
-        log.error("sing-box check failed: %s", output)
-        raise HTTPException(status_code=422, detail=f"sing-box check failed: {output}")
-    # 3) 校验通过: 替换正式配置 (sing-box 以 GID 930 运行 -> 640 root:singbox) 并重启
-    os.replace(tmp_config, SINGBOX_CONFIG_FILE)
-    singbox_manager.mark_config(True)
-    started = singbox_manager.restart()
-    message = (
-        "State saved, singbox config valid, sing-box restarted."
-        if started else
-        "State saved, singbox config valid, but sing-box failed to start; see logs."
+    """保存状态 -> 归一化 -> 校验配置 -> 事务下发 (旧前端只传 current_node 也兼容)。"""
+    data = state.model_dump()
+    # 旧前端 payload 不含 nodes 字段: 保留已有多节点列表, 并把 current_node 的改动
+    # 合并到当前活跃节点 (否则一次"保存设置"会把导入的节点列表清空)
+    if "nodes" not in state.model_fields_set and "active_node_id" not in state.model_fields_set:
+        try:
+            stored = _load_state_dict(persist=False)
+        except HTTPException:
+            stored = None
+        if stored and stored.get("nodes"):
+            active = str(stored.get("active_node_id") or "")
+            dumped = data.get("current_node") or {}
+            incoming = {k: dumped[k] for k in state.current_node.model_fields_set if k in dumped}
+            for node in stored["nodes"]:
+                if node.get("id") == active:
+                    for key in NODE_FIELDS:
+                        if key in incoming:
+                            node[key] = incoming[key]
+                    break
+            data["nodes"] = stored["nodes"]
+            data["active_node_id"] = active
+    data = normalize_state_dict(data)
+    try:
+        normalized = StateModel.model_validate(data)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"状态参数非法: {exc}")
+    message = commit_state(normalized, restart=True)
+    has_active = _resolve_active_node(normalized) is not None
+    return {"status": "success", "message": message, "singbox_valid": has_active}
+
+
+# ---------------- 多节点管理 API ----------------
+def _redact_text(text: str) -> str:
+    """错误回显脱敏 (URL userinfo / JSON password / auth 参数)。"""
+    safe = re.sub(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s?#]*@", r"\1***@", str(text or ""))
+    safe = re.sub(r'(?i)("(?:password|obfs[-_]?password)"\s*:\s*")[^"]*(")', r"\1***\2", safe)
+    safe = re.sub(r"(?i)((?:auth|password|obfs[-_]?password)=)[^&\s#]+", r"\1***", safe)
+    return safe[:500]
+
+
+@app.get("/api/nodes")
+def list_nodes():
+    """节点列表 + 活跃节点 + 内存中的延迟测试结果。"""
+    data = _load_state_dict()
+    return {
+        "active_node_id": data.get("active_node_id", ""),
+        "nodes": [_public_node(node) for node in data["nodes"]],
+    }
+
+
+@app.post("/api/nodes/import")
+def import_nodes(body: NodeImportModel):
+    """导入分享链接/base64 订阅/sing-box JSON; 只更新 nodes, 不重启 sing-box。"""
+    text = (body.text or "").strip()
+    url = (body.url or "").strip()
+    if not text and not url:
+        raise HTTPException(status_code=422, detail="text 与 url 不能同时为空")
+
+    errors: list[dict] = []
+    source = "clipboard"
+    # 单行 http(s) URL 视为订阅地址
+    if not url and "\n" not in text and re.match(r"(?i)^https?://", text):
+        url, text = text, ""
+    if url:
+        source = "subscription"
+        try:
+            content = fetch_subscription(url)
+        except Exception as exc:
+            content = ""
+            errors.append({"line": None, "input": _redact_text(url), "error": str(exc)[:300]})
+    else:
+        content = text
+
+    parsed: list[dict] = []
+    if content:
+        try:
+            parsed, parse_errors = parse_import_text(content, source=source)
+        except Exception as exc:  # 解析器异常不应升级为 500
+            parsed, parse_errors = [], [{
+                "line": None,
+                "input": _redact_text(content),
+                "error": f"解析失败: {str(exc)[:200]}",
+            }]
+        errors.extend(parse_errors)
+
+    data = _load_state_dict(persist=False)
+    if parsed:
+        nodes = data["nodes"]
+        by_fp: dict[str, dict] = {}
+        for node in nodes:
+            by_fp.setdefault(node_fingerprint(node), node)
+        used_ids = {str(node.get("id") or "") for node in nodes}
+        imported = 0
+        updated = 0
+        skipped = 0
+        for node in parsed:
+            fp = node_fingerprint(node)
+            existing = by_fp.get(fp)
+            if existing is not None:
+                # 同指纹 -> 更新参数, 保留原 id/created_at
+                for key, value in node.items():
+                    if key in ("id", "created_at"):
+                        continue
+                    existing[key] = value
+                updated += 1
+            else:
+                node["id"] = _new_node_id(used_ids)
+                used_ids.add(node["id"])
+                node["created_at"] = int(time.time())
+                node["source"] = str(node.get("source") or source)
+                nodes.append(node)
+                by_fp[fp] = node
+                imported += 1
+
+        was_active = bool(data.get("active_node_id"))
+        data = normalize_state_dict(data)
+        atomic_write_json(STATE_FILE, data, mode=0o600)
+        log.info("nodes import: imported=%d updated=%d skipped=%d errors=%d",
+                 imported, updated, skipped, len(errors))
+        message = ""
+        if data["nodes"] and data["active_node_id"] and not was_active:
+            message = "已自动将第一个节点设为活跃节点；sing-box 未重启，请激活节点后生效"
+    else:
+        imported = updated = skipped = 0
+        message = ""
+
+    result = {
+        "status": "success",
+        "imported": imported,
+        "updated": updated,
+        "skipped": skipped,
+        "errors": errors,
+        "active_node_id": data.get("active_node_id", ""),
+        "nodes": [_public_node(node) for node in data["nodes"]],
+    }
+    if message:
+        result["message"] = message
+    return result
+
+
+@app.post("/api/nodes/{node_id}/activate")
+def activate_node(node_id: str):
+    """切换活跃节点并立即下发 (重启 sing-box)。"""
+    data = _load_state_dict(persist=False)
+    target = next((n for n in data["nodes"] if n["id"] == node_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="节点不存在")
+    if not str(target.get("server") or "").strip() or not str(target.get("password") or ""):
+        raise HTTPException(status_code=422, detail="节点缺少服务器或密码")
+    data["active_node_id"] = node_id
+    data = normalize_state_dict(data)
+    try:
+        state = StateModel.model_validate(data)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"节点参数非法: {exc}")
+    message = commit_state(state, restart=True)
+    return {
+        "status": "success",
+        "message": message,
+        "active_node_id": data["active_node_id"],
+    }
+
+
+@app.patch("/api/nodes/{node_id}")
+def patch_node(node_id: str, patch: NodePatchModel):
+    """部分更新节点; 活跃节点改动会立即下发, 非活跃节点只落盘。"""
+    data = _load_state_dict(persist=False)
+    node = next((n for n in data["nodes"] if n["id"] == node_id), None)
+    if node is None:
+        raise HTTPException(status_code=404, detail="节点不存在")
+
+    updates = patch.model_dump(exclude_unset=True)
+    for key, value in updates.items():
+        if key == "tag":
+            used = {n["tag"] for n in data["nodes"] if n["id"] != node_id}
+            node["tag"] = sanitize_tag(str(value or ""), used)
+        elif key == "port_hopping":
+            try:
+                node["port_hopping"] = normalize_port_hopping(str(value or ""))
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+        elif key == "obfs_type":
+            obfs_type = str(value or "").strip().lower()
+            if obfs_type not in ("", "salamander"):
+                raise HTTPException(status_code=422, detail="不支持的混淆类型 (仅支持 salamander)")
+            node["obfs_type"] = obfs_type
+        elif key in ("server", "password"):
+            text = str(value) if value is not None else ""
+            if not text.strip():
+                raise HTTPException(status_code=422, detail=f"{key} 不能为空")
+            if key == "server":
+                text = text.strip()
+                if any(ch.isspace() for ch in text) or "/" in text:
+                    raise HTTPException(status_code=422, detail="服务器地址格式非法")
+            node[key] = text
+        elif key in ("up_mbps", "down_mbps"):
+            if value is None:
+                node[key] = None
+            else:
+                node[key] = int(value)
+        elif key in ("sni", "obfs_password"):
+            node[key] = str(value or "")
+        elif key == "insecure":
+            node["insecure"] = bool(value)
+        elif key == "port":
+            if value is not None:
+                node["port"] = int(value)
+        else:
+            node[key] = value
+
+    if node.get("obfs_type") and not str(node.get("obfs_password") or "").strip():
+        raise HTTPException(status_code=422, detail="启用混淆时必须提供混淆口令")
+
+    data = normalize_state_dict(data)
+    activated = data.get("active_node_id") == node_id
+    if activated:
+        try:
+            state = StateModel.model_validate(data)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"节点参数非法: {exc}")
+        message = commit_state(state, restart=True)
+    else:
+        atomic_write_json(STATE_FILE, data, mode=0o600)
+        message = "节点已更新"
+
+    updated = next((n for n in data["nodes"] if n["id"] == node_id), node)
+    return {
+        "status": "success",
+        "node": _public_node(updated),
+        "activated": activated,
+        "message": message,
+    }
+
+
+@app.delete("/api/nodes/{node_id}")
+def delete_node(node_id: str):
+    """删除非活跃节点; 活跃节点需先切换。"""
+    data = _load_state_dict(persist=False)
+    node = next((n for n in data["nodes"] if n["id"] == node_id), None)
+    if node is None:
+        raise HTTPException(status_code=404, detail="节点不存在")
+    if data.get("active_node_id") == node_id:
+        raise HTTPException(status_code=409, detail="请先切换到其他节点再删除")
+
+    data["nodes"] = [n for n in data["nodes"] if n["id"] != node_id]
+    data = normalize_state_dict(data)
+    atomic_write_json(STATE_FILE, data, mode=0o600)
+    with _latency_lock:
+        _latency_cache.pop(node_id, None)
+    log.info("nodes delete: %s", node_id)
+    return {
+        "status": "success",
+        "active_node_id": data.get("active_node_id", ""),
+        "nodes": [_public_node(n) for n in data["nodes"]],
+    }
+
+
+# ---------------- 节点延迟测试 (临时 sing-box 实例 + Clash API) ----------------
+def _clash_api_get(port: int, path: str, secret: str, timeout: float) -> tuple[int, bytes]:
+    """访问临时实例的 Clash API; 非 2xx 也返回状态码与响应体。"""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        headers={"Authorization": f"Bearer {secret}"},
     )
-    return {"status": "success", "message": message, "singbox_valid": True}
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read(65536)
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, exc.read(65536)
+        finally:
+            exc.close()
+
+
+def _hop_start_port(node: Hy2NodeModel) -> int:
+    if node.port_hopping:
+        try:
+            return int(str(node.port_hopping).split(",")[0].split(":")[0])
+        except (TypeError, ValueError):
+            pass
+    return node.port
+
+
+def _udp_probe(ip: str, port: int, timeout: float = 2.0) -> str:
+    """UDP 静默探测: QUIC 服务对垃圾包应静默丢弃; ICMP 拒绝则说明端口未开放。"""
+    family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect((ip, port))
+            sock.send(b"hy2-gateway-latency-probe")
+            try:
+                sock.recv(64)
+                return "UDP 收到响应"
+            except socket.timeout:
+                return "UDP 静默 (2s 无 ICMP 拒绝)"
+    except ConnectionRefusedError:
+        return "UDP ICMP 端口不可达"
+    except Exception as exc:
+        return f"UDP 探测异常: {str(exc)[:60]}"
+
+
+def _node_diagnosis(node: Hy2NodeModel) -> str:
+    """延迟测试失败后的补充诊断: DNS + UDP 静默探测。"""
+    try:
+        infos = socket.getaddrinfo(node.server, None)
+    except Exception as exc:
+        return f"DNS 解析失败: {str(exc)[:80]}"
+    ips: list[str] = []
+    for info in infos:
+        ip = info[4][0]
+        if ip not in ips:
+            ips.append(ip)
+    if not ips:
+        return "DNS 解析失败: 无结果"
+    text = f"DNS 解析: {','.join(ips[:2])}"
+    text += "；" + _udp_probe(ips[0], _hop_start_port(node))
+    return text
+
+
+def _scrub_secrets(text: str, node: Hy2NodeModel) -> str:
+    """日志/错误文本去密: 任何密码片段都替换为 ***。"""
+    safe = str(text or "")
+    for secret in (node.password, node.obfs_password):
+        if secret:
+            safe = safe.replace(secret, "***")
+    return safe[:400]
+
+
+def _proc_stderr_tail(proc: Optional[subprocess.Popen], limit: int = 200) -> str:
+    """进程已退出时读取 stderr 末尾 (未退出/无输出返回空串)。"""
+    if proc is None or proc.poll() is None or proc.stderr is None:
+        return ""
+    try:
+        raw = proc.stderr.read()
+    except Exception:
+        return ""
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    return " | ".join(lines[-3:])[-limit:]
+
+
+def test_node_latency(node: Hy2NodeModel) -> dict:
+    """用独立临时 sing-box 实例做真实握手测速, 不影响主进程与主配置。"""
+    proc: Optional[subprocess.Popen] = None
+    tmpdir = tempfile.mkdtemp(prefix="hy2test-", dir="/tmp")
+    try:
+        # 随机空闲本地端口 (仅临时 Clash API 使用)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            clash_port = int(probe.getsockname()[1])
+        secret = secrets.token_urlsafe(18)
+        tag = sanitize_tag(node.tag)  # 避免与 direct 等内置标签冲突
+        test_node = node.model_copy(update={"tag": tag})
+        config = {
+            "log": {"level": "error"},
+            "experimental": {
+                "clash_api": {
+                    "external_controller": f"127.0.0.1:{clash_port}",
+                    "secret": secret,
+                }
+            },
+            "outbounds": [build_hy2_outbound(test_node), {"type": "direct", "tag": "direct"}],
+            "route": {"final": tag},
+        }
+        cfg_path = os.path.join(tmpdir, "config.json")
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json.dump(config, fh, ensure_ascii=False)
+        os.chmod(tmpdir, 0o755)
+        os.chmod(cfg_path, 0o644)
+        try:
+            os.chown(tmpdir, SINGBOX_UID, SINGBOX_GID)
+            os.chown(cfg_path, SINGBOX_UID, SINGBOX_GID)
+        except OSError as exc:
+            log.warning("latency: chown temp dir failed: %s", exc)
+
+        proc = subprocess.Popen(
+            [SINGBOX_BIN, "run", "-D", tmpdir, "-c", cfg_path],
+            shell=False,
+            user=SINGBOX_UID,
+            group=SINGBOX_GID,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        # 等 Clash API 就绪 (最多约 3 秒)
+        deadline = time.monotonic() + 3.0
+        ready = False
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break
+            try:
+                status, _ = _clash_api_get(clash_port, "/proxies", secret, 0.4)
+                if status == 200:
+                    ready = True
+                    break
+            except Exception:
+                pass
+            time.sleep(0.15)
+
+        if not ready:
+            reason = "临时 sing-box 实例未就绪 (Clash API 3 秒内无响应)"
+            if proc.poll() is not None:
+                reason += f"；进程提前退出 (code={proc.returncode})"
+                tail = _proc_stderr_tail(proc)
+                if tail:
+                    reason += f"；stderr: {tail}"
+            reason += "；" + _node_diagnosis(node)
+            return {"ok": False, "latency_ms": None, "error": _scrub_secrets(reason, node)}
+
+        # 真实握手: 让 sing-box 通过节点的 hysteria2 出站访问 gstatic 204
+        params = urllib.parse.urlencode({
+            "url": "https://www.gstatic.com/generate_204",
+            "timeout": "5000",
+        })
+        delay_path = f"/proxies/{urllib.parse.quote(tag, safe='')}/delay?{params}"
+        try:
+            status, body = _clash_api_get(clash_port, delay_path, secret, 6.0)
+        except Exception as exc:
+            reason = f"延迟测试请求失败: {str(exc)[:120]}"
+            tail = _proc_stderr_tail(proc)
+            if tail:
+                reason += f"；sing-box: {tail}"
+            reason += "；" + _node_diagnosis(node)
+            return {"ok": False, "latency_ms": None, "error": _scrub_secrets(reason, node)}
+
+        if status != 200:
+            detail = ""
+            try:
+                payload = json.loads(body.decode("utf-8", errors="replace"))
+                detail = str(payload.get("message") or payload.get("error") or "")
+            except Exception:
+                detail = body.decode("utf-8", errors="replace")[:120]
+            reason = f"节点握手失败 (HTTP {status})"
+            if detail:
+                reason += f": {detail}"
+            tail = _proc_stderr_tail(proc)
+            if tail:
+                reason += f"；sing-box: {tail}"
+            reason += "；" + _node_diagnosis(node)
+            return {"ok": False, "latency_ms": None, "error": _scrub_secrets(reason, node)}
+
+        try:
+            payload = json.loads(body.decode("utf-8", errors="replace"))
+            delay = int(payload.get("delay") or 0)
+        except Exception as exc:
+            reason = f"Clash API 响应解析失败: {str(exc)[:80]}"
+            return {"ok": False, "latency_ms": None, "error": _scrub_secrets(reason, node)}
+        if delay <= 0:
+            reason = "节点握手失败: 延迟为 0；" + _node_diagnosis(node)
+            return {"ok": False, "latency_ms": None, "error": _scrub_secrets(reason, node)}
+        return {"ok": True, "latency_ms": delay, "error": ""}
+    except Exception as exc:
+        reason = f"延迟测试异常: {str(exc)[:160]}"
+        return {"ok": False, "latency_ms": None, "error": _scrub_secrets(reason, node)}
+    finally:
+        if proc is not None:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
+            for stream in (proc.stdout, proc.stderr):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except Exception:
+                    pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@app.post("/api/nodes/test")
+def test_nodes(body: Optional[NodeTestModel] = None):
+    """并发测试节点延迟 (最多 3 并发), 结果写入内存缓存。"""
+    data = _load_state_dict()
+    by_id = {str(n["id"]): n for n in data["nodes"]}
+    ids = list(body.ids) if body is not None else []
+    requested = [str(i).strip() for i in ids if str(i).strip()]
+    if not requested:
+        requested = [str(n["id"]) for n in data["nodes"]]
+    # 去重并保序
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for nid in requested:
+        if nid not in seen:
+            seen.add(nid)
+            ordered.append(nid)
+
+    results: dict[str, dict] = {}
+    targets = [by_id[nid] for nid in ordered if nid in by_id]
+    if targets:
+        valid_targets: list[tuple[dict, Hy2NodeModel]] = []
+        for node in targets:
+            try:
+                valid_targets.append((node, Hy2NodeModel.model_validate(node)))
+            except Exception as exc:
+                nid = str(node["id"])
+                results[nid] = {
+                    "id": nid, "ok": False, "latency_ms": None,
+                    "error": f"节点参数非法: {str(exc)[:200]}",
+                }
+                with _latency_lock:
+                    _latency_cache[nid] = {
+                        "latency_ms": None, "ok": False,
+                        "error": results[nid]["error"], "tested_at": int(time.time()),
+                    }
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            future_map = {
+                pool.submit(test_node_latency, model): node
+                for node, model in valid_targets
+            }
+            for future, node in future_map.items():
+                nid = str(node["id"])
+                try:
+                    outcome = future.result()
+                except Exception as exc:
+                    outcome = {"ok": False, "latency_ms": None, "error": str(exc)[:300]}
+                results[nid] = {
+                    "id": nid,
+                    "ok": bool(outcome.get("ok")),
+                    "latency_ms": outcome.get("latency_ms"),
+                    "error": str(outcome.get("error") or ""),
+                }
+                with _latency_lock:
+                    _latency_cache[nid] = {
+                        "latency_ms": outcome.get("latency_ms"),
+                        "ok": bool(outcome.get("ok")),
+                        "error": str(outcome.get("error") or ""),
+                        "tested_at": int(time.time()),
+                    }
+
+    ordered_results: list[dict] = []
+    for nid in ordered:
+        if nid in results:
+            ordered_results.append(results[nid])
+        else:
+            ordered_results.append({"id": nid, "ok": False, "latency_ms": None, "error": "节点不存在"})
+    return {"status": "success", "results": ordered_results}
 
 
 @app.get("/api/status")
@@ -585,10 +1455,10 @@ def nettest(body: NetTestModel):
     tcp_probe("tcp_cn", "直连 TCP 223.5.5.5:443 (国内)", "223.5.5.5", 443)
     tcp_probe("tcp_global", "直连 TCP 1.1.1.1:443 (国际)", "1.1.1.1", 443)
 
-    # 4-5: 当前节点可达性
+    # 4-5: 当前活跃节点可达性
     node = None
     try:
-        node = json.loads(STATE_FILE.read_text(encoding="utf-8")).get("current_node") or {}
+        node = _load_state_dict().get("current_node") or {}
     except Exception:
         pass
     server = str(node.get("server") or "").strip()
@@ -618,18 +1488,22 @@ def main() -> None:
     web_host = os.environ.get("WEB_HOST", "0.0.0.0")
     web_port = int(os.environ.get("WEB_PORT", "8080"))
 
-    # 启动恢复: 状态文件存在则生成配置并拉起 sing-box; 不存在则仅等待 /api/apply
+    # 启动恢复: 状态文件存在则归一化并生成配置; 无活跃节点时不写坏配置
     if STATE_FILE.exists():
         try:
-            state = StateModel.model_validate_json(STATE_FILE.read_text(encoding="utf-8"))
-            atomic_write_json(SINGBOX_CONFIG_FILE, build_singbox_config(state), mode=0o640, gid=SINGBOX_GID)
-            ok, output = run_singbox_check()
-            singbox_manager.mark_config(ok)
-            if ok:
-                singbox_manager.start()
-                log.info("startup: sing-box restored from saved state")
+            data = _load_state_dict()
+            state = StateModel.model_validate(data)
+            if _resolve_active_node(state) is None:
+                log.info("startup: no active node, waiting for node activation")
             else:
-                log.warning("startup: singbox.json check failed, sing-box not started: %s", output)
+                atomic_write_json(SINGBOX_CONFIG_FILE, build_singbox_config(state), mode=0o640, gid=SINGBOX_GID)
+                ok, output = run_singbox_check()
+                singbox_manager.mark_config(ok)
+                if ok:
+                    singbox_manager.start()
+                    log.info("startup: sing-box restored from saved state")
+                else:
+                    log.warning("startup: singbox.json check failed, sing-box not started: %s", output)
         except Exception as exc:
             log.warning("startup: restore failed (%s), waiting for /api/apply", exc)
     else:
