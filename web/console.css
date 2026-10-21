@@ -570,6 +570,9 @@ main { flex: 1; }
 .btn-primary:disabled:hover { background: var(--accent); }
 .btn-danger:disabled:hover { background: var(--bad); }
 .btn-quiet:disabled:hover { background: transparent; }
+/* 手动代理开关当前态: 所处状态一侧加绿色激活环 (零布局偏移) */
+.btn.is-on { box-shadow: inset 0 0 0 2px var(--ok); }
+.btn-quiet.is-on { color: var(--ok); }
 
 /* ============================================================
    Badges / semantic text

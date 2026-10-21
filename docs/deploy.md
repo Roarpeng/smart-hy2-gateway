@@ -21,7 +21,7 @@
 | 操作系统 | Ubuntu 22.04 / 24.04（宿主机，双网卡 enp3s0 + wlp2s0） |
 | 容器环境 | Docker Engine + docker compose 插件 |
 | 虚拟化 | VMware Workstation 17 |
-| 系统工具 | `jq`、NetworkManager（`nmcli`） |
+| 系统工具 | `jq`、`ipset`、NetworkManager（`nmcli`） |
 
 > **仅接管 IPv4**：TProxy 规则集只覆盖 iptables（IPv4），IPv6 流量不进隧道。双栈 Wi-Fi 环境下如需避免 IPv6 出口，建议对 Wi-Fi 连接禁用 IPv6：`nmcli connection modify "<连接名>" ipv6.method disabled`。
 
@@ -31,7 +31,7 @@
 cat /etc/os-release | grep -E '22.04|24.04'
 docker version && docker compose version
 vmware --version
-jq --version && nmcli --version
+jq --version && ipset version && nmcli --version
 ```
 
 ## 2. 部署步骤
@@ -53,11 +53,13 @@ cd /opt/hy2-gateway
 sudo ./install.sh
 ```
 
-安装脚本完成三件事，全部幂等，可重复执行：
+安装脚本完成五件事，全部幂等，可重复执行：
 
 1. 安装 TProxy 开关脚本：`scripts/proxy-switch.sh` → `/usr/local/bin/proxy-switch.sh`（可执行）。
 2. 安装 NetworkManager 钩子：`scripts/99-wifi-proxy.sh` → `/etc/NetworkManager/dispatcher.d/99-wifi-proxy.sh`（可执行）。
 3. 生成种子状态文件：`/opt/hy2-gateway/data/gateway_state.json`（不存在时写入初始骨架，含白名单、`wifi_policy: whitelist` 与节点占位），权限设为 600。
+4. 安装规则集自动更新：`scripts/ruleset-update.sh` → `/usr/local/bin/ruleset-update.sh`，`scripts/systemd/` 下的 `hy2-ruleset-update.service` / `hy2-ruleset-update.timer` 一并安装并 `systemctl enable --now`（详见第 4 节「规则集每周自动更新」）。
+5. 依赖检查与首跑：确认 `curl` / `jq` / `ipset` 可用；安装尾声 best-effort 立即执行一次规则集更新（失败仅告警，不影响安装结果）。
 
 ### 2.3 构建并启动容器
 
@@ -127,13 +129,13 @@ ip rule
 ip route show table 100
 ```
 
-**mangle 链 HY2_PRE**——应有私网 RETURN 规则和 TCP/UDP TPROXY `:12345` 规则：
+**mangle 链 HY2_PRE**——应有私网 RETURN 规则、`-m set --match-set hy2_cn dst -j RETURN`（第 2 条，中国 IP 内核层直连、免进 TProxy）和 TCP/UDP TPROXY `:12345` 规则：
 
 ```bash
 iptables -t mangle -S HY2_PRE
 ```
 
-**mangle 链 HY2_OUT**——首规则应为 `-m owner --uid-owner 930 -j RETURN`（放行 sing-box 自身流量防回环），其后为私网 RETURN 与 MARK 规则：
+**mangle 链 HY2_OUT**——首规则应为 `-m owner --uid-owner 930 -j RETURN`（放行 sing-box 自身流量防回环），其后为私网 RETURN、`hy2_cn` 匹配 RETURN（第 3 条）与 MARK 规则：
 
 ```bash
 iptables -t mangle -L HY2_OUT | head
@@ -215,7 +217,31 @@ curl -s https://api.ipify.org  # 国外服务: 应显示 Hysteria 2 节点 IP (�
 curl -s ifconfig.me && echo    # 同上对照
 ```
 
-> 地理分流规则（geosite-cn / geoip-cn）随仓库 `ruleset/` 目录内置，构建与运行均零外联；更新规则集：从 [sing-geosite](https://gitlab.com/SagerNet/sing-geosite)/[sing-geoip](https://gitlab.com/SagerNet/sing-geoip) 的 rule-set 分支取最新 `.srs` 覆盖后 `docker compose up -d --build`。
+> 地理分流规则（geosite-cn / geoip-cn）随仓库 `ruleset/` 目录内置镜像，**首次启动零外联**；之后由 `hy2-ruleset-update.timer` 每周自动更新，无需手工替换，见下节。
+
+### 规则集每周自动更新
+
+地理分流的规则集（geosite-cn / geoip-cn）与内核直连 ipset `hy2_cn` 由 systemd 定时任务自动保鲜。为什么要定时更新：规则集镜像内置保证首次启动零外联，但 CN 域名/IP 列表随时间变化，需要每周刷新；且 `.srs` 投递 sing-box 与 CIDR 重建 ipset 来自**同一份 `geoip-cn.srs`**（单一数据源，内核层与用户态判定不会不一致）。
+
+- **触发**：`hy2-ruleset-update.timer` 每周一 04:30（±10 分钟随机抖动，避免更新源扎堆；`Persistent=true`，宿主机关机错过后下次开机补跑）。
+- **单次流程**：从 SagerNet 官方（[sing-geosite](https://gitlab.com/SagerNet/sing-geosite) / [sing-geoip](https://gitlab.com/SagerNet/sing-geoip) 的 rule-set 分支）下载 `geosite-cn.srs` / `geoip-cn.srs` → 尺寸校验 → 原子替换仓库 `ruleset/` → `docker cp` 投递容器 `/usr/local/share/sing-box/` → 用 `sing-box rule-set decompile` 从同一份 `geoip-cn.srs` 导出 CIDR、原子重建 ipset `hy2_cn`（swap 后既有 iptables 规则即时命中新数据，无需重载规则）→ 若代理在开则确保 `hy2_cn` match 规则在位 → 经后端 `/api/apply` 触发 sing-box 优雅重载。
+- **fail-safe**：下载失败或尺寸校验不过则保留现有规则集、不动运行态；重载前先过 `sing-box check`，坏文件不会重启进程；`proxy-switch.sh` 绝不 create/destroy/flush `hy2_cn`，ipset 数据只由本更新脚本维护。
+
+验证（宿主机执行）：
+
+```bash
+# 1. timer 已排程（NEXT 应指向下个周一 04:30 ±10 分钟）
+systemctl list-timers hy2-ruleset-update.timer
+
+# 2. 手动触发一次更新
+sudo systemctl start hy2-ruleset-update.service
+
+# 3. ipset 已载入（Name: hy2_cn，Header 为 hash:net，Members 非空）
+ipset list hy2_cn | head
+
+# 4. 更新日志（下载 / 校验 / 投递 / ipset 重建 / 重载各步骤）
+journalctl -t HY2_RULESET -n 50
+```
 
 ## 5. Wi-Fi 切换自动分流测试
 
@@ -286,7 +312,9 @@ nmcli device wifi connect "AnotherNet" password "<密码>"
 | 导入报 mport / 端口跳跃格式错误 | `mport` 既不是合法区间也不是合法列表，或起止倒置；或镜像内 sing-box < 1.11 | 使用 `20000:30000`（分享链接中的 `20000-30000` 会归一化）；多段用逗号 `443:443,8443:8443`；端口须在 1–65535 且起始不大于结束；本仓库默认 sing-box 1.11.15，端口跳跃需要 1.11+ |
 | 认证失败，但链接能正常导入 | 口令含冒号，复制或百分号编码不完整；或 shell 中未加引号导致 `&` 之后的参数丢失 | 导入会整体解码 userinfo，`roar:pass` 与 `roar%3Apass` 都应还原为完整 `roar:pass`；从 v2rayN 重新导出并完整粘贴，命令行测试时用单引号包住链接 |
 | 启用/保存节点后不生效 | 生成的 sing-box 配置未通过 `sing-box check`，后端拒绝重启 | 查看控制台 `/api/apply` 返回的错误信息定位字段（密码/SNI/端口）；`docker logs hy2-gateway` 查看 check 输出；修正后重新保存或启用 |
-| 虚拟机完全无法连通宿主 192.168.100.1 | VMnet8 子网/掩码配置错误或虚拟机 netplan 未应用 | 按 [vmware-setup.md](vmware-setup.md) 核对 VMnet8 为 Host-Only 192.168.100.0/24；虚拟机内 `sudo netplan apply` 后 `ip route` 复查 |
+| 虚拟机完全无法连通宿主 192.168.100.1 | VMnet1 子网/掩码配置错误或虚拟机网卡未配置 | 按 [vmware-setup.md](vmware-setup.md) 核对 VMnet1 为 Host-Only 192.168.100.0/24；Linux 执行 `sudo netplan apply`，Windows 检查以太网 2 的静态 IP/网关后复查 |
+| 虚拟机有 192.168.100.x 地址，但没有默认网关 / 浏览器打不开 | VMware Host-Only DHCP 默认不下发 `option routers`，或虚拟机默认路由仍指向 eth0 | 在虚拟机内把代理网卡设为静态：IP `192.168.100.50/24`、网关 `192.168.100.1`、DNS `223.5.5.5`；确认 `ip route` / `route print` 中存在 `default via 192.168.100.1` |
+| 虚拟机可以上网，但出口 IP 不是 Hysteria 2 节点 | 代理网卡误设为 NAT/Bridged，流量绕过宿主 PREROUTING；或默认路由仍走 eth0 | 在 VMware 中把代理网卡改为 **Host-Only VMnet1**，不要用 NAT；虚拟机内把默认路由/跃点指向 `192.168.100.1`；宿主执行 `proxy-switch.sh status` 确认 `VMNET_IFACE=vmnet1`、`VMNET_SUBNET=192.168.100.0/24` |
 | 开机后分流不自动生效 | dispatcher 脚本未安装或不可执行 | `ls -l /etc/NetworkManager/dispatcher.d/99-wifi-proxy.sh` 确认存在且可执行；重跑 `sudo ./install.sh` |
 
 ## 7. 卸载

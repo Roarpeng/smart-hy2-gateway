@@ -7,13 +7,16 @@
 #
 # on:
 #   1. sysctl 尽力设置 net.ipv4.ip_forward / net.ipv4.ip_nonlocal_bind
+#      / net.core.default_qdisc fq (fq 对 QUIC pacing 友好, Hysteria 2 出站)
 #   2. 幂等清理旧规则 (链引用 -> 链 -> ip rule -> 路由表)
 #   3. 策略路由: fwmark -> table -> local 路由回环, 截获交给 sing-box
 #   4. mangle HY2_PRE / HY2_OUT: 目的地为保留网段的流量 RETURN 绕行
 #   5. HY2_OUT 首条规则 owner 匹配放行 sing-box (UID 930), 防出站回环
 #   6. RJ45 有线网卡进出流量显式 RETURN —— 通道A "恒直连" 的规则级硬保证
-#   7. PREROUTING TPROXY (转发流量/虚拟机) + OUTPUT MARK (本机流量)
-#   8. 确保 FORWARD 放行 VMnet 源/回程 (mangle RETURN 绕行的保留网段
+#   7. 内核层中国 IP 直连: 目的地命中 hy2_cn ipset 的流量在 mangle 层
+#      RETURN, 不进 sing-box 用户态 (省一跳; 集合缺失则回落 sing-box 判定)
+#   8. PREROUTING TPROXY (转发流量/虚拟机) + OUTPUT MARK (本机流量)
+#   9. 确保 FORWARD 放行 VMnet 源/回程 (mangle RETURN 绕行的保留网段
 #      流量仍要过 FORWARD 链, Docker 宿主默认策略 DROP 会将其丢弃)
 #
 # off:
@@ -25,7 +28,8 @@
 #
 # 配置来源优先级: 环境变量 > 状态文件(jq) > 内置默认值
 #   状态文件: /opt/hy2-gateway/data/gateway_state.json (STATE_FILE 可覆盖)
-#   可覆盖项: TPROXY_PORT FWMARK TABLE WIFI_DEV VMNET_IFACE VMNET_SUBNET SINGBOX_UID
+#   可覆盖项: TPROXY_PORT FWMARK TABLE WIFI_DEV VMNET_IFACE VMNET_SUBNET SINGBOX_UID CHNROUTE_SET
+#   (CHNROUTE_SET 默认 hy2_cn, 元素由 /usr/local/bin/ruleset-update.sh 每周维护)
 #
 # 全部 iptables/ip 调用容错 (2>/dev/null || true 风格),
 # 脚本可重复执行, 不因 set -e 中断。
@@ -62,9 +66,12 @@ FWMARK="$(pick FWMARK fwmark 1)"
 TABLE="$(pick TABLE table 100)"
 RJ45_DEV="$(pick RJ45_DEV rj45_iface enp3s0)"
 WIFI_DEV="$(pick WIFI_DEV wifi_iface wlp2s0)"
-VMNET_IFACE="$(pick VMNET_IFACE vmnet_iface vmnet8)"
+VMNET_IFACE="$(pick VMNET_IFACE vmnet_iface vmnet1)"
 VMNET_SUBNET="$(pick VMNET_SUBNET vmnet_subnet 192.168.100.0/24)"
 SINGBOX_UID="$(pick SINGBOX_UID singbox_uid 930)"
+# 中国 IP 段 ipset 集合名: 由 /usr/local/bin/ruleset-update.sh 创建与维护,
+# 本脚本只引用匹配, 不负责其生命周期 (见 do_on 步骤 7 注释)
+CHNROUTE_SET="$(pick CHNROUTE_SET chnroute_set hy2_cn)"
 
 # 目的地为保留网段的流量 RETURN 绕行 (不进隧道):
 #   覆盖本机/VMnet 访问局域网、链路本地、组播广播等场景。
@@ -164,6 +171,9 @@ do_on() {
     # 1. 内核参数 (尽力设置)
     sysctl_best_effort net.ipv4.ip_forward 1
     sysctl_best_effort net.ipv4.ip_nonlocal_bind 1
+    # fq 对 QUIC pacing 友好 (Hysteria 2 出站): Hysteria 2 基于 QUIC 依赖
+    # 精确发包节奏控速, 默认 qdisc (如 pfifo_fast/cake) 会干扰其 pacing
+    sysctl_best_effort net.core.default_qdisc fq
 
     # 2. 幂等清理旧规则
     cleanup_tproxy
@@ -200,7 +210,24 @@ do_on() {
     ipt -t mangle -I HY2_PRE 1 -i "$RJ45_DEV" -j RETURN
     ipt -t mangle -I HY2_OUT 2 -o "$RJ45_DEV" -j RETURN
 
-    # 7. PREROUTING (VMnet 虚拟机经宿主转发的流量) -> TPROXY 交给 sing-box
+    # 7. 内核层中国 IP 直连: 目的地命中 $CHNROUTE_SET 的流量在 mangle 层
+    #    直接 RETURN, 省去"进 sing-box 用户态再按 geoip-cn 判回直连"的一跳;
+    #    集合缺失时仅告警回落 sing-box 判定, 不中断。
+    #    插入位置固定: HY2_PRE 第 2 条 / HY2_OUT 第 3 条 —— 均位于
+    #    TPROXY/MARK catch-all 之前, 且 HY2_OUT 的 UID 回环防护(1)/
+    #    RJ45(2) 保持在前 (RETURN 规则之间先后顺序不影响语义, 相对
+    #    catch-all 的位置才是关键)。
+    #    集合元素由 /usr/local/bin/ruleset-update.sh 每周维护; 其通过
+    #    swap 原子换表, 更新即时生效, 无需重载本脚本规则;
+    #    本脚本只做只读匹配, 绝不 create/destroy/flush 该集合。
+    if command -v ipset >/dev/null 2>&1 && ipset list "$CHNROUTE_SET" >/dev/null 2>&1; then
+        ipt -t mangle -I HY2_PRE 2 -m set --match-set "$CHNROUTE_SET" dst -j RETURN
+        ipt -t mangle -I HY2_OUT 3 -m set --match-set "$CHNROUTE_SET" dst -j RETURN
+    else
+        log "WARN: ipset $CHNROUTE_SET 不存在, 中国 IP 直连回落 sing-box 判定 (先运行 ruleset-update.sh)"
+    fi
+
+    # 8. PREROUTING (VMnet 虚拟机经宿主转发的流量) -> TPROXY 交给 sing-box
     ipt -t mangle -A HY2_PRE -p tcp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
     ipt -t mangle -A HY2_PRE -p udp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
     ipt -t mangle -A PREROUTING -j HY2_PRE
@@ -210,7 +237,7 @@ do_on() {
     ipt -t mangle -A HY2_OUT -p udp -j MARK --set-mark "$FWMARK"
     ipt -t mangle -A OUTPUT -j HY2_OUT
 
-    # 8. FORWARD 放行 (见 ensure_forward_rules 注释: RETURN 绕行流量所需)
+    # 9. FORWARD 放行 (见 ensure_forward_rules 注释: RETURN 绕行流量所需)
     ensure_forward_rules
 
     log "代理已开启: 全量流量 (本机 + VMnet $VMNET_SUBNET) -> TProxy :$TPROXY_PORT (Hysteria 2)"
@@ -310,6 +337,21 @@ do_status() {
         echo "[无] table $TABLE local 路由 (0.0.0.0/0 dev lo)"
     fi
     echo
+    echo "--- 中国 IP 直连 (内核层 $CHNROUTE_SET) ---"
+    if command -v ipset >/dev/null 2>&1 && ipset list "$CHNROUTE_SET" >/dev/null 2>&1; then
+        local chn_cnt
+        # ipset list 输出的 Members 段每行一个成员 (IP/CIDR 均以数字开头),
+        # 其余头部字段行不以数字开头, 故按行首数字计行; 取不到则显示 [无]
+        chn_cnt="$(ipset list "$CHNROUTE_SET" | grep -c '^[0-9]' || true)"
+        echo "[在] ipset $CHNROUTE_SET (元素数: ${chn_cnt:-[无]})"
+    else
+        echo "[无] ipset $CHNROUTE_SET (先运行 ruleset-update.sh)"
+    fi
+    report "HY2_PRE 中国 IP RETURN (-m set $CHNROUTE_SET dst)" \
+        iptables -t mangle -C HY2_PRE -m set --match-set "$CHNROUTE_SET" dst -j RETURN
+    report "HY2_OUT 中国 IP RETURN (-m set $CHNROUTE_SET dst)" \
+        iptables -t mangle -C HY2_OUT -m set --match-set "$CHNROUTE_SET" dst -j RETURN
+    echo
     echo "--- 直连通路 (off 态保障) ---"
     report "MASQUERADE $VMNET_SUBNET -> $WIFI_DEV" \
         iptables -t nat -C POSTROUTING -s "$VMNET_SUBNET" -o "$WIFI_DEV" -j MASQUERADE
@@ -329,11 +371,14 @@ usage() {
 用法: proxy-switch.sh on|off|status
 
   on | enable    开启 TProxy: mangle 劫持 + 策略路由, 全量流量走 Hysteria 2 隧道
+                 (中国 IP 命中 hy2_cn ipset 时在内核 mangle 层直接直连,
+                  并尽力设置 net.core.default_qdisc=fq, QUIC pacing 友好)
   off | disable  关闭 TProxy: 清除规则恢复直连 (保留 VMnet -> Wi-Fi 伪装通路)
   status         检查各组件存在性 (恒定 exit 0)
 
 配置优先级: 环境变量 > /opt/hy2-gateway/data/gateway_state.json > 默认值
-可覆盖变量: STATE_FILE TPROXY_PORT FWMARK TABLE RJ45_DEV WIFI_DEV VMNET_IFACE VMNET_SUBNET SINGBOX_UID
+可覆盖变量: STATE_FILE TPROXY_PORT FWMARK TABLE RJ45_DEV WIFI_DEV VMNET_IFACE VMNET_SUBNET SINGBOX_UID CHNROUTE_SET
+(CHNROUTE_SET 默认 hy2_cn, 元素由 /usr/local/bin/ruleset-update.sh 每周维护)
 EOF
 }
 

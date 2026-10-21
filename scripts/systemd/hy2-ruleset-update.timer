@@ -1,0 +1,11 @@
+[Unit]
+Description=Smart Hy2 Gateway 规则集每周更新定时器（周一 04:30 ±10 分钟）
+
+[Timer]
+OnCalendar=Mon *-*-* 04:30:00
+Persistent=true
+RandomizedDelaySec=10m
+Unit=hy2-ruleset-update.service
+
+[Install]
+WantedBy=timers.target

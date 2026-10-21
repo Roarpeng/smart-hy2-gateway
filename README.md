@@ -11,7 +11,7 @@
 | 通道 | 载体 | 策略 | 流量 |
 |---|---|---|---|
 | **A · 有线** | RJ45 网卡（`rj45_iface`） | 恒直连，规则级硬保证（`-i/-o` 显式 RETURN），永不进隧道 | 宿主机有线 + 虚拟机 eth0 (VMnet0 桥接) |
-| **B · 无线** | Wi-Fi 网卡（`wifi_iface`） | `wifi_policy` 三态：`whitelist`（默认，白名单 SSID 例外直连）/ `always_proxy`（强制代理）/ `always_direct`（强制直连） | 宿主机 Wi-Fi + 虚拟机 eth1 (VMnet8 Host-Only) |
+| **B · 无线** | Wi-Fi 网卡（`wifi_iface`） | `wifi_policy` 三态：`whitelist`（默认，白名单 SSID 例外直连）/ `always_proxy`（强制代理）/ `always_direct`（强制直连） | 宿主机 Wi-Fi + 虚拟机 eth1 (VMnet1 Host-Only) |
 
 Wi-Fi 连接事件由 NetworkManager dispatcher 感知，按 `wifi_policy` 与白名单自动写入/清除 iptables TProxy 规则——全程无感切换，断网自动恢复直连。
 
@@ -21,7 +21,7 @@ Wi-Fi 连接事件由 NetworkManager dispatcher 感知，按 `wifi_policy` 与�
 flowchart TB
     subgraph VM["VMware Workstation 17 虚拟机（双网卡）"]
         ETH0["eth0 · VMnet0 桥接<br/>工控/内网直连"]
-        ETH1["eth1 · VMnet8 Host-Only<br/>192.168.100.50/24"]
+        ETH1["eth1 · VMnet1 Host-Only<br/>192.168.100.50/24"]
     end
 
     subgraph HOST["Ubuntu 宿主机"]
@@ -30,7 +30,7 @@ flowchart TB
 
         NM["NetworkManager dispatcher<br/>99-wifi-proxy.sh<br/>按 wifi_policy 决策"]
         PS["proxy-switch.sh<br/>on / off / status"]
-        RULES["iptables mangle + 策略路由<br/>HY2_PRE → TPROXY :12345<br/>HY2_OUT → MARK 1<br/>fwmark 1 · table 100 → lo"]
+        RULES["iptables mangle + 策略路由<br/>ipset hy2_cn 中国 IP 内核直连<br/>HY2_PRE → TPROXY :12345<br/>HY2_OUT → MARK 1<br/>fwmark 1 · table 100 → lo"]
         MASQ["ip_forward + MASQUERADE<br/>off 态直连兜底"]
 
         subgraph DOCKER["Docker 容器 hy2-gateway（network_mode:host · privileged · NET_ADMIN）"]
@@ -39,6 +39,7 @@ flowchart TB
         end
 
         STATE[("gateway_state.json<br/>白名单 + wifi_policy + 节点列表<br/>权限 600")]
+        TIMER["hy2-ruleset-update.timer<br/>每周一 04:30 · ruleset-update.sh<br/>更新 .srs + 重建 ipset hy2_cn"]
     end
 
     subgraph OUT["外部网络"]
@@ -64,19 +65,23 @@ flowchart TB
     BROWSER -->|"http://宿主IP:8080"| API
     API -->|"读写状态"| STATE
     API -->|"sing-box check 通过后重启"| SB
+    TIMER -->|".srs 投递 + ipset swap"| SB
+    TIMER -->|"每周 /api/apply 优雅重载"| API
+    RULES -.->|"hy2_cn 命中: 中国 IP 内核直连"| WLP
 ```
 
 ## 核心特性
 
 - **双通道自动分流**：通道A 有线恒直连（iptables 规则级硬保证）；通道B 无线按 `wifi_policy` 三态 + SSID 白名单自动开/关 TProxy，事件驱动、断网自动恢复直连。
-- **TProxy 透明代理**：mangle `HY2_PRE`（PREROUTING）+ `HY2_OUT`（OUTPUT）配合 fwmark 1 / table 100 策略路由，宿主机与虚拟机流量无感接管；UID 930 owner 放行杜绝 sing-box 自身回环。
+- **TProxy 透明代理**：mangle `HY2_PRE`（PREROUTING）+ `HY2_OUT`（OUTPUT）配合 fwmark 1 / table 100 策略路由，宿主机与虚拟机流量无感接管；UID 930 owner 放行杜绝 sing-box 自身回环；`on` 时在 TPROXY/MARK 兜底规则之前插入 `-m set --match-set hy2_cn dst -j RETURN`（HY2_PRE 第 2 条 / HY2_OUT 第 3 条），命中中国 IP 的流量在内核层直接绕过 TProxy、免进用户态转发；ipset `hy2_cn`（hash:net，maxelem 65536）或其数据缺失时仅告警、回落 sing-box 判定（行为与原先相同）——切换脚本绝不 create/destroy/flush 该 set，数据由每周更新脚本原子 swap，swap 后既有 iptables 规则即时命中新数据；`on` 同时 best-effort 设置 `sysctl net.core.default_qdisc=fq`（对 QUIC/Hysteria 2 pacing 友好）。
 - **Hysteria 2 (QUIC) 出站**：sing-box 1.11.x 以专用 UID + `cap_net_admin` 运行，配置经 `sing-box check` 校验通过后才落盘重启，坏配置不破坏运行态。
 - **Web 控制台**（节点管理 / 双通道 / 运行状态三视图；深色控制台外壳，桌面左侧导航、移动端顶部导航；断网自动演示模式、恢复自动回在线）：
   - **节点管理（v2rayN 式）**：多节点列表与启用切换；首屏显示当前**出口 IP、端口、Hysteria 2 · QUIC 协议与实测延迟**；粘贴单条/多条 v2rayN `hy2://` 分享链接、整段 base64 订阅内容或订阅 URL 批量导入，亦支持 sing-box JSON（完整配置 / 单 outbound）。导入自动去重、标签冲突加后缀，兼容 `hysteria2://`、`allowInsecure` 别名、`pinSHA256`（sing-box 不支持证书锁定，insecure 下显式忽略）、`mport`/`ports` 端口跳跃（需 sing-box 1.11+；带宽缺省 = BBR 自适应）；支持真实延迟测试、编辑 / 重命名 / 删除；连通性分段诊断（DNS / 国内·国际直连 TCP / 节点解析 / 节点 UDP 静默探测）
   - **双通道**：宿主真实网卡下拉选择（类型过滤）；通道策略三态切换；白名单管理；顶部使用虚化实景背景，不占用配置版面
   - **运行状态**：sing-box / TProxy 规则实况 / 通道策略 / Wi-Fi 通道四读数，手动启停，运维速查
-- **REST API**：`/api/state` · `/api/apply` · `/api/status` · `/api/proxy` · `/api/interfaces` · `/api/nettest` · `/api/nodes`（节点列表） · `/api/nodes/import`（批量导入） · `/api/nodes/{id}/activate`（启用切换） · `PATCH/DELETE /api/nodes/{id}`（编辑 / 删除） · `/api/nodes/test`（真实延迟测试）
-- **地理分流（v2rayN 式「绕过大陆」）**：代理开启时中国域名/IP（geosite-cn / geoip-cn 规则集，随仓库 `ruleset/` 内置、构建与运行零外联下载）自动直连，其余走 Hysteria 2 隧道；DNS 同步拆分——国内域名用 223.5.5.5 解析（CDN 友好），国外域名经隧道解析（防污染）。
+- **REST API**：`/api/state` · `/api/apply` · `/api/status` · `/api/proxy` · `/api/interfaces` · `/api/nettest` · `/api/egress`（实测出口公网 IP：代理开启时为隧道出口、关闭时为本地宽带出口） · `/api/nodes`（节点列表） · `/api/nodes/import`（批量导入） · `/api/nodes/{id}/activate`（启用切换） · `PATCH/DELETE /api/nodes/{id}`（编辑 / 删除） · `/api/nodes/test`（真实延迟测试）
+- **地理分流（v2rayN 式「绕过大陆」，三层递进）**：代理开启时 ① **通道策略**——通道A 有线恒直连、白名单 SSID 直连，永不进隧道；② **内核截流**——目的 IP 命中 ipset `hy2_cn` 中国网段即在 mangle 层直接放行，不进 TProxy（见上条）；③ **sing-box 判定**——其余流量由 geosite-cn / geoip-cn 规则集二次识别，中国域名/IP 直连、其余走 Hysteria 2 隧道；DNS 同步拆分——国内域名用 223.5.5.5 解析（CDN 友好），国外域名经隧道解析（防污染）。规则集随镜像内置，**首次启动零外联**；之后每周定时自动更新（见下条）。
+- **规则集每周自动更新（systemd timer）**：`hy2-ruleset-update.timer` 每周一 04:30 触发（±10 分钟随机抖动，`Persistent=true` 错过补跑）执行 `ruleset-update.sh`：从 SagerNet 官方（sing-geosite / sing-geoip 的 rule-set 分支）下载 `geosite-cn.srs` / `geoip-cn.srs` → 尺寸校验 → 原子替换仓库 `ruleset/` → `docker cp` 投递容器 `/usr/local/share/sing-box/` → 从同一份 `geoip-cn.srs` 用 `sing-box rule-set decompile` 导出 CIDR、原子重建 ipset `hy2_cn`（单一数据源）→ 若代理在开则确保 match 规则在位 → 经后端 `/api/apply` 触发 sing-box 优雅重载。全程 fail-safe：下载失败或校验不过即保留现有规则集，重载前 `sing-box check` 通过才重启进程，坏文件不破坏运行态。`install.sh` 一并安装脚本与 timer（`enable --now`）、检查 `curl`/`jq`/`ipset` 依赖，并在安装尾声 best-effort 首跑一次。
 - **规则守护（rule-guard）**：dispatcher 每次决策落盘期望态，后端每 30s 将 iptables 实况对齐——任何原因（容器重建、系统事件）导致的规则丢失在一个周期内自动恢复；Wi-Fi 波动断连不清规则。
 - **Host-Only 虚拟机直连兜底**：代理关闭时脚本确保 `ip_forward` + MASQUERADE，虚拟机不断网。
 
@@ -96,7 +101,7 @@ docker compose up -d --build
 
 浏览器打开 `http://宿主IP:8080`：节点管理页粘贴一条或多条 v2rayN 分享链接 / base64 订阅 / 订阅 URL → 导入列表 → 启用节点（自动校验并重启 sing-box）→ 做延迟测试；「双通道」页选好两张网卡与通道策略（默认「走代理·白名单例外」）→ 点「保存网卡配置」；断开重连一次 Wi-Fi 即生效。
 
-> 仅接管 IPv4。VMware 虚拟网络（VMnet0 桥接 / VMnet8 Host-Only）配置见 [docs/vmware-setup.md](docs/vmware-setup.md)。
+> 仅接管 IPv4。VMware 虚拟网络（VMnet0 桥接 / VMnet1 Host-Only）配置见 [docs/vmware-setup.md](docs/vmware-setup.md)。
 
 ## 仓库文件
 
@@ -109,8 +114,13 @@ smart-hy2-gateway/（部署目录 = /opt/hy2-gateway）
 ├── node_parser.py                   分享链接 / base64 订阅 / sing-box JSON 解析与去重
 ├── scripts/
 │   ├── proxy-switch.sh              TProxy 开关 (on/off/status, 幂等, RJ45 硬直连)
-│   └── 99-wifi-proxy.sh             NetworkManager dispatcher (wifi_policy 决策)
-├── ruleset/                         地理分流规则集 (geosite/geoip CN 直连, 构建时内置镜像)
+│   ├── 99-wifi-proxy.sh             NetworkManager dispatcher (wifi_policy 决策)
+│   ├── ruleset-update.sh            规则集每周更新 (下载→校验→原子替换→投递容器→重建 ipset)
+│   └── systemd/
+│       ├── hy2-ruleset-update.service
+│       └── hy2-ruleset-update.timer
+│                                    定时单元 (每周一 04:30 触发, ±10min 抖动, 错过补跑)
+├── ruleset/                         地理分流规则集 (geosite/geoip CN 直连, 镜像内置, 每周自动更新)
 ├── web/                             控制台前端 (零框架, 自托管 Switzer 字体, 断网可用)
 │   ├── index.html · console.css · console.js
 │   ├── assets/                      实景照片与版权说明 (CREDITS.md)

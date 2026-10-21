@@ -16,13 +16,17 @@ const appState = {
   network: {
     rj45Dev: 'enp3s0',
     wifiDev: 'wlp2s0',
-    vmnetDev: 'vmnet8',
+    vmnetDev: 'vmnet1',
+    vmnetSubnet: '192.168.100.0/24',
     tproxyPort: 12345,
     fwmark: '0x1',
     table: 100,
     wifiPolicy: 'whitelist'
   },
   runtime: null,              // /api/status 实况; null = 未知
+  egress: null,               // /api/egress 实测出口 {ok, ip, via, detail}; null = 未测
+  lastEgressAt: 0,            // 出口探测节流时间戳 (ms)
+  lastProxyActive: null,      // 上次轮询的代理态; 翻转时强制重测出口 IP
   currentNode: {
     tag: '未命名节点',
     server: '',
@@ -160,6 +164,25 @@ async function refreshRuntimeStatus() {
   }
 }
 
+// 实测真实出口公网 IP: 代理开启时为隧道出口, 关闭时为本地宽带出口。
+// 10s 节流; 代理态翻转/手动操作带 force 立即重测。
+async function refreshEgress(force = false) {
+  if (DEMO_MODE) return;
+  const now = Date.now();
+  if (!force && now - appState.lastEgressAt < 10000) return;
+  appState.lastEgressAt = now;
+  try {
+    const res = await apiFetch('/api/egress', {}, 12000);
+    const data = await res.json().catch(() => null);
+    if (res.ok && data && data.status === 'success') {
+      appState.egress = data;
+      updateRouteStage(); // 出口 IP 读数/顶栏即时换新
+    }
+  } catch (err) {
+    // 探测失败静默: 读数回落到节点地址, 节流窗口后自动重试
+  }
+}
+
 // 将 /api/status 实况写入状态视图读数砖
 function applyRuntimeStatus(data) {
   if (!data || DEMO_MODE) return;
@@ -176,6 +199,13 @@ function applyRuntimeStatus(data) {
   renderStatusReadouts();
   renderWhitelistTags();
   updateRouteStage();
+
+  // 代理态翻转 (含首次读取) 时立即重测出口 IP: 隧道/直连的出口必然不同
+  const activeNow = appState.runtime.proxyActive;
+  if (activeNow !== appState.lastProxyActive) {
+    appState.lastProxyActive = activeNow;
+    refreshEgress(true);
+  }
 }
 
 // ---- 启动水合：GET /api/state + /api/status；任何失败均静默回退到演示初始化 ----
@@ -224,6 +254,7 @@ function mapApiStateToApp(data) {
   appState.network.rj45Dev = data.rj45_iface || appState.network.rj45Dev;
   appState.network.wifiDev = data.wifi_iface || appState.network.wifiDev;
   appState.network.vmnetDev = data.vmnet_iface || appState.network.vmnetDev;
+  appState.network.vmnetSubnet = data.vmnet_subnet || appState.network.vmnetSubnet;
   appState.network.tproxyPort = data.tproxy_port ?? appState.network.tproxyPort;
   appState.network.fwmark = (typeof data.fwmark === 'number')
     ? '0x' + data.fwmark.toString(16)   // API int 1 -> UI 显示 '0x1'
@@ -282,8 +313,8 @@ function buildApplyPayload() {
     },
     wifi_iface: appState.network.wifiDev,
     rj45_iface: appState.network.rj45Dev,
-    vmnet_iface: appState.network.vmnetDev || 'vmnet8', // UI 无输入框, 保留后端状态值
-    vmnet_subnet: '192.168.100.0/24',
+    vmnet_iface: appState.network.vmnetDev || 'vmnet1', // UI 无输入框, 保留后端状态值
+    vmnet_subnet: appState.network.vmnetSubnet || '192.168.100.0/24',
     tproxy_port: parseInt(appState.network.tproxyPort, 10) || 12345,
     fwmark: parseFwmarkToInt(appState.network.fwmark),
     table: parseInt(appState.network.table, 10) || 100,
@@ -365,15 +396,22 @@ function renderStatusReadouts() {
     sbDot.className = 'dot warn';
   }
 
-  // TProxy 规则 (在线时为 iptables 实况)
+  // TProxy 规则 (在线时为 iptables 实况): 已启用=绿色工作态, 未启用=中性灰
   const tp = document.getElementById('st-tproxy-text');
   if (appState.runtime) {
     tp.textContent = appState.runtime.proxyActive ? '已启用' : '未启用';
-    tp.className = `tv big ${appState.runtime.proxyActive ? 'v-warn' : 'v-ok'}`;
+    tp.className = `tv big ${appState.runtime.proxyActive ? 'v-ok' : 'v-muted'}`;
   } else {
     tp.textContent = DEMO_MODE ? '未知 (演示模式)' : '未知';
     tp.className = 'tv big v-muted';
   }
+
+  // 手动开关按钮: 当前所处状态的一侧加绿色激活环, 点击后立刻看到颜色翻转
+  const proxyOnBtn = document.getElementById('btn-proxy-on');
+  const proxyOffBtn = document.getElementById('btn-proxy-off');
+  const proxyKnown = !!appState.runtime;
+  if (proxyOnBtn) proxyOnBtn.classList.toggle('is-on', proxyKnown && appState.runtime.proxyActive);
+  if (proxyOffBtn) proxyOffBtn.classList.toggle('is-on', proxyKnown && !appState.runtime.proxyActive);
 
   // 无线通道策略
   const pol = document.getElementById('st-policy-text');
@@ -925,11 +963,33 @@ function updateRouteStage() {
       : '在下方导入第一条 v2rayN 链接，或粘贴订阅地址。';
   }
 
+  // 出口 IP: 优先显示实测公网 IP (via 标注隧道/直连), 失败回落节点地址
+  const eg = appState.egress;
+  const egOk = eg && eg.ok && eg.ip;
   const ipEl = document.getElementById('route-ip');
-  if (ipEl) ipEl.textContent = n ? (n.server || '未填写') : '未配置';
+  if (ipEl) {
+    if (egOk) {
+      ipEl.textContent = eg.ip;
+      ipEl.title = eg.via === 'tunnel' ? '实测出口公网 IP · 经 Hysteria 2 隧道' : '实测出口公网 IP · 当前直连';
+      ipEl.classList.add('v-ok');
+    } else {
+      ipEl.textContent = n ? (n.server || '未填写') : '未配置';
+      ipEl.title = (eg && !eg.ok && eg.detail)
+        ? `${eg.detail} · 暂显节点地址`
+        : '未取到实测 IP · 暂显节点地址';
+      ipEl.classList.remove('v-ok');
+    }
+  }
 
   const portEl = document.getElementById('route-port-out');
   if (portEl) portEl.textContent = n ? String(n.port || 443) : '未配置';
+
+  // 协议: 有活跃节点才标识 Hysteria 2 · QUIC (hy2 传输层恒为 QUIC/UDP)
+  const protoEl = document.getElementById('route-proto');
+  if (protoEl) {
+    protoEl.textContent = n ? 'Hysteria 2 · QUIC' : '未配置';
+    protoEl.title = n ? 'Hysteria 2 · QUIC (UDP) 传输' : '';
+  }
 
   const tag = document.getElementById('route-node-tag');
   if (tag) tag.textContent = n ? n.tag : '未配置';
@@ -939,8 +999,9 @@ function updateRouteStage() {
 
   const topbarRoute = document.getElementById('topbar-route');
   if (topbarRoute) {
+    const viaTag = egOk ? (eg.via === 'tunnel' ? ' · 隧道' : ' · 直连') : '';
     topbarRoute.textContent = n
-      ? `出口 IP ${n.server || '未填写'} · ${n.port || 443} · QUIC`
+      ? `出口 IP ${egOk ? eg.ip : (n.server || '未填写')}${viaTag} · ${n.port || 443} · QUIC`
       : '尚未配置出口节点';
   }
 

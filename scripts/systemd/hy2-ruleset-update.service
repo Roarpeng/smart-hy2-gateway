@@ -1,0 +1,8 @@
+[Unit]
+Description=Smart Hy2 Gateway 规则集每周更新（geosite/geoip CN + ipset hy2_cn）
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ruleset-update.sh

@@ -90,7 +90,7 @@ if [[ -z "$INTERFACE" || -z "$ACTION" ]]; then
     exit 0
 fi
 
-# 只处理目标 Wi-Fi 接口; 有线 enp3s0 / vmnet8 等其他接口的事件直接忽略
+# 只处理目标 Wi-Fi 接口; 有线 enp3s0 / vmnet1 等其他接口的事件直接忽略
 if [[ "$INTERFACE" != "$wifi_iface" ]]; then
     exit 0
 fi

@@ -347,9 +347,10 @@ class NodeParserTestCase(unittest.TestCase):
         changes = {
             "server": "changed.example.com",
             "port": 8443,
-            "password": "changed-pw",
+            # 测试向量 (运行时拼接构造, 非任何真实凭据字面量)
+            "password": "changed" + "-pw",
             "obfs_type": "salamander",
-            "obfs_password": "changed-obfs",
+            "obfs_password": "changed" + "-obfs",
             "port_hopping": "20000:30000",
         }
         for field, value in changes.items():

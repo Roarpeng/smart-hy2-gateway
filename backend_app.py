@@ -12,6 +12,7 @@
 """
 
 import atexit
+import http.client
 import json
 import logging
 import os
@@ -101,7 +102,7 @@ class StateModel(BaseModel):
     active_node_id: str = ""
     wifi_iface: str = "wlp2s0"
     rj45_iface: str = "enp3s0"
-    vmnet_iface: str = "vmnet8"
+    vmnet_iface: str = "vmnet1"
     vmnet_subnet: str = "192.168.100.0/24"
     # Wi-Fi 通道策略 (顶层, 双通道模型):
     #   whitelist     = 默认走代理, 白名单 SSID 例外直连
@@ -776,6 +777,36 @@ def proxy_switch_env() -> dict:
     return env
 
 
+def reapply_proxy_rules() -> str:
+    """网络参数变更后按落盘期望态重建 iptables 规则。
+
+    `proxy-switch.sh on/off` 会把 VMnet 网段/网卡/IP 端口写入规则；仅修改状态
+    文件不会更新已有 MASQUERADE/FORWARD 规则。因此 /api/apply 成功后必须重放
+    一次期望态，否则 WebUI 改 vmnet_iface/vmnet_subnet 后规则仍是旧值。
+    """
+    try:
+        expected = LAST_DECISION_FILE.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+    if expected not in ("on", "off"):
+        return ""
+    try:
+        r = subprocess.run(
+            [PROXY_SWITCH_SCRIPT, expected],
+            shell=False,  # argv 列表直传; expected 已限定为 on/off
+            capture_output=True, text=True, timeout=SWITCH_TIMEOUT,
+            env=proxy_switch_env(),
+        )
+        if r.returncode != 0:
+            summary = " ".join((r.stdout + " " + r.stderr).split())[:300]
+            log.warning("reapply proxy rules failed: %s", summary)
+            return f"网络规则重载失败: {summary}"
+        return "网络规则已按新参数重载"
+    except Exception as exc:
+        log.warning("reapply proxy rules exception: %s", exc)
+        return f"网络规则重载异常: {exc}"
+
+
 @app.post("/api/apply")
 def apply_state(state: StateModel):
     """保存状态 -> 归一化 -> 校验配置 -> 事务下发 (旧前端只传 current_node 也兼容)。"""
@@ -805,8 +836,14 @@ def apply_state(state: StateModel):
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"状态参数非法: {exc}")
     message = commit_state(normalized, restart=True)
+    network_message = reapply_proxy_rules()
     has_active = _resolve_active_node(normalized) is not None
-    return {"status": "success", "message": message, "singbox_valid": has_active}
+    return {
+        "status": "success",
+        "message": message,
+        "network_message": network_message,
+        "singbox_valid": has_active,
+    }
 
 
 # ---------------- 多节点管理 API ----------------
@@ -1037,19 +1074,17 @@ def delete_node(node_id: str):
 
 # ---------------- 节点延迟测试 (临时 sing-box 实例 + Clash API) ----------------
 def _clash_api_get(port: int, path: str, secret: str, timeout: float) -> tuple[int, bytes]:
-    """访问临时实例的 Clash API; 非 2xx 也返回状态码与响应体。"""
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{port}{path}",
-        headers={"Authorization": f"Bearer {secret}"},
-    )
+    """访问临时实例的 Clash API (固定 127.0.0.1 回环); 非 2xx 也返回状态码与响应体。
+
+    http.client 显式绑定回环主机与端口, 请求目标不经过 URL 拼接,
+    从结构上排除请求目标被外部输入改写的可能。"""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.read(65536)
-    except urllib.error.HTTPError as exc:
-        try:
-            return exc.code, exc.read(65536)
-        finally:
-            exc.close()
+        conn.request("GET", path, headers={"Authorization": f"Bearer {secret}"})
+        resp = conn.getresponse()
+        return resp.status, resp.read(65536)
+    finally:
+        conn.close()
 
 
 def _hop_start_port(node: Hy2NodeModel) -> int:
@@ -1144,9 +1179,13 @@ def test_node_latency(node: Hy2NodeModel) -> dict:
             "outbounds": [build_hy2_outbound(test_node), {"type": "direct", "tag": "direct"}],
             "route": {"final": tag},
         }
-        cfg_path = os.path.join(tmpdir, "config.json")
-        with open(cfg_path, "w", encoding="utf-8") as fh:
-            json.dump(config, fh, ensure_ascii=False)
+        # 临时配置文件由 tempfile 命名 (目录 mkdtemp + 文件名自动生成,
+        # 路径不经任何手工拼接/外部输入, 无穿越面)
+        with tempfile.NamedTemporaryFile(
+                "w", dir=tmpdir, prefix="config-", suffix=".json",
+                delete=False, encoding="utf-8") as fh:
+            fh.write(json.dumps(config, ensure_ascii=False))
+            cfg_path = fh.name
         os.chmod(tmpdir, 0o755)
         os.chmod(cfg_path, 0o644)
         try:
@@ -1476,6 +1515,106 @@ def nettest(body: NetTestModel):
     key_results = [r for r in results if r["name"] in ("dns_target", "tcp_cn")]
     overall = "up" if all(r["ok"] for r in key_results) else ("degraded" if any(r["ok"] for r in results) else "down")
     return {"status": "success", "target": target, "overall": overall, "results": results}
+
+
+# ---------------- 出口 IP 实测 ----------------
+# 后端容器与宿主共享网络栈: 它自己的出站 HTTP 同样被 OUTPUT 链劫持。
+# 代理开启时 echo 服务看到的是 Hysteria 2 隧道出口 IP, 关闭时是本地宽带
+# 公网 IP —— 因此"后端自己请求一次 IP echo"即等价于实测当前真实出口。
+# 探测源均为国际站点 (经隧道出网): 若混入国内源, sing-box 地理分流会将其
+# 直连放行, 代理开启时就会把"国内直连出口"误标为"隧道出口"。
+# 源1 cloudflare trace (ip=x), 源2 ip.sb 纯文本; 两者皆败则如实报不可测。
+_EGRESS_TTL = 15.0
+_EGRESS_TIMEOUT = 2.5
+_egress_cache: dict = {"at": 0.0, "payload": None}
+_egress_lock = threading.Lock()
+
+
+def _parse_public_ip(text: str) -> Optional[str]:
+    """从 echo 响应中提取首个公网 IP; 异常内容一律返回 None。"""
+    import ipaddress
+
+    for token in str(text or "").replace(",", " ").split():
+        try:
+            addr = ipaddress.ip_address(token)
+        except ValueError:
+            continue
+        if not (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            return token
+    return None
+
+
+def _egress_ip_cloudflare() -> Optional[str]:
+    """源1: cloudflare trace, 形如 "ip=1.2.3.4"。
+    用字面量 IPv4 地址而非域名: 双栈宿主上域名解析可能选 IPv6, 而 TProxy
+    仅接管 IPv4, v6 直连会绕过隧道把家宽地址误报成隧道出口。1.1.1.1 的
+    证书 SAN 覆盖该 IP, 直连校验不受影响。"""
+    try:
+        with urllib.request.urlopen(
+            "https://1.1.1.1/cdn-cgi/trace", timeout=_EGRESS_TIMEOUT
+        ) as resp:
+            body = resp.read(2048).decode("utf-8", "ignore")
+    except Exception:
+        return None
+    for line in body.splitlines():
+        if line.startswith("ip="):
+            return _parse_public_ip(line.split("=", 1)[1])
+    return None
+
+
+def _egress_ip_cloudflare_host() -> Optional[str]:
+    """源2: cloudflare trace 域名形态 (1.1.1.1 被阻断时的回落; 双栈机上
+    可能选 v6 直连, 仅作降级参考)。"""
+    try:
+        with urllib.request.urlopen(
+            "https://www.cloudflare.com/cdn-cgi/trace", timeout=_EGRESS_TIMEOUT
+        ) as resp:
+            body = resp.read(2048).decode("utf-8", "ignore")
+    except Exception:
+        return None
+    for line in body.splitlines():
+        if line.startswith("ip="):
+            return _parse_public_ip(line.split("=", 1)[1])
+    return None
+
+
+def _egress_ip_ipsb() -> Optional[str]:
+    """源3: api.ip.sb 纯文本 IP (末级回落)。"""
+    try:
+        with urllib.request.urlopen("https://api.ip.sb/ip", timeout=_EGRESS_TIMEOUT) as resp:
+            return _parse_public_ip(resp.read(256).decode("utf-8", "ignore"))
+    except Exception:
+        return None
+
+
+def _egress_probe() -> dict:
+    proxy_active = is_proxy_active()
+    for provider in (_egress_ip_cloudflare, _egress_ip_cloudflare_host, _egress_ip_ipsb):
+        ip = provider()
+        if ip:
+            return {
+                "ok": True, "ip": ip,
+                "proxy_active": proxy_active,
+                "via": "tunnel" if proxy_active else "direct",
+            }
+    detail = "出口探测失败: 各探测源均不可达"
+    if proxy_active:
+        detail += " (代理已接管但出口不通, 检查节点可达性与 sing-box 进程)"
+    return {"ok": False, "ip": None, "proxy_active": proxy_active, "via": None, "detail": detail}
+
+
+@app.get("/api/egress")
+def get_egress_ip():
+    """实测当前出口公网 IP (15s 缓存; 探测本身走真实路径, 结果即所见即所得)。"""
+    with _egress_lock:
+        now = time.monotonic()
+        if _egress_cache["payload"] and now - _egress_cache["at"] < _EGRESS_TTL:
+            return {"status": "success", **_egress_cache["payload"]}
+        payload = _egress_probe()
+        _egress_cache["at"] = now
+        _egress_cache["payload"] = payload
+    return {"status": "success", **payload}
 
 
 # 静态控制台挂载必须放在所有 API 路由之后

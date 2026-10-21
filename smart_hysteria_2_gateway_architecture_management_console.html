@@ -287,10 +287,10 @@
             <text x="65" y="196" fill="#10b981" font-size="11" font-weight="600">✓ 策略：永远本地直连 (RJ45)</text>
             <text x="50" y="248" fill="#64748b" font-size="10">用途：PLC/工业控制/内网数据库</text>
 
-            <!-- VM Adapter 2: VMnet8 (Wi-Fi NAT/Router) -->
+            <!-- VM Adapter 2: VMnet1 (Wi-Fi Host-Only) -->
             <rect x="35" y="295" width="250" height="205" rx="12" fill="#111c33" stroke="#818cf8" stroke-width="1.2"/>
             <text x="50" y="325" fill="#c084fc" font-size="13" font-weight="700">虚拟网卡 2: eth1</text>
-            <text x="50" y="346" fill="#94a3b8" font-size="11">绑定模式: VMnet8 (NAT 网关模式)</text>
+            <text x="50" y="346" fill="#94a3b8" font-size="11">绑定模式: VMnet1 (Host-Only 模式)</text>
             <text x="50" y="364" fill="#94a3b8" font-size="11">默认网关: 192.168.100.1 (宿主)</text>
 
             <rect x="50" y="380" width="220" height="48" rx="8" fill="#090f1d"/>
@@ -629,7 +629,7 @@
 
             <div>
               <label class="block text-slate-400 mb-1 font-medium">VMware NAT 虚拟网卡 (宿主端接口)</label>
-              <input type="text" id="cfg-vmnet-dev" value="vmnet8" class="w-full bg-obsidian border border-obsidian-border rounded-lg p-2.5 text-slate-200 font-mono">
+              <input type="text" id="cfg-vmnet-dev" value="vmnet1" class="w-full bg-obsidian border border-obsidian-border rounded-lg p-2.5 text-slate-200 font-mono">
               <p class="text-[11px] text-slate-500 mt-1">虚拟机的 Wi-Fi 流量从该网卡接收并执行 TProxy</p>
             </div>
 
@@ -730,7 +730,7 @@
       network: {
         rj45Dev: 'enp3s0',
         wifiDev: 'wlp2s0',
-        vmnetDev: 'vmnet8',
+        vmnetDev: 'vmnet1',
         tproxyPort: 12345,
         fwmark: '0x1',
         table: 100
@@ -1023,10 +1023,10 @@ fi`
 - **Bridged to**：切勿选择 Automatic，必须显式指定物理有线网卡名称（例如 \`enp3s0\`）。
 - **效果**：虚拟机 eth0 获得物理路由器分配的内网 IP，数据帧在二层直接出物理口，完全不进入宿主机 iptables/TProxy，永远直连。
 
-### 网卡 2 (代理通路)：VMnet8 -> 映射 Wi-Fi 智能网关
+### 网卡 2 (代理通路)：VMnet1 -> 映射 Wi-Fi 智能网关
 - **网络类型**：NAT 模式 (或 Host-Only 模式)
 - **子网 IP**：例如 \`192.168.100.0\`，掩码 \`255.255.255.0\`
-- **网关 IP**：\`192.168.100.1\` (即宿主机在 vmnet8 虚拟接口上的 IP)
+- **网关 IP**：\`192.168.100.1\` (即宿主机在 vmnet1 虚拟接口上的 IP)
 - **效果**：虚拟机发起的出站流量通过 192.168.100.1 转交宿主机内核，宿主机的 PREROUTING 规则即可根据 Wi-Fi SSID 状态拦截并 TProxy 至 Docker 容器。
 
 ---
@@ -1043,7 +1043,7 @@ network:
       dhcp4-overrides:
         route-metric: 200     # 较高跃点值，防止抢夺默认网关
 
-    # 对应 VMnet8 (Wi-Fi 代理出口，用于日常互联网)
+    # 对应 VMnet1 (Wi-Fi 代理出口，用于日常互联网)
     eth1:
       dhcp4: false
       addresses: [192.168.100.50/24]
@@ -1117,7 +1117,7 @@ network:
 
         // SVG Dynamic Lines: DIRECT TO NORMAL INTERNET
         flowContainer.innerHTML = `
-          <!-- VMnet8 to Host Wi-Fi dev -->
+          <!-- VMnet1 to Host Wi-Fi dev -->
           <path d="M 285 410 L 375 440" stroke="#06b6d4" stroke-width="2.5" class="flow-line-direct" marker-end="url(#arrow-blue)" />
           <!-- Host Wi-Fi dev to Wi-Fi Internet Direct -->
           <path d="M 715 440 L 805 440" stroke="#06b6d4" stroke-width="2.5" class="flow-line-direct" marker-end="url(#arrow-blue)" />
@@ -1134,7 +1134,7 @@ network:
 
         // SVG Dynamic Lines: HIJACK INTO DOCKER TPROXY -> OUTBOUND TO HY2 SERVER
         flowContainer.innerHTML = `
-          <!-- VMnet8 to Host Dispatcher Layer -->
+          <!-- VMnet1 to Host Dispatcher Layer -->
           <path d="M 285 410 L 375 440" stroke="#f59e0b" stroke-width="2.5" class="flow-line-proxy" marker-end="url(#arrow-purple)" />
           <!-- Host Wi-Fi intercept up to Docker sing-box Container -->
           <path d="M 545 395 L 545 285" stroke="#a855f7" stroke-width="2.5" class="flow-line-proxy" marker-end="url(#arrow-purple)" />
