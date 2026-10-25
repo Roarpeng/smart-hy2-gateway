@@ -60,6 +60,7 @@ CHECK_TIMEOUT = 15         # sing-box check 超时 (秒)
 SWITCH_TIMEOUT = 30        # proxy-switch.sh 执行超时 (秒)
 STABLE_UPTIME = 60         # 存活超过该秒数则重置崩溃退避
 LAST_DECISION_FILE = Path("/data/last_decision")  # proxy-switch on/off 落盘的期望态
+CURRENT_SSID_FILE = Path("/data/current_ssid")    # 宿主 dispatcher 落盘的当前 SSID
 GUARD_INTERVAL = 30        # 规则守护巡检周期 (秒)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
@@ -406,11 +407,11 @@ def build_singbox_config(state: StateModel) -> dict:
                 "listen": "::",                 # 双栈监听, 端口由状态文件驱动
                 "listen_port": state.tproxy_port,
                 "sniff": True,
-                # 嗅探到域名后用本配置的拆分 DNS 重解析并覆盖目标地址:
-                # 系统 resolver 被污染时(如 youtube 返回假 IP), 此开关让连接
-                # 奔向真实 IP (国外经隧道解析 / 国内走 223.5.5.5), 否则隧道
-                # 只是把包送到了污染 IP 上
-                "sniff_override_destination": True,
+                # 只嗅探、不覆盖目标地址。覆盖会把 metadata.Destination 变成域名,
+                # 导致 geoip-cn 规则(按 IP 匹配)永远不命中, 中国 IP 全被塞进隧道
+                # (实测 5k+ 次被节点 rejected)。DNS 污染改由下面的 hijack-dns
+                # 拆分解析解决, 客户端拿到的一定是干净 IP。
+                "sniff_override_destination": False,
             }
         ],
         "outbounds": [hy2_outbound, {"type": "direct", "tag": "direct"}],
@@ -419,6 +420,14 @@ def build_singbox_config(state: StateModel) -> dict:
         "route": {
             "auto_detect_interface": True,
             "rules": [
+                # 客户端 DNS (UDP/TCP 53) 一律由本配置的拆分 DNS 应答:
+                # 国内域名 -> 223.5.5.5 直连; 国外域名 -> 隧道内 DoH (防污染)。
+                # 客户端只拿到干净 IP, 后续 TCP 按真实 IP 做 geoip 判定。
+                {"protocol": "dns", "action": "hijack-dns"},
+                # Windows 联网探测走直连, 否则节点拒绝该域名时 Windows 会
+                # 把整条链路标记为"无 Internet", 浏览器表现为完全没网
+                {"domain_suffix": [".msftconnecttest.com", ".msftncsi.com"],
+                 "outbound": "direct"},
                 {"rule_set": ["geosite-cn"], "outbound": "direct"},
                 {"rule_set": ["geoip-cn"], "outbound": "direct"},
             ],
@@ -664,11 +673,23 @@ atexit.register(singbox_manager.stop)
 
 # ---------------- 状态探测 ----------------
 def detect_current_ssid() -> Optional[str]:
-    """尽力获取当前 Wi-Fi SSID; 容器内无 nmcli 或查询失败一律返回 None。"""
+    """尽力获取当前 Wi-Fi SSID。
+
+    容器内没有 nmcli 也连不到 dbus, 因此主路径是读宿主 dispatcher
+    (99-wifi-proxy.sh) 落盘的 /data/current_ssid; nmcli 仅作宿主直接运行时的兜底。
+    注意 nmcli 输出受 locale 影响 (zh_CN 下 active 列是 "是"/"否"), 必须 LC_ALL=C。
+    """
     try:
+        cached = CURRENT_SSID_FILE.read_text(encoding="utf-8").strip()
+        if cached:
+            return cached
+    except Exception:
+        pass
+    try:
+        env = dict(os.environ, LC_ALL="C")
         r = subprocess.run(
             ["nmcli", "-t", "-f", "active,ssid", "dev", "wifi"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, env=env,
         )
         if r.returncode == 0:
             for line in r.stdout.splitlines():

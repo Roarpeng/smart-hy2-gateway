@@ -70,9 +70,11 @@ proxy_ctl() {
 
 # 当前活动 Wi-Fi 的 SSID; 空串 = 无活动连接 / 隐藏网络 / 尚未就绪
 # nmcli -t 输出形如 "yes:MySSID"; SSID 本身可含冒号, 因此只剥 "yes:" 前缀
+# 必须 LC_ALL=C: 系统 locale 为 zh_CN 时 nmcli 会把 active 列输出成 "是"/"否",
+# 导致 grep '^yes:' 永远落空 -> SSID 被判为空 -> fail-secure 误开代理 (白名单失效)
 current_ssid() {
     local line
-    line="$(nmcli -t -f active,ssid dev wifi 2>/dev/null | grep -m1 '^yes:' || true)"
+    line="$(LC_ALL=C nmcli -t -f active,ssid dev wifi 2>/dev/null | grep -m1 '^yes:' || true)"
     printf '%s' "${line#yes:}"
 }
 
@@ -82,6 +84,14 @@ ssid_whitelisted() {
     [[ -r "$STATE_FILE" ]] || return 1
     command -v jq >/dev/null 2>&1 || return 1
     jq -e --arg s "$ssid" 'any(.whitelist[]?; . == $s)' "$STATE_FILE" >/dev/null 2>&1
+}
+
+# 落盘当前 SSID (与状态文件同目录): 后端在容器内没有 nmcli/dbus,
+# WebUI 的"当前 SSID"由此文件读取
+persist_ssid() {
+    local f
+    f="$(dirname "$STATE_FILE")/current_ssid"
+    printf '%s\n' "${1:-}" > "$f" 2>/dev/null || true
 }
 
 # --- 主流程 -----------------------------------------------------------------
@@ -99,21 +109,23 @@ case "$ACTION" in
     up|connectivity-change)
         # 读取策略: 缺失/空/非法值都落入 *) 分支 => 按 whitelist 处理 (fail-secure)
         wifi_policy="$(state_get wifi_policy)"
+        ssid_now="$(current_ssid)"
+        persist_ssid "$ssid_now"
         case "$wifi_policy" in
             always_proxy)
                 # 策略优先: 恒开代理, 即使命中白名单也不放行, 不进入 SSID 判断
-                proxy_ctl on "策略强制代理 (wifi_policy=always_proxy), SSID '$(current_ssid)'"
+                proxy_ctl on "策略强制代理 (wifi_policy=always_proxy), SSID '$ssid_now'"
                 ;;
             always_direct)
                 # 策略优先: 恒关代理, 即使 SSID 不可信/为空也不开, 不进入 SSID 判断
-                proxy_ctl off "策略强制直连 (wifi_policy=always_direct), SSID '$(current_ssid)'"
+                proxy_ctl off "策略强制直连 (wifi_policy=always_direct), SSID '$ssid_now'"
                 ;;
             *)
                 # whitelist (默认): 空串 = 字段缺失; 其他未知值告警后同样回落 whitelist
                 if [[ "$wifi_policy" != "whitelist" && -n "$wifi_policy" ]]; then
                     log "WARN: wifi_policy='$wifi_policy' 非法 (期望 whitelist|always_proxy|always_direct), 按 whitelist 处理"
                 fi
-                ssid="$(current_ssid)"
+                ssid="$ssid_now"
                 if [[ -z "$ssid" ]]; then
                     # 刻意收紧 (相对早期原型): SSID 为空 => 不可信 => 开代理。
                     # 隐藏网络与"连接尚未就绪"都落在这里, 宁可误开不误放;
@@ -133,6 +145,7 @@ case "$ACTION" in
         # 断网期间规则无害(无流量可劫持), 且 down->off->up 依赖事件恢复,
         # 在 Wi-Fi 波动场景会造成规则丢失窗口(实测踩坑); 直连通路由
         # MASQUERADE 常驻规则兜底。清除规则只发生在明确的直连决策时。
+        persist_ssid ""
         log "决策: 保持现有规则 ($INTERFACE down, 断网不清规则)"
         ;;
     *)

@@ -316,6 +316,9 @@ nmcli device wifi connect "AnotherNet" password "<密码>"
 | 虚拟机有 192.168.100.x 地址，但没有默认网关 / 浏览器打不开 | VMware Host-Only DHCP 默认不下发 `option routers`，或虚拟机默认路由仍指向 eth0 | 在虚拟机内把代理网卡设为静态：IP `192.168.100.50/24`、网关 `192.168.100.1`、DNS `223.5.5.5`；确认 `ip route` / `route print` 中存在 `default via 192.168.100.1` |
 | 虚拟机可以上网，但出口 IP 不是 Hysteria 2 节点 | 代理网卡误设为 NAT/Bridged，流量绕过宿主 PREROUTING；或默认路由仍走 eth0 | 在 VMware 中把代理网卡改为 **Host-Only VMnet1**，不要用 NAT；虚拟机内把默认路由/跃点指向 `192.168.100.1`；宿主执行 `proxy-switch.sh status` 确认 `VMNET_IFACE=vmnet1`、`VMNET_SUBNET=192.168.100.0/24` |
 | 开机后分流不自动生效 | dispatcher 脚本未安装或不可执行 | `ls -l /etc/NetworkManager/dispatcher.d/99-wifi-proxy.sh` 确认存在且可执行；重跑 `sudo ./install.sh` |
+| 代理开着，但国内站点/国内 CDN 打不开，`docker logs hy2-gateway` 里大量 `connection download closed: remote error: rejected` | `sniff_override_destination` 被打开时，目标地址被改写成域名，按 IP 匹配的 `geoip-cn` 规则永远不命中，中国 IP 被整体塞进隧道，而多数节点拒绝 CN 落地 | 确认 `/data/singbox.json` 中 `sniff_override_destination` 为 `false`（本仓库默认）；DNS 污染交给 `{"protocol":"dns","action":"hijack-dns"}` 的拆分解析，不要用覆盖目标地址的方式解决 |
+| Windows 提示"无 Internet"但浏览器能打开部分站点 | 联网探测域名 `www.msftconnecttest.com` 被节点拒绝，Windows 据此把链路标记为无 Internet | 本仓库默认把 `.msftconnecttest.com` / `.msftncsi.com` 直连；若改了 route 规则需保留这两条；VM 内可运行 `netsh winhttp reset proxy` 后重试 |
+| 白名单 SSID 命中后仍开代理（`journalctl -t HY2_DISPATCH` 显示 `SSID 为空, fail-secure`） | 系统 locale 为 `zh_CN` 时 `nmcli` 把 active 列输出成"是/否"，脚本按 `^yes:` 匹配会取到空 SSID | 已修复：`99-wifi-proxy.sh` 的 `current_ssid()` 强制 `LC_ALL=C`；升级后重跑 `sudo ./install.sh` 覆盖 `/etc/NetworkManager/dispatcher.d/99-wifi-proxy.sh` |
 
 ## 7. 卸载
 
