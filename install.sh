@@ -11,7 +11,11 @@
 #   4. 安装 ruleset-update.sh -> /usr/local/bin/ruleset-update.sh                (755)
 #   5. 安装 systemd 单元 hy2-ruleset-update.{service,timer} 并启用
 #      (每周一 04:30 ±10 分钟自动更新 geosite/geoip CN + ipset hy2_cn)
-#   6. 安装尾声 best-effort 首跑一次 ruleset-update.sh (离线失败只 WARN)
+#   6. 安装 VMnet1 DHCP 网关服务 (hy2-vmnet1-dhcp.sh + service)
+#      VMware Host-Only 的 DHCP 默认不下发 option routers, 虚拟机会"有 IP 没网关";
+#      本服务重写 dhcpd.conf 后自带网关 192.168.100.1 与 DNS。
+#      非 VMware 宿主由 unit 的 ConditionPathExists 自动跳过。
+#   7. 安装尾声 best-effort 首跑一次 ruleset-update.sh (离线失败只 WARN)
 #
 # 幂等: 可重复执行; 已存在的状态文件不会被覆盖。
 # ============================================================================
@@ -24,9 +28,12 @@ SRC_DISPATCHER="$SCRIPT_DIR/scripts/99-wifi-proxy.sh"
 SRC_RULESET_UPDATE="$SCRIPT_DIR/scripts/ruleset-update.sh"
 SRC_RULESET_SERVICE="$SCRIPT_DIR/scripts/systemd/hy2-ruleset-update.service"
 SRC_RULESET_TIMER="$SCRIPT_DIR/scripts/systemd/hy2-ruleset-update.timer"
+SRC_VMNET_DHCP="$SCRIPT_DIR/scripts/hy2-vmnet1-dhcp.sh"
+SRC_VMNET_DHCP_SERVICE="$SCRIPT_DIR/scripts/systemd/hy2-vmnet1-dhcp.service"
 
 DST_PROXY_SWITCH=/usr/local/bin/proxy-switch.sh
 DST_RULESET_UPDATE=/usr/local/bin/ruleset-update.sh
+DST_VMNET_DHCP=/usr/local/bin/hy2-vmnet1-dhcp.sh
 DISPATCHER_DIR=/etc/NetworkManager/dispatcher.d
 DST_DISPATCHER="$DISPATCHER_DIR/99-wifi-proxy.sh"
 
@@ -41,7 +48,8 @@ fi
 
 # --- 源文件检查 ---
 for f in "$SRC_PROXY_SWITCH" "$SRC_DISPATCHER" "$SRC_RULESET_UPDATE" \
-         "$SRC_RULESET_SERVICE" "$SRC_RULESET_TIMER"; do
+         "$SRC_RULESET_SERVICE" "$SRC_RULESET_TIMER" \
+         "$SRC_VMNET_DHCP" "$SRC_VMNET_DHCP_SERVICE"; do
     if [[ ! -f "$f" ]]; then
         echo "错误: 缺少源文件 $f" >&2
         exit 1
@@ -86,6 +94,24 @@ if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
     fi
 else
     echo "警告: 非 systemd 环境, 已跳过定时器安装; 可用 cron 每周调用 $DST_RULESET_UPDATE" >&2
+fi
+
+# --- 安装 VMnet1 DHCP 网关服务 (Host-Only 下发默认网关/DNS) ---
+install -m 755 -o root -g root "$SRC_VMNET_DHCP" "$DST_VMNET_DHCP"
+echo "[OK] 已安装: $DST_VMNET_DHCP"
+if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    install -m 644 -o root -g root "$SRC_VMNET_DHCP_SERVICE" /etc/systemd/system/hy2-vmnet1-dhcp.service
+    systemctl daemon-reload 2>/dev/null || true
+    if ! command -v vmnet-dhcpd >/dev/null 2>&1; then
+        echo "[跳过] 未检测到 vmnet-dhcpd (非 VMware 宿主), 已安装单元但不启用"
+    elif systemctl enable --now hy2-vmnet1-dhcp.service 2>/dev/null; then
+        systemctl restart hy2-vmnet1-dhcp.service 2>/dev/null || true
+        echo "[OK] 已安装并启用: hy2-vmnet1-dhcp.service (vmnet1 网关 192.168.100.1)"
+    else
+        echo "警告: hy2-vmnet1-dhcp.service 启用失败, 请检查 /etc/vmware/networking 中 VNET_1_DHCP" >&2
+    fi
+else
+    echo "警告: 非 systemd 环境, 已跳过 hy2-vmnet1-dhcp.service" >&2
 fi
 
 # --- 默认状态文件 (不存在才生成) ---
@@ -151,6 +177,7 @@ cat <<EOF
         proxy-switch.sh on  && proxy-switch.sh status
         proxy-switch.sh off && proxy-switch.sh status
         systemctl list-timers hy2-ruleset-update.timer
+        systemctl status hy2-vmnet1-dhcp.service   # VMware 环境下 vmnet1 网关/DNS 下发
  提示: dispatcher 钩子即时生效, 断开/重连一次 Wi-Fi 即可触发切换。
 ============================================================
 EOF

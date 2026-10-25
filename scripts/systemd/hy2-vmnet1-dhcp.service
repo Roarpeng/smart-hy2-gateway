@@ -1,0 +1,17 @@
+[Unit]
+Description=Hy2 Gateway VMnet1 DHCP (gateway 192.168.100.1 + DNS)
+# 非 VMware 宿主上直接跳过 (无 vmnet-dhcpd 二进制), 不产生 failed 状态
+ConditionPathExists=/usr/bin/vmnet-dhcpd
+After=vmware.service
+Wants=vmware.service
+
+[Service]
+Type=forking
+PIDFile=/var/run/vmnet-dhcpd-vmnet1.pid
+ExecStartPre=/usr/local/bin/hy2-vmnet1-dhcp.sh
+ExecStart=/usr/bin/vmnet-dhcpd -s 6 -cf /etc/vmware/vmnet1/dhcpd/dhcpd.conf -lf /etc/vmware/vmnet1/dhcpd/dhcpd.leases -pf /var/run/vmnet-dhcpd-vmnet1.pid vmnet1
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
