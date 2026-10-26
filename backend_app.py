@@ -385,6 +385,20 @@ def build_singbox_config(state: StateModel) -> dict:
         raise ValueError("未配置可用节点")
     hy2_outbound = build_hy2_outbound(node)
 
+    import ipaddress as _ipaddress
+
+    # DNS 规则: 国内域名走国内 DNS; 劫持进来的国外域名必须走隧道 DoH。
+    # 注意不要用 "outbound: any" 做节点自解析 —— 它会连带捕获 hijack 进来的
+    # 客户端查询, 把国外域名也交给 223.5.5.5 (其递归缓存对被墙域名是污染的,
+    # gemini/chatgpt 因此解析到假 IP)。节点自解析只在"节点是域名"时按域名窄化:
+    # 走直连国内 DNS, 避免鸡生蛋 (经节点隧道解析节点自身)。
+    dns_rules: list[dict] = [{"rule_set": ["geosite-cn"], "server": "cn-dns"}]
+    node_host = str(node.server or "").strip()
+    try:
+        _ipaddress.ip_address(node_host)   # 字面量 IP: 无需自解析规则
+    except ValueError:
+        dns_rules.append({"domain": [node_host], "server": "cn-dns"})
+
     return {
         "log": {"level": "info", "timestamp": True},
         # DNS 拆分: 国内域名用国内 DNS (CDN 调度友好), 其余经隧道解析 (防污染)
@@ -394,10 +408,7 @@ def build_singbox_config(state: StateModel) -> dict:
                 # 国外域名经隧道 DoH 解析: 不少节点不放行 UDP 53, TCP 443 必通且更防污染
                 {"tag": "proxy-dns", "address": "https://1.1.1.1/dns-query", "detour": node.tag},
             ],
-            "rules": [
-                {"rule_set": ["geosite-cn"], "server": "cn-dns"},
-                {"outbound": "any", "server": "cn-dns"},   # sing-box 自身解析(节点域名/直连出站)走直连
-            ],
+            "rules": dns_rules,
             "final": "proxy-dns",
         },
         "inbounds": [
@@ -414,16 +425,28 @@ def build_singbox_config(state: StateModel) -> dict:
                 "sniff_override_destination": False,
             }
         ],
-        "outbounds": [hy2_outbound, {"type": "direct", "tag": "direct"}],
+        "outbounds": [hy2_outbound, {"type": "direct", "tag": "direct"},
+                      # dns-out 出站: 把 protocol=dns 的包移交上方拆分 DNS 模块应答。
+                      # 必须用本 legacy 形态 —— 1.11 的 action:"hijack-dns" 在 legacy
+                      # DNS schema 下不生效, DNS 包会被地理规则当普通流量分流:
+                      # 发往国内 DNS(如 223.5.5.5)直连取污染缓存, 发往国外 DNS 走隧道,
+                      # 表现为"不同上游拿到不同答案"且被污染域名永远解析到假 IP
+                      {"type": "dns", "tag": "dns-out"}],
         # 地理分流 (v2rayN 式"绕过大陆"): 中国域名/IP 直连, 其余走 Hysteria 2 隧道;
         # 规则集为镜像内置本地文件, 运行时零下载依赖
         "route": {
             "auto_detect_interface": True,
             "rules": [
-                # 客户端 DNS (UDP/TCP 53) 一律由本配置的拆分 DNS 应答:
-                # 国内域名 -> 223.5.5.5 直连; 国外域名 -> 隧道内 DoH (防污染)。
-                # 客户端只拿到干净 IP, 后续 TCP 按真实 IP 做 geoip 判定。
-                {"protocol": "dns", "action": "hijack-dns"},
+                # DNS 劫持双保险 —— 端口级强制 + 协议嗅探兜底:
+                # 1) port:53 规则不依赖载荷嗅探, 直接命中, 杜绝 UDP DNS
+                #    "嗅探竞态漏网后被 geoip 规则当普通流量转发"的污染路径
+                #    (实测表现为: 查询已被劫持记录, 但 gemini 等域名仍解析到
+                #    轮换假 IP, 且 POSTROUTING 计数器抓到明文 53 端口包出主机)
+                # 2) protocol:dns 兜底非 53 端口的 DNS 形态
+                # 两者都移交 dns-out → 拆分 DNS 应答: 国内域名走 223.5.5.5,
+                # 国外域名走隧道内 DoH (防污染), 客户端只拿干净 IP
+                {"port": 53, "outbound": "dns-out"},
+                {"protocol": "dns", "outbound": "dns-out"},
                 # Windows 联网探测走直连, 否则节点拒绝该域名时 Windows 会
                 # 把整条链路标记为"无 Internet", 浏览器表现为完全没网
                 {"domain_suffix": [".msftconnecttest.com", ".msftncsi.com"],
