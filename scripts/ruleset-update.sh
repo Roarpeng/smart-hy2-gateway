@@ -194,6 +194,9 @@ rebuild_ipset
 # ---------------------------------------------------------------------------
 ensure_cn_rule() {
     # ensure_cn_rule <链> <插入位次>
+    # 位次与 proxy-switch.sh 构建序一致: HY2_PRE=4 (RJ45,DNS:53 之后),
+    # HY2_OUT=5 (UID,RJ45,DNS:53 之后) —— 必须后于 DNS 劫持(否则国内 DNS
+    # 查询被内核放行绕过劫持)、先于 catch-all
     local chain="$1" pos="$2"
     if iptables -t mangle -C "$chain" -m set --match-set "$CHNROUTE_SET" dst -j RETURN 2>/dev/null; then
         return 0  # 已在位
@@ -206,8 +209,8 @@ ensure_cn_rule() {
 }
 
 if iptables -t mangle -L HY2_PRE >/dev/null 2>&1; then
-    ensure_cn_rule HY2_PRE 2
-    ensure_cn_rule HY2_OUT 3
+    ensure_cn_rule HY2_PRE 4
+    ensure_cn_rule HY2_OUT 5
 else
     log "代理当前 off (无 HY2_PRE 链), 跳过 iptables match-set 规则 (on 时由 proxy-switch.sh 插入)"
 fi

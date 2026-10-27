@@ -10,13 +10,13 @@
 #      / net.core.default_qdisc fq (fq 对 QUIC pacing 友好, Hysteria 2 出站)
 #   2. 幂等清理旧规则 (链引用 -> 链 -> ip rule -> 路由表)
 #   3. 策略路由: fwmark -> table -> local 路由回环, 截获交给 sing-box
-#   4. mangle HY2_PRE / HY2_OUT: 目的地为保留网段的流量 RETURN 绕行
-#   5. HY2_OUT 首条规则 owner 匹配放行 sing-box (UID 930), 防出站回环
-#   6. RJ45 有线网卡进出流量显式 RETURN —— 通道A "恒直连" 的规则级硬保证
-#   7. 内核层中国 IP 直连: 目的地命中 hy2_cn ipset 的流量在 mangle 层
-#      RETURN, 不进 sing-box 用户态 (省一跳; 集合缺失则回落 sing-box 判定)
-#   8. PREROUTING TPROXY (转发流量/虚拟机) + OUTPUT MARK (本机流量)
-#   9. 确保 FORWARD 放行 VMnet 源/回程 (mangle RETURN 绕行的保留网段
+#   4. mangle HY2_PRE: RJ45 直连(1) -> DNS:53 劫持(2,3) -> 中国IP集(4)
+#      -> 保留网段 RETURN 绕行 -> catch-all TPROXY
+#   5. HY2_OUT 同构: UID 防回环(1) -> RJ45(2) -> DNS:53 打标(3,4)
+#      -> 中国IP集(5) -> 保留网段 -> catch-all MARK
+#      (DNS 必须先于保留网段: 网络推私网 DNS 时按保留段放行会漏出污染)
+#   6. PREROUTING 挂 HY2_PRE (转发流量/虚拟机) + OUTPUT 挂 HY2_OUT (本机)
+#   7. 确保 FORWARD 放行 VMnet 源/回程 (mangle RETURN 绕行的保留网段
 #      流量仍要过 FORWARD 链, Docker 宿主默认策略 DROP 会将其丢弃)
 #
 # off:
@@ -189,52 +189,66 @@ do_on() {
     ipt -t mangle -N HY2_PRE
     ipt -t mangle -N HY2_OUT
 
-    # 目的地为保留网段 -> RETURN 绕行 (HY2_OUT 同样需要: 本机访问
-    # 局域网/VMnet 的流量也不应被劫持进隧道)
+    # 5. HY2_PRE (PREROUTING, 虚拟机/转发流量) —— 固定顺序:
+    #    RJ45(1) -> DNS(2,3) -> 中国IP集(4) -> 保留网段 -> catch-all TPROXY
+    # 5.1 通道A 有线硬直连
+    ipt -t mangle -A HY2_PRE -i "$RJ45_DEV" -j RETURN
+
+    # 5.2 DNS 端口劫持 (必须先于保留网段 RETURN):
+    #     网络环境可能把 DHCP DNS 推成路由器/私网地址 (实测 10.x), 按保留
+    #     网段放行的话明文查询根本到不了 sing-box, 直漏上游被污染
+    #     (换网即复发: gemini 解析到轮换假 IP)。53 端口一律进 TProxy,
+    #     由 sing-box 端口级规则移交拆分 DNS 干净应答
+    ipt -t mangle -A HY2_PRE -p udp --dport 53 -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
+    ipt -t mangle -A HY2_PRE -p tcp --dport 53 -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
+
+    # 5.3 内核层中国 IP 直连: 目的地命中 $CHNROUTE_SET 的流量在 mangle 层
+    #     直接 RETURN, 省去"进 sing-box 用户态再按 geoip-cn 判回直连"一跳;
+    #     必须排在 DNS 劫持之后 —— 否则发往国内 DNS 的查询会被内核放行,
+    #     再次绕过劫持。集合缺失仅告警回落 sing-box 判定, 不中断。
+    #     位置固定第 4 条 (ruleset-update.sh 与后端 ensure 逻辑同位插入);
+    #     元素由后端启动/每周 ruleset-update 重建, swap 原子换表即时生效;
+    #     本脚本只做只读匹配, 绝不 create/destroy/flush 该集合。
+    if command -v ipset >/dev/null 2>&1 && ipset list "$CHNROUTE_SET" >/dev/null 2>&1; then
+        ipt -t mangle -A HY2_PRE -m set --match-set "$CHNROUTE_SET" dst -j RETURN
+        CN_SET_OK=1
+    else
+        log "WARN: ipset $CHNROUTE_SET 不存在, 中国 IP 直连回落 sing-box 判定 (后端启动时会自动重建)"
+    fi
+
+    # 5.4 目的地为保留网段 -> RETURN 绕行 (本机/VMnet 访问局域网不进隧道)
     local net
     for net in "${RESERVED_NETS[@]}"; do
         ipt -t mangle -A HY2_PRE -d "$net" -j RETURN
-        ipt -t mangle -A HY2_OUT -d "$net" -j RETURN
     done
 
-    # 5. 回环防护 (必须保持为 HY2_OUT 首条规则):
-    #    sing-box 容器以 UID 930 运行, 它自身访问 Hysteria2 服务器的出站
-    #    连接若再被 OUTPUT 链 MARK 劫持, 会形成
-    #    "sing-box 出站 -> 本机 TProxy -> sing-box -> 出站 ..." 的死循环。
-    #    用 owner 匹配放行 UID 930 的流量, 从源头打断回环。
-    #    (-I ... 1 显式插到首条, 不依赖此前的追加顺序)
-    ipt -t mangle -I HY2_OUT 1 -m owner --uid-owner "$SINGBOX_UID" -j RETURN
-
-    # 6. RJ45 有线通道硬直连: 凡从该网卡进/出的流量一律 RETURN,
-    #    无论代理开关状态都不进隧道 (通道A "恒直连" 的规则级保证)
-    ipt -t mangle -I HY2_PRE 1 -i "$RJ45_DEV" -j RETURN
-    ipt -t mangle -I HY2_OUT 2 -o "$RJ45_DEV" -j RETURN
-
-    # 7. 内核层中国 IP 直连: 目的地命中 $CHNROUTE_SET 的流量在 mangle 层
-    #    直接 RETURN, 省去"进 sing-box 用户态再按 geoip-cn 判回直连"的一跳;
-    #    集合缺失时仅告警回落 sing-box 判定, 不中断。
-    #    插入位置固定: HY2_PRE 第 2 条 / HY2_OUT 第 3 条 —— 均位于
-    #    TPROXY/MARK catch-all 之前, 且 HY2_OUT 的 UID 回环防护(1)/
-    #    RJ45(2) 保持在前 (RETURN 规则之间先后顺序不影响语义, 相对
-    #    catch-all 的位置才是关键)。
-    #    集合元素由 /usr/local/bin/ruleset-update.sh 每周维护; 其通过
-    #    swap 原子换表, 更新即时生效, 无需重载本脚本规则;
-    #    本脚本只做只读匹配, 绝不 create/destroy/flush 该集合。
-    if command -v ipset >/dev/null 2>&1 && ipset list "$CHNROUTE_SET" >/dev/null 2>&1; then
-        ipt -t mangle -I HY2_PRE 2 -m set --match-set "$CHNROUTE_SET" dst -j RETURN
-        ipt -t mangle -I HY2_OUT 3 -m set --match-set "$CHNROUTE_SET" dst -j RETURN
-    else
-        log "WARN: ipset $CHNROUTE_SET 不存在, 中国 IP 直连回落 sing-box 判定 (先运行 ruleset-update.sh)"
-    fi
-
-    # 8. PREROUTING (VMnet 虚拟机经宿主转发的流量) -> TPROXY 交给 sing-box
+    # 5.5 catch-all: 其余全部交给 sing-box
     ipt -t mangle -A HY2_PRE -p tcp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
     ipt -t mangle -A HY2_PRE -p udp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
     ipt -t mangle -A PREROUTING -j HY2_PRE
 
-    # OUTPUT (宿主机本机出站流量) -> 打标记, 由策略路由送回本机 TProxy
+    # 6. HY2_OUT (OUTPUT, 本机流量) —— 固定顺序:
+    #    UID 防回环(1) -> RJ45(2) -> DNS(3,4) -> 中国IP集(5) -> 保留网段 -> catch-all MARK
+    ipt -t mangle -A HY2_OUT -o "$RJ45_DEV" -j RETURN
+    # 6.1 DNS 先于保留网段打标 (理由同 5.2: 私网 DNS 也要进拆分 DNS)
+    ipt -t mangle -A HY2_OUT -p udp --dport 53 -j MARK --set-mark "$FWMARK"
+    ipt -t mangle -A HY2_OUT -p tcp --dport 53 -j MARK --set-mark "$FWMARK"
+    # 6.2 内核层中国 IP 直连 (位置固定第 5 条, 与 ensure 逻辑一致)
+    if [[ "${CN_SET_OK:-0}" -eq 1 ]]; then
+        ipt -t mangle -A HY2_OUT -m set --match-set "$CHNROUTE_SET" dst -j RETURN
+    fi
+    # 6.3 保留网段绕行
+    for net in "${RESERVED_NETS[@]}"; do
+        ipt -t mangle -A HY2_OUT -d "$net" -j RETURN
+    done
+    # 6.4 catch-all 打标, 由策略路由送回本机 TProxy
     ipt -t mangle -A HY2_OUT -p tcp -j MARK --set-mark "$FWMARK"
     ipt -t mangle -A HY2_OUT -p udp -j MARK --set-mark "$FWMARK"
+
+    # 6.5 回环防护 (必须保持为 HY2_OUT 首条规则):
+    #     sing-box 以 UID 930 运行, 其自身出站 (含 cn-dns 上游查询) 若再被
+    #     OUTPUT 劫持会形成 "sing-box -> TProxy -> sing-box -> ..." 死循环
+    ipt -t mangle -I HY2_OUT 1 -m owner --uid-owner "$SINGBOX_UID" -j RETURN
     ipt -t mangle -A OUTPUT -j HY2_OUT
 
     # 9. FORWARD 放行 (见 ensure_forward_rules 注释: RETURN 绕行流量所需)
@@ -336,6 +350,14 @@ do_status() {
     else
         echo "[无] table $TABLE local 路由 (0.0.0.0/0 dev lo)"
     fi
+    echo
+    echo "--- DNS 劫持 (53 端口先行, 私网 DNS 同样接管) ---"
+    report "HY2_PRE UDP:53 TPROXY" \
+        iptables -t mangle -C HY2_PRE -p udp --dport 53 -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
+    report "HY2_PRE TCP:53 TPROXY" \
+        iptables -t mangle -C HY2_PRE -p tcp --dport 53 -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
+    report "HY2_OUT UDP:53 MARK" iptables -t mangle -C HY2_OUT -p udp --dport 53 -j MARK --set-mark "$FWMARK"
+    report "HY2_OUT TCP:53 MARK" iptables -t mangle -C HY2_OUT -p tcp --dport 53 -j MARK --set-mark "$FWMARK"
     echo
     echo "--- 中国 IP 直连 (内核层 $CHNROUTE_SET) ---"
     if command -v ipset >/dev/null 2>&1 && ipset list "$CHNROUTE_SET" >/dev/null 2>&1; then

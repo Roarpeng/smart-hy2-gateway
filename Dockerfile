@@ -24,8 +24,9 @@ ARG SINGBOX_VERSION
 LABEL org.opencontainers.image.title="hy2-gateway" \
       org.opencontainers.image.description="Smart Hysteria 2 TProxy Gateway (sing-box ${SINGBOX_VERSION} + FastAPI WebUI)"
 
-# iptables/iproute2: TProxy 规则与策略路由; jq: 配置自检; libcap: setcap
-RUN apk add --no-cache iptables iproute2 bash curl jq ca-certificates libcap
+# iptables/iproute2: TProxy 规则与策略路由; jq: 配置自检; libcap: setcap;
+# ipset: 内核层中国 IP 直连集 (容器 privileged 直写宿主内核, 宿主机无需安装)
+RUN apk add --no-cache iptables iproute2 bash curl jq ca-certificates libcap ipset
 
 # sing-box 专用运行账户 UID/GID=930 (999 已被 alpine 自带 ping 组占用):
 # iptables -m owner --uid-owner 930 可据此放行 sing-box 自身出站, 防回环劫持

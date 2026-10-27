@@ -821,6 +821,98 @@ def proxy_switch_env() -> dict:
     return env
 
 
+# ---------------- 内核层中国 IP 直连集 (ipset hy2_cn) ----------------
+def sync_chnroute_ipset() -> bool:
+    """从镜像内置 geoip-cn.srs 重建内核层中国 IP 直连集 (best-effort)。
+
+    容器为 privileged + host 网络, ipset/netlink 操作直接作用于宿主内核,
+    因此无需宿主机安装任何组件。失败 (缺 ipset 二进制/无权限/规则集缺失)
+    仅告警, 分流回落 sing-box geoip 判定, 不影响主流程。
+    数据源与 sing-box 路由判定是同一份 .srs 文件, 两层分流永不漂移。
+    """
+    set_name = "hy2_cn"
+    if shutil.which("ipset") is None:
+        log.info("chnroute: 容器内无 ipset, 内核层中国 IP 直连未启用 (sing-box 判定兜底)")
+        return False
+
+    def ipset(*args: str, stdin: Optional[str] = None) -> bool:
+        try:
+            r = subprocess.run(["ipset", *args], input=stdin, capture_output=True,
+                               text=True, timeout=90)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    try:
+        # sing-box decompile 把结果写入 -o 指定的文件而非 stdout (默认写到
+        # srs 同目录的 .json, 会污染只读的规则集目录, 故显式指到 /tmp)
+        out_path = "/tmp/geoip-cn.decompiled.json"
+        r = subprocess.run(
+            [SINGBOX_BIN, "rule-set", "decompile", f"{RULE_SET_DIR}/geoip-cn.srs",
+             "-o", out_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0 or not os.path.exists(out_path):
+            log.warning("chnroute: geoip-cn.srs decompile 失败: %s", (r.stderr or "")[:120])
+            return False
+
+        import ipaddress
+
+        cidrs: list[str] = []
+        decompiled = json.loads(Path(out_path).read_text(encoding="utf-8"))
+        Path(out_path).unlink(missing_ok=True)
+        for rule in decompiled.get("rules", []):
+            for cidr in rule.get("ip_cidr") or []:
+                try:
+                    if ipaddress.ip_network(str(cidr), strict=False).version == 4:
+                        cidrs.append(str(cidr))
+                except ValueError:
+                    continue
+        if not cidrs:
+            log.warning("chnroute: decompile 结果无 IPv4 CIDR, 保留现有集合")
+            return False
+
+        # 临时集填充 -> swap 原子换表: 内核中已有 iptables 规则即时命中新数据
+        new_set = f"{set_name}_new"
+        if not ipset("create", new_set, "hash:net", "family", "inet", "maxelem", "65536", "-exist"):
+            log.warning("chnroute: ipset create 失败 (权限?)")
+            return False
+        ipset("flush", new_set)
+        payload = "".join(f"add {new_set} {c} -exist\n" for c in cidrs)
+        if not ipset("restore", "-exist", stdin=payload):
+            log.warning("chnroute: ipset restore 失败, 保留现有集合")
+            ipset("destroy", new_set)
+            return False
+        ok = (ipset("create", set_name, "hash:net", "family", "inet", "maxelem", "65536", "-exist")
+              and ipset("swap", new_set, set_name))
+        ipset("destroy", new_set)
+        if not ok:
+            log.warning("chnroute: ipset swap 失败, 保留现有集合")
+            return False
+        log.info("chnroute: ipset %s 已重建 (%d 条 IPv4 CIDR)", set_name, len(cidrs))
+
+        # 代理在开时确保 mangle 匹配规则在位 (位次与 proxy-switch.sh 构建序一致:
+        # HY2_PRE=4 / HY2_OUT=5, 后于 DNS 劫持、先于 catch-all)
+        if is_proxy_active():
+            for chain, pos in (("HY2_PRE", "4"), ("HY2_OUT", "5")):
+                chk = subprocess.run(
+                    ["iptables", "-t", "mangle", "-C", chain,
+                     "-m", "set", "--match-set", set_name, "dst", "-j", "RETURN"],
+                    capture_output=True, timeout=5,
+                )
+                if chk.returncode != 0:
+                    subprocess.run(
+                        ["iptables", "-t", "mangle", "-I", chain, pos,
+                         "-m", "set", "--match-set", set_name, "dst", "-j", "RETURN"],
+                        capture_output=True, timeout=5,
+                    )
+            log.info("chnroute: mangle 匹配规则已确保在位")
+        return True
+    except Exception as exc:
+        log.warning("chnroute: 同步异常(%s), sing-box 判定兜底", exc)
+        return False
+
+
 def reapply_proxy_rules() -> str:
     """网络参数变更后按落盘期望态重建 iptables 规则。
 
@@ -881,6 +973,8 @@ def apply_state(state: StateModel):
         raise HTTPException(status_code=422, detail=f"状态参数非法: {exc}")
     message = commit_state(normalized, restart=True)
     network_message = reapply_proxy_rules()
+    # 每周规则更新走 /api/apply 回传, 顺带刷新内核直连集 (数据源同源)
+    chnroute_ok = sync_chnroute_ipset()
     has_active = _resolve_active_node(normalized) is not None
     return {
         "status": "success",
@@ -1691,6 +1785,9 @@ def main() -> None:
             log.warning("startup: restore failed (%s), waiting for /api/apply", exc)
     else:
         log.info("startup: no state file, waiting for /api/apply")
+
+    # 内核层中国 IP 直连集: 容器特权直写宿主内核, 无需宿主机安装任何组件
+    sync_chnroute_ipset()
 
     # 优雅退出: uvicorn 接管信号前兜底; 接管后由 atexit 收尾
     def _handle_signal(signum, _frame):
