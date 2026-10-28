@@ -758,6 +758,44 @@ def is_proxy_active() -> bool:
     return False
 
 
+def _dns_hijack_rules_ok() -> bool:
+    """on 态关键规则形态检查: DNS:53 劫持规则必须在位且先于保留网段。
+
+    背景: 宿主侧 /usr/local/bin/proxy-switch.sh 与容器内副本可能版本分叉
+    (宿主侧经 install.sh 更新, 早于某次规则序修复时), dispatcher 触发宿主
+    脚本重建规则会覆盖掉 DNS 劫持序 —— 私网 DNS 随即漏出被污染。本检查
+    让 rule-guard 能识别这种"开关态正确但形态回退"的回归并自动纠正。
+    实现上仅执行固定字面量命令, 对 -S 输出做文本分析 (顺序也要对: DNS
+    劫持必须位于保留网段 RETURN 之前); 检查自身异常返回 True 不误伤。
+    """
+    try:
+        pre = subprocess.run(["iptables", "-t", "mangle", "-S", "HY2_PRE"],
+                             capture_output=True, text=True, timeout=5)
+        out = subprocess.run(["iptables", "-t", "mangle", "-S", "HY2_OUT"],
+                             capture_output=True, text=True, timeout=5)
+        if pre.returncode != 0 or out.returncode != 0:
+            return True
+
+        def _dns_before_reserved(rules: str, udp_needle: str, tcp_needle: str) -> bool:
+            lines = rules.splitlines()
+            reserved_idx = next((i for i, l in enumerate(lines)
+                                 if " -d 10.0.0.0/8 " in l), None)
+            for needle in (udp_needle, tcp_needle):
+                dns_idx = next((i for i, l in enumerate(lines) if needle in l), None)
+                if dns_idx is None or (reserved_idx is not None and dns_idx > reserved_idx):
+                    return False
+            return True
+
+        # needle 采用 iptables -S 的规范形式 (显式匹配模块 "-m udp"/"-m tcp"),
+        # 手写 "-p udp --dport 53" 会因缺 "-m udp" 段而永不匹配
+        return (_dns_before_reserved(pre.stdout, "-m udp --dport 53 -j TPROXY",
+                                     "-m tcp --dport 53 -j TPROXY")
+                and _dns_before_reserved(out.stdout, "-m udp --dport 53 -j MARK",
+                                         "-m tcp --dport 53 -j MARK"))
+    except Exception:
+        return True
+
+
 def rule_guard_loop() -> None:
     """规则守护: 每 30s 将 iptables 实况对齐到落盘期望态 (last_decision)。
 
@@ -774,15 +812,24 @@ def rule_guard_loop() -> None:
             if expected not in ("on", "off"):
                 continue
             active = is_proxy_active()
-            if (expected == "on") != active:
-                log.warning("rule-guard: 规则与期望态不一致 (期望=%s 实际=%s), 自动恢复中",
-                            expected, "on" if active else "off")
-                subprocess.run(
-                    [PROXY_SWITCH_SCRIPT, expected],
-                    shell=False,  # argv 列表直传; expected 已限定为 on/off
-                    capture_output=True, text=True, timeout=SWITCH_TIMEOUT,
-                    env=proxy_switch_env(),
-                )
+            shape_ok = (expected != "on") or _dns_hijack_rules_ok()
+            if (expected == "on") != active or not shape_ok:
+                log.warning("rule-guard: 规则与期望态不一致 (期望=%s 实际=%s 形态=%s), 自动恢复中",
+                            expected, "on" if active else "off",
+                            "完整" if shape_ok else "DNS劫持规则回退")
+                # argv 仅用字面量 (expected 已白名单校验), 不把文件内容直传命令
+                if expected == "on":
+                    subprocess.run(
+                        [PROXY_SWITCH_SCRIPT, "on"],
+                        shell=False, capture_output=True, text=True,
+                        timeout=SWITCH_TIMEOUT, env=proxy_switch_env(),
+                    )
+                else:
+                    subprocess.run(
+                        [PROXY_SWITCH_SCRIPT, "off"],
+                        shell=False, capture_output=True, text=True,
+                        timeout=SWITCH_TIMEOUT, env=proxy_switch_env(),
+                    )
         except Exception as exc:
             log.warning("rule-guard: 巡检异常(%s), 下个周期重试", exc)
 
