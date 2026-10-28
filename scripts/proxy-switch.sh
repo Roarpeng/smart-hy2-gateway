@@ -144,10 +144,12 @@ cleanup_tproxy() {
 }
 
 # ---------------------------------------------------------------------------
-# 确保 VMnet 源/回程转发放行 (on/off 两态都调用):
+# 确保 VMnet 转发直连通路 (on/off 两态都调用):
 #   - off 态: Host-Only 虚拟机直连上网的必经路径
-#   - on 态 : mangle RETURN 绕行的保留网段流量 (VM -> 局域网等) 仍要过
-#             FORWARD 链, Docker 宿主默认策略 DROP 会将其丢弃
+#   - on 态 : mangle RETURN 绕行的流量仍要走 FORWARD 转发 —— 除保留网段外,
+#             内核层中国 IP 直连 (hy2_cn) 启用后, VM 的国内公网流量也走
+#             这条路径, 而 RETURN 出来的包源地址仍是 192.168.100.x 私网,
+#             没有 SNAT 会被上游路由器直接丢弃 (表现为 VM 国内流量黑洞)
 # ---------------------------------------------------------------------------
 ensure_forward_rules() {
     if ! iptables -C FORWARD -s "$VMNET_SUBNET" -j ACCEPT 2>/dev/null; then
@@ -158,6 +160,14 @@ ensure_forward_rules() {
     if ! iptables -C FORWARD -d "$VMNET_SUBNET" -o "$VMNET_IFACE" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; then
         run_warn "添加 FORWARD ACCEPT 回程 (-d $VMNET_SUBNET -o $VMNET_IFACE)" \
             iptables -A FORWARD -d "$VMNET_SUBNET" -o "$VMNET_IFACE" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    fi
+    # SNAT: 所有被 mangle RETURN 放行、经 FORWARD 转发出 $WIFI_DEV 的 VM
+    # 流量 (保留网段 + 中国 IP 内核直连) 都需要伪装成宿主地址才能回包;
+    # 代理 on 时同样必须 —— sing-box 处理的流量自带源地址, 与此规则无关,
+    # 但内核直连绕行的流量只有这一条 NAT 出路
+    if ! iptables -t nat -C POSTROUTING -s "$VMNET_SUBNET" -o "$WIFI_DEV" -j MASQUERADE 2>/dev/null; then
+        run_warn "添加 MASQUERADE ($VMNET_SUBNET -> $WIFI_DEV)" \
+            iptables -t nat -A POSTROUTING -s "$VMNET_SUBNET" -o "$WIFI_DEV" -j MASQUERADE
     fi
 }
 
@@ -271,14 +281,9 @@ do_off() {
     cleanup_tproxy
 
     # 2. 保留/确保直连通路: Host-Only 虚拟机上网依赖宿主转发 + 伪装,
-    #    无论代理开关状态, 这条通路必须始终存在
+    #    无论代理开关状态, 这条通路必须始终存在 (MASQUERADE 现统一由
+    #    ensure_forward_rules 保证, on 态同样需要 —— 见其注释)
     sysctl_best_effort net.ipv4.ip_forward 1
-
-    # VMnet -> Wi-Fi 伪装 (幂等: 先 -C 检查, 不存在才 -A)
-    if ! iptables -t nat -C POSTROUTING -s "$VMNET_SUBNET" -o "$WIFI_DEV" -j MASQUERADE 2>/dev/null; then
-        run_warn "添加 MASQUERADE ($VMNET_SUBNET -> $WIFI_DEV)" \
-            iptables -t nat -A POSTROUTING -s "$VMNET_SUBNET" -o "$WIFI_DEV" -j MASQUERADE
-    fi
 
     # 放行 VMnet 源/回程转发 (幂等, 与 on 态共用同一助手)
     ensure_forward_rules

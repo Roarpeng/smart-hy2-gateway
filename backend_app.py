@@ -759,21 +759,25 @@ def is_proxy_active() -> bool:
 
 
 def _dns_hijack_rules_ok() -> bool:
-    """on 态关键规则形态检查: DNS:53 劫持规则必须在位且先于保留网段。
+    """on 态关键规则形态检查: DNS:53 劫持序 + VMnet 直连 NAT 都必须在位。
 
     背景: 宿主侧 /usr/local/bin/proxy-switch.sh 与容器内副本可能版本分叉
-    (宿主侧经 install.sh 更新, 早于某次规则序修复时), dispatcher 触发宿主
-    脚本重建规则会覆盖掉 DNS 劫持序 —— 私网 DNS 随即漏出被污染。本检查
-    让 rule-guard 能识别这种"开关态正确但形态回退"的回归并自动纠正。
-    实现上仅执行固定字面量命令, 对 -S 输出做文本分析 (顺序也要对: DNS
-    劫持必须位于保留网段 RETURN 之前); 检查自身异常返回 True 不误伤。
+    (宿主侧经 install.sh 更新, 早于某次修复时), dispatcher 触发宿主脚本
+    重建规则会覆盖掉容器新版铺好的形态 —— DNS 劫持序回退会让私网 DNS
+    漏出被污染; MASQUERADE 缺失则让内核直连放行的 VM 流量带着私网源地址
+    出网卡被上游丢弃 (VM 国内流量黑洞)。本检查让 rule-guard 识别这类
+    "开关态正确但形态回退"的回归并自动纠正。
+    实现上仅执行固定字面量命令, 对 -S 输出做文本分析; 子网/网卡取值只
+    用于字符串匹配不进 argv; 检查自身异常返回 True 不误伤。
     """
     try:
         pre = subprocess.run(["iptables", "-t", "mangle", "-S", "HY2_PRE"],
                              capture_output=True, text=True, timeout=5)
         out = subprocess.run(["iptables", "-t", "mangle", "-S", "HY2_OUT"],
                              capture_output=True, text=True, timeout=5)
-        if pre.returncode != 0 or out.returncode != 0:
+        nat = subprocess.run(["iptables", "-t", "nat", "-S", "POSTROUTING"],
+                             capture_output=True, text=True, timeout=5)
+        if pre.returncode != 0 or out.returncode != 0 or nat.returncode != 0:
             return True
 
         def _dns_before_reserved(rules: str, udp_needle: str, tcp_needle: str) -> bool:
@@ -788,10 +792,27 @@ def _dns_hijack_rules_ok() -> bool:
 
         # needle 采用 iptables -S 的规范形式 (显式匹配模块 "-m udp"/"-m tcp"),
         # 手写 "-p udp --dport 53" 会因缺 "-m udp" 段而永不匹配
-        return (_dns_before_reserved(pre.stdout, "-m udp --dport 53 -j TPROXY",
-                                     "-m tcp --dport 53 -j TPROXY")
-                and _dns_before_reserved(out.stdout, "-m udp --dport 53 -j MARK",
-                                         "-m tcp --dport 53 -j MARK"))
+        dns_ok = (_dns_before_reserved(pre.stdout, "-m udp --dport 53 -j TPROXY",
+                                       "-m tcp --dport 53 -j TPROXY")
+                  and _dns_before_reserved(out.stdout, "-m udp --dport 53 -j MARK",
+                                           "-m tcp --dport 53 -j MARK"))
+        if not dns_ok:
+            return False
+
+        # VMnet 直连 NAT: 被 mangle RETURN 放行、经 FORWARD 转发的 VM 流量
+        # (保留网段 + 中国 IP 内核直连) 必须有 MASQUERADE 才能回包。
+        # 排除 docker 自带的 172.17/16 规则: 只认 -s 为状态文件 vmnet_subnet
+        try:
+            state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            vmnet_subnet = str(state.get("vmnet_subnet") or "192.168.100.0/24")
+            wifi_iface = str(state.get("wifi_iface") or "wlo1")
+        except Exception:
+            vmnet_subnet, wifi_iface = "192.168.100.0/24", "wlo1"
+        masq_ok = any(
+            ("-j MASQUERADE" in l) and (f"-s {vmnet_subnet} " in l) and (f"-o {wifi_iface} " in l)
+            for l in nat.stdout.splitlines()
+        )
+        return masq_ok
     except Exception:
         return True
 
@@ -816,7 +837,7 @@ def rule_guard_loop() -> None:
             if (expected == "on") != active or not shape_ok:
                 log.warning("rule-guard: 规则与期望态不一致 (期望=%s 实际=%s 形态=%s), 自动恢复中",
                             expected, "on" if active else "off",
-                            "完整" if shape_ok else "DNS劫持规则回退")
+                            "完整" if shape_ok else "关键规则回退")
                 # argv 仅用字面量 (expected 已白名单校验), 不把文件内容直传命令
                 if expected == "on":
                     subprocess.run(
