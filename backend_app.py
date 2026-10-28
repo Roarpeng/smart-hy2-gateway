@@ -335,11 +335,13 @@ def _public_node(node: dict) -> dict:
         out["latency_ms"] = cached.get("latency_ms")
         out["latency_ok"] = cached.get("ok")
         out["latency_error"] = cached.get("error", "")
+        out["rtt_ms"] = cached.get("rtt_ms")
         out["tested_at"] = cached.get("tested_at", 0)
     else:
         out["latency_ms"] = None
         out["latency_ok"] = None
         out["latency_error"] = ""
+        out["rtt_ms"] = None
         out["tested_at"] = 0
     return out
 
@@ -387,7 +389,7 @@ def build_singbox_config(state: StateModel) -> dict:
 
     import ipaddress as _ipaddress
 
-    # DNS 规则: 国内域名走国内 DNS; 劫持进来的国外域名必须走隧道 DoH。
+    # DNS 规则: 国内域名走国内 DNS; 劫持进来的国外域名必须走隧道内 DNS。
     # 注意不要用 "outbound: any" 做节点自解析 —— 它会连带捕获 hijack 进来的
     # 客户端查询, 把国外域名也交给 223.5.5.5 (其递归缓存对被墙域名是污染的,
     # gemini/chatgpt 因此解析到假 IP)。节点自解析只在"节点是域名"时按域名窄化:
@@ -405,7 +407,9 @@ def build_singbox_config(state: StateModel) -> dict:
         "dns": {
             "servers": [
                 {"tag": "cn-dns", "address": "udp://223.5.5.5", "detour": "direct"},
-                # 国外域名经隧道 DoH 解析: 不少节点不放行 UDP 53, TCP 443 必通且更防污染
+                # 国外域名经隧道 DoH 解析: 本链路实测 UDP 53 会出现 5-10s
+                # 超时 (丢包后重传不可控), 而 DoH 走 TCP 443 有重传保障,
+                # 冷启动约 0.5-0.8s, 命中缓存后约 1 RTT; TCP 443 也几乎不被节点封。
                 {"tag": "proxy-dns", "address": "https://1.1.1.1/dns-query", "detour": node.tag},
             ],
             "rules": dns_rules,
@@ -444,7 +448,7 @@ def build_singbox_config(state: StateModel) -> dict:
                 #    轮换假 IP, 且 POSTROUTING 计数器抓到明文 53 端口包出主机)
                 # 2) protocol:dns 兜底非 53 端口的 DNS 形态
                 # 两者都移交 dns-out → 拆分 DNS 应答: 国内域名走 223.5.5.5,
-                # 国外域名走隧道内 DoH (防污染), 客户端只拿干净 IP
+                # 国外域名走隧道内 DNS (防污染), 客户端只拿干净 IP
                 {"port": 53, "outbound": "dns-out"},
                 {"protocol": "dns", "outbound": "dns-out"},
                 # Windows 联网探测走直连, 否则节点拒绝该域名时 Windows 会
@@ -1234,6 +1238,80 @@ def _hop_start_port(node: Hy2NodeModel) -> int:
     return node.port
 
 
+# TCP RTT 兜底探针: 以 sing-box UID 运行, 绕过 OUTPUT 链的 TProxy 劫持
+# (否则 connect 只握到本地 sing-box, 测出来是 0ms)。连接成功或收到 RST
+# 都代表 1 个 RTT 已返回; 超时则视为不可测。
+_TCP_RTT_PROBE = r"""
+import socket, sys, time
+ip, port = sys.argv[1], int(sys.argv[2])
+best = -1.0
+for _ in range(2):
+    s = socket.socket()
+    s.settimeout(1.5)
+    t = time.monotonic()
+    ok = False
+    try:
+        s.connect((ip, port))
+        ok = True
+    except ConnectionRefusedError:
+        ok = True
+    except Exception:
+        ok = False
+    finally:
+        dt = (time.monotonic() - t) * 1000
+        s.close()
+    if ok and (best < 0 or dt < best):
+        best = dt
+print(int(best))
+"""
+
+
+def _node_rtt(node: Hy2NodeModel) -> Optional[int]:
+    """节点单程 RTT (1 个往返), 与 v2rayN「测试延迟」口径一致。
+
+    优先 ICMP (ICMP 不进 TProxy: 宿主规则只处理 TCP/UDP, 因此是真实链路 RTT);
+    ICMP 被封时回落到 TCP 握手 (以 UID 930 直连, 绕开 TProxy)。
+    只应在节点已确认可达后调用, 避免不可达节点额外等待。
+    """
+    host = str(node.server or "").strip()
+    if not host:
+        return None
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET)
+        ip = infos[0][4][0]
+    except Exception:
+        return None
+
+    # 1) ICMP: 3 个包取 avg, 0.2s 间隔, 单包 1s 超时
+    try:
+        proc = subprocess.run(
+            ["ping", "-c", "3", "-i", "0.2", "-W", "1", ip],
+            capture_output=True, text=True, timeout=5,
+        )
+        out = proc.stdout or ""
+        # busybox: "round-trip min/avg/max = 272.2/281.0/290.1 ms"
+        # iputils: "rtt min/avg/max/mdev = 272.2/281.0/290.1/5.0 ms"
+        match = re.search(r"(?:round-trip|rtt)\s+min/avg/max(?:/mdev)?\s*=\s*[\d.]+/([\d.]+)/", out)
+        if match:
+            return max(1, int(round(float(match.group(1)))))
+    except Exception:
+        pass
+
+    # 2) TCP 兜底
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _TCP_RTT_PROBE, ip, str(_hop_start_port(node))],
+            capture_output=True, text=True, timeout=6,
+            user=SINGBOX_UID, group=SINGBOX_GID,
+        )
+        value = int((proc.stdout or "").strip() or -1)
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return None
+
+
 def _udp_probe(ip: str, port: int, timeout: float = 2.0) -> str:
     """UDP 静默探测: QUIC 服务对垃圾包应静默丢弃; ICMP 拒绝则说明端口未开放。"""
     family = socket.AF_INET6 if ":" in ip else socket.AF_INET
@@ -1306,8 +1384,25 @@ def test_node_latency(node: Hy2NodeModel) -> dict:
         secret = secrets.token_urlsafe(18)
         tag = sanitize_tag(node.tag)  # 避免与 direct 等内置标签冲突
         test_node = node.model_copy(update={"tag": tag})
+        # 节点自身是域名时走直连 DNS 自解析 (避免经节点隧道解析自身的鸡生蛋);
+        # 其余查询 (若测试目标改成域名) 一律经节点解析, 避免系统 DNS 污染。
+        node_host = str(test_node.server or "").strip()
+        dns_rules: list[dict] = []
+        try:
+            import ipaddress as _ipaddress
+            _ipaddress.ip_address(node_host)
+        except ValueError:
+            dns_rules.append({"domain": [node_host], "server": "direct-dns"})
         config = {
             "log": {"level": "error"},
+            "dns": {
+                "servers": [
+                    {"tag": "direct-dns", "address": "udp://223.5.5.5", "detour": "direct"},
+                    {"tag": "proxy-dns", "address": "https://1.1.1.1/dns-query", "detour": tag},
+                ],
+                "rules": dns_rules,
+                "final": "proxy-dns",
+            },
             "experimental": {
                 "clash_api": {
                     "external_controller": f"127.0.0.1:{clash_port}",
@@ -1364,11 +1459,13 @@ def test_node_latency(node: Hy2NodeModel) -> dict:
                 if tail:
                     reason += f"；stderr: {tail}"
             reason += "；" + _node_diagnosis(node)
-            return {"ok": False, "latency_ms": None, "error": _scrub_secrets(reason, node)}
+            return {"ok": False, "latency_ms": None, "rtt_ms": None, "error": _scrub_secrets(reason, node)}
 
-        # 真实握手: 让 sing-box 通过节点的 hysteria2 出站访问 gstatic 204
+        # 真实握手: 让 sing-box 通过节点的 hysteria2 出站访问 Cloudflare 1.1.1.1。
+        # 用 IP 字面量而非域名: 避免系统 DNS 把测试目标解析到污染/国内 CDN IP,
+        # 再被强制走国外节点形成 CN→US→CN 的假高延迟 (实测可到 1.5s+)。
         params = urllib.parse.urlencode({
-            "url": "https://www.gstatic.com/generate_204",
+            "url": "https://1.1.1.1/cdn-cgi/trace",
             "timeout": "5000",
         })
         delay_path = f"/proxies/{urllib.parse.quote(tag, safe='')}/delay?{params}"
@@ -1380,7 +1477,7 @@ def test_node_latency(node: Hy2NodeModel) -> dict:
             if tail:
                 reason += f"；sing-box: {tail}"
             reason += "；" + _node_diagnosis(node)
-            return {"ok": False, "latency_ms": None, "error": _scrub_secrets(reason, node)}
+            return {"ok": False, "latency_ms": None, "rtt_ms": None, "error": _scrub_secrets(reason, node)}
 
         if status != 200:
             detail = ""
@@ -1396,18 +1493,21 @@ def test_node_latency(node: Hy2NodeModel) -> dict:
             if tail:
                 reason += f"；sing-box: {tail}"
             reason += "；" + _node_diagnosis(node)
-            return {"ok": False, "latency_ms": None, "error": _scrub_secrets(reason, node)}
+            return {"ok": False, "latency_ms": None, "rtt_ms": None, "error": _scrub_secrets(reason, node)}
 
         try:
             payload = json.loads(body.decode("utf-8", errors="replace"))
             delay = int(payload.get("delay") or 0)
         except Exception as exc:
             reason = f"Clash API 响应解析失败: {str(exc)[:80]}"
-            return {"ok": False, "latency_ms": None, "error": _scrub_secrets(reason, node)}
+            return {"ok": False, "latency_ms": None, "rtt_ms": None, "error": _scrub_secrets(reason, node)}
         if delay <= 0:
             reason = "节点握手失败: 延迟为 0；" + _node_diagnosis(node)
-            return {"ok": False, "latency_ms": None, "error": _scrub_secrets(reason, node)}
-        return {"ok": True, "latency_ms": delay, "error": ""}
+            return {"ok": False, "latency_ms": None, "rtt_ms": None, "error": _scrub_secrets(reason, node)}
+        # 单程 RTT: 与 v2rayN「测试延迟」同口径 (1 个往返), 用于解释
+        # 完整 HTTPS 延迟 (≥3 RTT) 与 ping 数值之间的倍数关系。
+        rtt = _node_rtt(node)
+        return {"ok": True, "latency_ms": delay, "rtt_ms": rtt, "error": ""}
     except Exception as exc:
         reason = f"延迟测试异常: {str(exc)[:160]}"
         return {"ok": False, "latency_ms": None, "error": _scrub_secrets(reason, node)}
@@ -1459,12 +1559,12 @@ def test_nodes(body: Optional[NodeTestModel] = None):
             except Exception as exc:
                 nid = str(node["id"])
                 results[nid] = {
-                    "id": nid, "ok": False, "latency_ms": None,
+                    "id": nid, "ok": False, "latency_ms": None, "rtt_ms": None,
                     "error": f"节点参数非法: {str(exc)[:200]}",
                 }
                 with _latency_lock:
                     _latency_cache[nid] = {
-                        "latency_ms": None, "ok": False,
+                        "latency_ms": None, "rtt_ms": None, "ok": False,
                         "error": results[nid]["error"], "tested_at": int(time.time()),
                     }
         with ThreadPoolExecutor(max_workers=3) as pool:
@@ -1482,11 +1582,13 @@ def test_nodes(body: Optional[NodeTestModel] = None):
                     "id": nid,
                     "ok": bool(outcome.get("ok")),
                     "latency_ms": outcome.get("latency_ms"),
+                    "rtt_ms": outcome.get("rtt_ms"),
                     "error": str(outcome.get("error") or ""),
                 }
                 with _latency_lock:
                     _latency_cache[nid] = {
                         "latency_ms": outcome.get("latency_ms"),
+                        "rtt_ms": outcome.get("rtt_ms"),
                         "ok": bool(outcome.get("ok")),
                         "error": str(outcome.get("error") or ""),
                         "tested_at": int(time.time()),
@@ -1497,7 +1599,7 @@ def test_nodes(body: Optional[NodeTestModel] = None):
         if nid in results:
             ordered_results.append(results[nid])
         else:
-            ordered_results.append({"id": nid, "ok": False, "latency_ms": None, "error": "节点不存在"})
+            ordered_results.append({"id": nid, "ok": False, "latency_ms": None, "rtt_ms": None, "error": "节点不存在"})
     return {"status": "success", "results": ordered_results}
 
 

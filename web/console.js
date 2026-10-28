@@ -662,6 +662,7 @@ function normalizeNode(n, index) {
     source: raw.source || '',
     created_at: raw.created_at || 0,
     latency_ms: (typeof raw.latency_ms === 'number') ? raw.latency_ms : null,
+    rtt_ms: (typeof raw.rtt_ms === 'number') ? raw.rtt_ms : null,
     latency_ok: (raw.latency_ok === true || raw.latency_ok === false) ? raw.latency_ok : null,
     latency_error: raw.latency_error || '',
     tested_at: raw.tested_at || 0,
@@ -678,11 +679,11 @@ function syncLatencyFromNodes() {
     if (p && p.status === 'testing') {
       next[n.id] = p;
     } else if (n.latency_ok === true) {
-      next[n.id] = { status: 'ok', latency_ms: n.latency_ms, error: '' };
+      next[n.id] = { status: 'ok', latency_ms: n.latency_ms, rtt_ms: n.rtt_ms, error: '' };
     } else if (n.latency_ok === false) {
-      next[n.id] = { status: 'fail', latency_ms: n.latency_ms, error: n.latency_error || '' };
+      next[n.id] = { status: 'fail', latency_ms: n.latency_ms, rtt_ms: null, error: n.latency_error || '' };
     } else {
-      next[n.id] = { status: 'idle', latency_ms: null, error: '' };
+      next[n.id] = { status: 'idle', latency_ms: null, rtt_ms: null, error: '' };
     }
   });
   appState.nodeLatency = next;
@@ -740,6 +741,7 @@ function setDemoNodes() {
     down_mbps: c.downMbps ?? null,
     port_hopping: c.portHopping || '',
     latency_ms: null,
+    rtt_ms: null,
     latency_ok: null,
     latency_error: '',
     __demo: true
@@ -802,6 +804,10 @@ function makeNodeButton(label, className, handler, disabled) {
   return btn;
 }
 
+function latencyClass(ms, okMax, warnMax) {
+  return ms < okMax ? 'node-lat-ok' : (ms < warnMax ? 'node-lat-warn' : 'node-lat-bad');
+}
+
 function buildNodeLatency(n) {
   const state = appState.nodeLatency[n.id] || { status: 'idle' };
   const el = document.createElement('div');
@@ -811,10 +817,21 @@ function buildNodeLatency(n) {
     el.classList.add('node-lat-testing');
   } else if (state.status === 'ok') {
     const ms = state.latency_ms;
+    const rtt = state.rtt_ms;
     if (typeof ms === 'number') {
-      el.textContent = `${Math.round(ms)} ms`;
-      el.title = `延迟 ${Math.round(ms)} ms`;
-      el.classList.add(ms < 200 ? 'node-lat-ok' : (ms < 500 ? 'node-lat-warn' : 'node-lat-bad'));
+      const httpEl = document.createElement('div');
+      httpEl.className = 'node-lat-http ' + latencyClass(ms, 700, 1400);
+      httpEl.textContent = `${Math.round(ms)} ms`;
+      el.appendChild(httpEl);
+      const titleParts = [`HTTP 延迟 ${Math.round(ms)} ms（完整请求，约 3×RTT）`];
+      if (typeof rtt === 'number') {
+        const rttEl = document.createElement('div');
+        rttEl.className = 'node-lat-rtt ' + latencyClass(rtt, 200, 500);
+        rttEl.textContent = `RTT ${Math.round(rtt)} ms`;
+        el.appendChild(rttEl);
+        titleParts.push(`单程 RTT ${Math.round(rtt)} ms（与 v2rayN 测试延迟同口径）`);
+      }
+      el.title = titleParts.join(' · ');
     } else {
       el.textContent = '成功';
       el.classList.add('node-lat-ok');
@@ -1019,15 +1036,23 @@ function updateRouteStage() {
       cls = 'is-warn';
     } else if (latState.status === 'ok') {
       const ms = typeof latState.latency_ms === 'number' ? latState.latency_ms : null;
+      const rtt = typeof latState.rtt_ms === 'number' ? latState.rtt_ms : null;
       text = ms !== null ? `${Math.round(ms)} ms` : '成功';
-      cls = ms === null ? 'is-ok' : (ms < 200 ? 'is-ok' : (ms < 500 ? 'is-warn' : 'is-bad'));
+      if (rtt !== null) text += ` · RTT ${Math.round(rtt)} ms`;
+      // 颜色以单程 RTT 为准 (与 v2rayN 同口径); 没有 RTT 时退回 HTTP 延迟
+      const basis = rtt !== null ? rtt : ms;
+      cls = basis === null ? 'is-ok' : (basis < 200 ? 'is-ok' : (basis < 500 ? 'is-warn' : 'is-bad'));
     } else {
       text = '失败';
       cls = 'is-bad';
     }
     latEl.textContent = text;
     latEl.className = cls;
-    latEl.title = latState && latState.error ? latState.error : '';
+    latEl.title = latState && latState.error
+      ? latState.error
+      : (latState && latState.status === 'ok'
+        ? 'HTTP 延迟为完整请求（约 3×RTT）；RTT 为单程握手延迟（与 v2rayN 口径一致）'
+        : '');
   }
 
   const stateEl = document.getElementById('route-state');
@@ -1119,12 +1144,14 @@ function applyTestResults(results) {
       appState.nodeLatency[r.id] = {
         status: 'ok',
         latency_ms: (typeof r.latency_ms === 'number') ? r.latency_ms : null,
+        rtt_ms: (typeof r.rtt_ms === 'number') ? r.rtt_ms : null,
         error: ''
       };
     } else {
       appState.nodeLatency[r.id] = {
         status: 'fail',
         latency_ms: null,
+        rtt_ms: null,
         error: r.error || '测试失败'
       };
     }
@@ -1137,7 +1164,7 @@ async function testNode(id) {
     return;
   }
   if (!id) return;
-  appState.nodeLatency[id] = { status: 'testing', latency_ms: null, error: '' };
+  appState.nodeLatency[id] = { status: 'testing', latency_ms: null, rtt_ms: null, error: '' };
   renderNodeList();
   try {
     const results = await requestNodeTest([id]);
@@ -1146,7 +1173,7 @@ async function testNode(id) {
   } catch (err) {
     if (!DEMO_MODE) {
       await fetchNodes();
-      appState.nodeLatency[id] = { status: 'fail', latency_ms: null, error: err.message || '测试失败' };
+      appState.nodeLatency[id] = { status: 'fail', latency_ms: null, rtt_ms: null, error: err.message || '测试失败' };
       showToast(`测试失败: ${err.message || '后端不可达'}`, 'warning');
     }
   } finally {
@@ -1165,7 +1192,7 @@ async function testAllNodes(btn) {
   }
   if (btn) btn.disabled = true;
   appState.nodes.forEach(n => {
-    appState.nodeLatency[n.id] = { status: 'testing', latency_ms: null, error: '' };
+    appState.nodeLatency[n.id] = { status: 'testing', latency_ms: null, rtt_ms: null, error: '' };
   });
   renderNodeList();
   try {
@@ -1179,7 +1206,7 @@ async function testAllNodes(btn) {
     if (!DEMO_MODE) {
       await fetchNodes();
       appState.nodes.forEach(n => {
-        appState.nodeLatency[n.id] = { status: 'fail', latency_ms: null, error: err.message || '测试失败' };
+        appState.nodeLatency[n.id] = { status: 'fail', latency_ms: null, rtt_ms: null, error: err.message || '测试失败' };
       });
       showToast(`全部测试失败: ${err.message || '后端不可达'}`, 'warning');
     }
