@@ -394,7 +394,17 @@ def build_singbox_config(state: StateModel) -> dict:
     # 客户端查询, 把国外域名也交给 223.5.5.5 (其递归缓存对被墙域名是污染的,
     # gemini/chatgpt 因此解析到假 IP)。节点自解析只在"节点是域名"时按域名窄化:
     # 走直连国内 DNS, 避免鸡生蛋 (经节点隧道解析节点自身)。
-    dns_rules: list[dict] = [{"rule_set": ["geosite-cn"], "server": "cn-dns"}]
+    # Google 域族优先于 geosite-cn 判定: geosite-cn 按后缀/用途收录了部分
+    # google 域名 (adservice/clientservices/googlevideo 等), 但其 A 记录指向
+    # 被墙的全球 IP —— 送国内 DNS 会拿到污染缓存 (AliDNS 对 Google 域名
+    # 的递归结果长期被注入), 送直连路由则必超时。路由与 DNS 两层都必须
+    # 先于 geosite-cn 规则命中。
+    _google_keywords = ["google", "gstatic"]
+
+    dns_rules: list[dict] = [
+        {"domain_keyword": _google_keywords, "server": "proxy-dns"},
+        {"rule_set": ["geosite-cn"], "server": "cn-dns"},
+    ]
     node_host = str(node.server or "").strip()
     try:
         _ipaddress.ip_address(node_host)   # 字面量 IP: 无需自解析规则
@@ -455,6 +465,10 @@ def build_singbox_config(state: StateModel) -> dict:
                 # 把整条链路标记为"无 Internet", 浏览器表现为完全没网
                 {"domain_suffix": [".msftconnecttest.com", ".msftncsi.com"],
                  "outbound": "direct"},
+                # Google 域族走隧道 (先于 geosite-cn, 理由见 dns_rules 处注释):
+                # 被 geosite-cn 收录的 google 域名若按"中国域名直连"处理,
+                # 目标是全球被墙 IP, 必超时 —— VM Chrome 后台服务反复失败实测根因
+                {"domain_keyword": _google_keywords, "outbound": node.tag},
                 {"rule_set": ["geosite-cn"], "outbound": "direct"},
                 {"rule_set": ["geoip-cn"], "outbound": "direct"},
             ],
