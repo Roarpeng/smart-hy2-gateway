@@ -1,0 +1,15 @@
+[Unit]
+Description=Ensure VMware vmnet device nodes exist before any VM starts
+Documentation=file:/usr/local/bin/vmnet-ensure.sh
+After=vmware.service
+Wants=vmware.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vmnet-ensure.sh
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MAC 认证 Wi-Fi 下虚拟机断网 · 定位与处置</title>
+<style>
+  :root{
+    --ink:#14181d; --ink-2:#3d4652; --ink-3:#6b7684;
+    --line:#dfe4ea; --line-2:#eef1f5;
+    --bg:#ffffff; --bg-2:#f7f8fa; --bg-3:#f1f4f7;
+    --accent:#0f766e; --accent-2:#e6f4f2;
+    --warn:#b45309; --warn-bg:#fdf6e9;
+    --bad:#b91c1c; --bad-bg:#fdeeee;
+    --ok:#15803d; --ok-bg:#eef7f0;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; padding:40px 28px 72px;
+    background:var(--bg); color:var(--ink);
+    font-family:"Inter","Helvetica Neue",-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+    font-size:15px; line-height:1.72; -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:900px;margin:0 auto}
+  header{border-bottom:2px solid var(--ink);padding-bottom:18px;margin-bottom:32px}
+  .kicker{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);font-weight:600;margin-bottom:10px}
+  h1{font-size:27px;line-height:1.3;margin:0 0 10px;font-weight:650;letter-spacing:-.01em}
+  .sub{color:var(--ink-3);font-size:13.5px;margin:0}
+  h2{font-size:18px;margin:44px 0 14px;font-weight:650;letter-spacing:-.005em;padding-left:11px;border-left:3px solid var(--accent)}
+  h3{font-size:15px;margin:26px 0 8px;font-weight:650;color:var(--ink-2)}
+  p{margin:10px 0}
+  code{font-family:"SF Mono",Menlo,Consolas,monospace;font-size:12.5px;background:var(--bg-3);padding:1.5px 5px;border-radius:3px;color:#0b3d3a}
+  pre{margin:12px 0;padding:14px 16px;background:#11161c;color:#e6edf3;border-radius:6px;overflow-x:auto;font-size:12.5px;line-height:1.62}
+  pre code{background:none;color:inherit;padding:0}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px}
+  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:var(--bg-2);font-weight:600;font-size:12.5px;color:var(--ink-2);white-space:nowrap}
+  td code{font-size:12px}
+  .verdict{border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:5px;background:var(--bg-2);padding:18px 20px;margin:20px 0}
+  .verdict p{margin:7px 0}
+  .verdict strong{color:var(--accent)}
+  .badge{display:inline-block;font-size:11px;font-weight:650;letter-spacing:.04em;padding:2px 7px;border-radius:3px;vertical-align:1px}
+  .b-fact{background:var(--ok-bg);color:var(--ok)}
+  .b-guess{background:var(--warn-bg);color:var(--warn)}
+  .b-bad{background:var(--bad-bg);color:var(--bad)}
+  .step{border:1px solid var(--line);border-radius:6px;padding:0 20px 18px;margin:16px 0;background:var(--bg)}
+  .step-h{display:flex;align-items:baseline;gap:10px;margin:0 -20px 4px;padding:13px 20px;background:var(--bg-2);border-bottom:1px solid var(--line);border-radius:6px 6px 0 0}
+  .step-n{font-variant-numeric:tabular-nums;font-weight:700;color:var(--accent);font-size:13px}
+  .step-t{font-weight:650;font-size:14.5px}
+  .meta{font-size:12.5px;color:var(--ink-3);margin-top:12px}
+  .meta b{color:var(--ink-2);font-weight:600}
+  ul{margin:10px 0;padding-left:22px}
+  li{margin:6px 0}
+  .note{border-left:3px solid var(--warn);background:var(--warn-bg);padding:12px 16px;margin:16px 0;font-size:13.5px;border-radius:0 4px 4px 0}
+  .note.danger{border-left-color:var(--bad);background:var(--bad-bg)}
+  .note b{font-weight:650}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:16px 0}
+  .card{border:1px solid var(--line);border-radius:6px;padding:14px 16px;background:var(--bg-2)}
+  .card h4{margin:0 0 6px;font-size:13.5px;font-weight:650}
+  .card p{margin:4px 0;font-size:13px;color:var(--ink-2)}
+  footer{margin-top:56px;padding-top:16px;border-top:1px solid var(--line);font-size:12px;color:var(--ink-3)}
+  @media print{
+    body{padding:0;font-size:11pt}
+    pre{background:#f4f4f4;color:#000;border:1px solid #ccc}
+    h2{page-break-after:avoid}
+    .step,.note,.verdict{page-break-inside:avoid}
+  }
+  @media (max-width:640px){
+    body{padding:24px 16px 48px}
+    .grid2{grid-template-columns:1fr}
+    h1{font-size:22px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="kicker">故障定位 · Smart Hy2 Gateway</div>
+  <h1>MAC 认证 Wi-Fi 下：宿主正常、虚拟机断网</h1>
+  <p class="sub">现场实测于 2026-11-01 · 宿主 Ubuntu / Wi-Fi wlo1 / SSID "room 116" / 策略 whitelist → 判定 on</p>
+</header>
+
+<div class="verdict">
+  <p style="margin-bottom:14px"><strong>结案（13:20 已修复）：</strong>根因是 <code>/dev/vmnet1</code> 设备节点缺失——虚拟机 14:58 开机，节点 15:02 才出现。vmx 开机打开设备失败后，把「以太网 2」标记为永久断开且不再重试。与 MAC 认证<strong>无关</strong>。</p>
+  <p><strong>证据链（vmware.log 原文）：</strong></p>
+  <pre style="margin:8px 0 14px"><code>VNET: MACVNetPortOpenDevice: Ethernet1: can't open vmnet device (No such file or directory)
+[msg.vnet.connectvnet] Could not connect 'Ethernet1' to virtual network 'vmnet1'
+[msg.device.startdisconnected] Virtual device 'Ethernet1' will start disconnected.</code></pre>
+  <p><strong>结论一：</strong>MAC 认证<strong>不会</strong>直接封掉 Host-Only 虚拟机。虚拟机的流量经 VMnet1 交给宿主，出 Wi-Fi 时源 MAC 是 <code>wlo1</code> 的 MAC、源 IP 是 <code>10.20.90.45</code>，认证态被完整继承。</p>
+  <p><strong>结论二：</strong>故障<strong>不是</strong>"代理没接住"，而是"虚拟机的包根本没上来"。<code>vmnet1</code> 收包计数为 <code>0</code>，对 <code>192.168.100.128</code> 的 ARP 一直是 FAILED。</p>
+  <p><strong>结论三：</strong>MAC 认证只通过两条间接路径致断：① 虚拟机网卡被桥到 Wi-Fi，自带 MAC 未认证被 AC 丢弃；② 认证网关的"反共享"按 TTL=63 / 多流特征掐掉宿主转发的直连流量。本次两者<strong>均不成立</strong>——<code>vmnet0</code> 桥接目标锁在 <code>enp55s0</code> 有线口。</p>
+</div>
+
+<h2>0 · 生效修复（已执行）</h2>
+
+<table>
+  <thead><tr><th>尝试</th><th>结果</th><th>原因</th></tr></thead>
+  <tbody>
+    <tr><td>虚拟机内 Windows「网络适配器 → 禁用/启用」</td><td><span class="badge b-bad">无效</span></td><td>只重置来宾系统侧驱动，动不了 vmx 链路层</td></tr>
+    <tr><td><code>vmrun suspend</code> + <code>start</code></td><td><span class="badge b-bad">无效</span></td><td>恢复时沿用保存前「设备断开」状态，不重新 open</td></tr>
+    <tr><td><code>vmrun stop soft</code> + <code>start gui</code></td><td><span class="badge b-fact">生效</span></td><td>重新上电，vmx 重新 open <code>/dev/vmnet1</code></td></tr>
+  </tbody>
+</table>
+
+<p><b>判别命令</b>（唯一可靠的判断依据，比看界面快）：</p>
+<pre><code>ls -l /proc/$(pgrep -f bin/vmware-vmx | head -1)/fd | grep vmnet
+# 只有 vmnet0 → 代理网卡未接入
+# vmnet0 + vmnet1 → 已接入</code></pre>
+
+<p><b>防复发：</b>已安装 <code>vmnet-guard.service</code>（开机等 <code>vmware.service</code> 就绪，缺失则按主设备号 119 补建 <code>/dev/vmnet0/1/8</code>）。源文件在仓库 <code>scripts/vmnet-ensure.sh</code> 与 <code>scripts/systemd/vmnet-guard.service</code>。</p>
+
+<h2>1 · 原理：一条路径，四个断点</h2>
+
+<p>虚拟机要上网，包必须穿过四个环节。任一处断，表现都是"虚拟机上不了网"，但处置完全不同——所以先定位，再动手。</p>
+
+<svg viewBox="0 0 860 400" width="100%" role="img" aria-label="虚拟机出网路径与四个断点">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3d4652"/>
+    </marker>
+  </defs>
+
+  <!-- 虚拟机 -->
+  <rect x="16" y="30" width="150" height="86" rx="6" fill="#f7f8fa" stroke="#dfe4ea"/>
+  <text x="91" y="54" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="600" fill="#14181d">虚拟机 (Win)</text>
+  <text x="91" y="74" text-anchor="middle" font-family="monospace" font-size="11" fill="#6b7684">eth1 192.168.100.128</text>
+  <text x="91" y="92" text-anchor="middle" font-family="monospace" font-size="11" fill="#6b7684">gw 192.168.100.1</text>
+
+  <!-- 断点1 -->
+  <line x1="166" y1="73" x2="230" y2="73" stroke="#3d4652" stroke-width="1.4" marker-end="url(#ar)"/>
+  <circle cx="198" cy="73" r="10" fill="#b91c1c"/>
+  <text x="198" y="77" text-anchor="middle" font-family="sans-serif" font-size="10.5" font-weight="700" fill="#fff">1</text>
+  <text x="198" y="55" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#b91c1c">二层</text>
+
+  <!-- 宿主 -->
+  <rect x="230" y="24" width="210" height="98" rx="6" fill="#ffffff" stroke="#0f766e" stroke-width="1.4"/>
+  <text x="335" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="600" fill="#0f766e">Ubuntu 宿主</text>
+  <text x="335" y="66" text-anchor="middle" font-family="monospace" font-size="11" fill="#3d4652">vmnet1 192.168.100.1</text>
+  <text x="335" y="84" text-anchor="middle" font-family="monospace" font-size="11" fill="#3d4652">PREROUTING / FORWARD</text>
+  <text x="335" y="102" text-anchor="middle" font-family="monospace" font-size="11" fill="#3d4652">TPROXY :12345 | MASQ</text>
+
+  <!-- 断点4 -->
+  <circle cx="335" cy="140" r="10" fill="#b91c1c"/>
+  <text x="335" y="144" text-anchor="middle" font-family="sans-serif" font-size="10.5" font-weight="700" fill="#fff">4</text>
+  <text x="335" y="168" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#b91c1c">TProxy / 转发</text>
+
+  <!-- 断点2 -->
+  <line x1="440" y1="73" x2="560" y2="73" stroke="#3d4652" stroke-width="1.4" marker-end="url(#ar)"/>
+  <circle cx="500" cy="40" r="10" fill="#b91c1c"/>
+  <text x="500" y="44" text-anchor="middle" font-family="sans-serif" font-size="10.5" font-weight="700" fill="#fff">2</text>
+  <text x="500" y="28" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#b91c1c">路由</text>
+
+  <!-- Wi-Fi -->
+  <rect x="560" y="40" width="130" height="66" rx="6" fill="#e6f4f2" stroke="#0f766e"/>
+  <text x="625" y="66" text-anchor="middle" font-family="monospace" font-size="11.5" font-weight="600" fill="#0b3d3a">wlo1 10.20.90.45</text>
+  <text x="625" y="86" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#0b3d3a">已认证 MAC</text>
+
+  <!-- 断点3 -->
+  <line x1="690" y1="73" x2="762" y2="73" stroke="#3d4652" stroke-width="1.4" marker-end="url(#ar)"/>
+  <circle cx="726" cy="40" r="10" fill="#b91c1c"/>
+  <text x="726" y="44" text-anchor="middle" font-family="sans-serif" font-size="10.5" font-weight="700" fill="#fff">3</text>
+  <text x="726" y="28" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#b91c1c">反共享</text>
+
+  <rect x="762" y="40" width="82" height="66" rx="6" fill="#f7f8fa" stroke="#dfe4ea"/>
+  <text x="803" y="70" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#14181d">AP / AC</text>
+  <text x="803" y="88" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b7684">互联网</text>
+
+  <!-- 旁路：错误桥接 -->
+  <path d="M120 116 C120 190, 300 200, 560 130" fill="none" stroke="#b91c1c" stroke-width="1.3" stroke-dasharray="5 4"/>
+  <text x="352" y="205" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#b91c1c">错误路径：VMnet0 桥到 wlo1 → 虚拟机自带 MAC 未认证 → 直接被 AC 丢弃</text>
+
+  <!-- 图例 -->
+  <text x="16" y="252" font-family="sans-serif" font-size="11.5" font-weight="600" fill="#14181d">四个断点</text>
+  <text x="16" y="276" font-family="sans-serif" font-size="11.5" fill="#3d4652">① 二层：虚拟机的帧没有进入 vmnet1（网卡归属 / 未连接）</text>
+  <text x="16" y="298" font-family="sans-serif" font-size="11.5" fill="#3d4652">② 路由：虚拟机默认路由未指向 192.168.100.1</text>
+  <text x="16" y="320" font-family="sans-serif" font-size="11.5" fill="#3d4652">③ 反共享：AC 按 TTL=63 或并发特征判定"多设备共享"并丢包</text>
+  <text x="16" y="342" font-family="sans-serif" font-size="11.5" fill="#3d4652">④ 转发：ip_forward / ip rule / sing-box 监听异常，包到了却没人接</text>
+  <text x="16" y="372" font-family="sans-serif" font-size="10.5" fill="#6b7684">本项目设计下 ① ② ④ 属于本地配置问题，③ 属于认证网关行为，只有"虚拟机被桥到 Wi-Fi"这一条与 MAC 认证直接相关。</text>
+</svg>
+
+<h2>2 · 现场实测：已确认的事实</h2>
+
+<p>下列数据取自当前机器，可直接复核；未取得证据的一律标为推断。</p>
+
+<table>
+  <thead><tr><th>检查项</th><th>实测结果</th><th>性质</th></tr></thead>
+  <tbody>
+    <tr><td>Wi-Fi 网卡 / 地址</td><td><code>wlo1</code> = 10.20.90.45/24，网关 10.20.90.1</td><td><span class="badge b-fact">事实</span></td></tr>
+    <tr><td>有线网卡</td><td><code>enp55s0</code> 状态 DOWN（通道A 当前不可用）</td><td><span class="badge b-fact">事实</span></td></tr>
+    <tr><td>通道策略</td><td>SSID "room 116" 不在白名单 <code>["Roar"]</code> → 判定 <code>on</code></td><td><span class="badge b-fact">事实</span></td></tr>
+    <tr><td>mangle 规则</td><td>HY2_PRE：<code>-i enp55s0 RETURN</code> → DNS:53 TPROXY → <code>hy2_cn RETURN</code> → 保留网段 RETURN → catch-all TPROXY；网卡名正确</td><td><span class="badge b-fact">事实</span></td></tr>
+    <tr><td>策略路由</td><td><code>ip rule fwmark 1 → table 100</code>，表内 <code>local default dev lo</code> 在位</td><td><span class="badge b-fact">事实</span></td></tr>
+    <tr><td>NAT / 转发</td><td><code>MASQUERADE -s 192.168.100.0/24 -o wlo1</code> 在位；FORWARD 双向 ACCEPT；<code>ip_forward=1</code></td><td><span class="badge b-fact">事实</span></td></tr>
+    <tr><td>sing-box 入站</td><td>tproxy 监听 <code>[::]:12345</code>，进程运行中，隧道出站正常</td><td><span class="badge b-fact">事实</span></td></tr>
+    <tr><td><b>vmnet1 收包计数</b></td><td><b>RX = 0 packets</b>；TX 持续增长（ARP 重试）</td><td><span class="badge b-bad">关键异常</span></td></tr>
+    <tr><td>邻居表</td><td><code>192.168.100.128</code> 状态 <b>FAILED</b></td><td><span class="badge b-bad">关键异常</span></td></tr>
+    <tr><td>DHCP 租约</td><td>192.168.100.128 / 00:50:56:2d:c8:0b / "Win"，今日 12:31 仍有更新</td><td><span class="badge b-fact">事实</span></td></tr>
+  </tbody>
+</table>
+
+<div class="note">
+<b>判读：</b>宿主侧规则、路由、隧道、NAT 全部正确，<b>问题出在 vmnet1 以西</b>——虚拟机的以太网帧没有到达宿主。这排除了"MAC 认证直接封禁"和"TProxy 没接住"两种说法，指向网卡归属或虚拟机侧配置。
+</div>
+
+<h2>3 · 定位流程（按序执行，每步只看一个判据）</h2>
+
+<div class="step">
+  <div class="step-h"><span class="step-n">STEP 1</span><span class="step-t">确认二层有没有包</span></div>
+  <p>宿主开一个窗口持续观察收包计数：</p>
+  <pre><code>watch -n1 "cat /sys/class/net/vmnet1/statistics/rx_packets"</code></pre>
+  <p>同时在虚拟机内发起三层连通：</p>
+  <pre><code>ping -c 3 192.168.100.1</code></pre>
+  <p class="meta"><b>判据：</b>计数<b>不增长</b> → 断点在 ① 二层，跳到 STEP 2。<br>
+  <b>判据：</b>计数增长但 ping 不通 → 断点在 ④，跳到 STEP 4 的宿主侧检查。</p>
+</div>
+
+<div class="step">
+  <div class="step-h"><span class="step-n">STEP 2</span><span class="step-t">核对虚拟机网卡归属（与 MAC 认证直接相关的一步）</span></div>
+  <p>VMware → 虚拟机设置 → 网络适配器，逐项核对：</p>
+  <table>
+    <thead><tr><th>适配器</th><th>必须是</th><th>不能是</th></tr></thead>
+    <tbody>
+      <tr><td>适配器 1（内网直连）</td><td>自定义 <code>VMnet0</code>，且 VMnet0 的 Bridged to <b>锁定 enp55s0</b></td><td>Automatic</td></tr>
+      <tr><td>适配器 2（上网出口）</td><td>自定义 <code>VMnet1</code>（Host-Only）</td><td>NAT / 桥接 / 未勾选"启动时连接"</td></tr>
+    </tbody>
+  </table>
+  <div class="note danger">
+  <b>这是 MAC 认证场景下唯一的直接致死路径：</b>VMnet0 若设为 Automatic，VMware 可能把桥接落到 <code>wlo1</code>。此时虚拟机以<b>自己的 MAC</b> 直接出现在 Wi-Fi 上，该 MAC 未在任何认证系统中登记 → 帧被 AC 丢弃。若虚拟机又把默认路由放到这块网卡上，整机断网；而宿主毫无异常，症状完全吻合。
+  </div>
+  <p class="meta"><b>判据：</b>两块网卡均须为 Custom 且显式指定 VMnet0 / VMnet1，桥接目标必须是物理有线口（当前 <code>enp55s0</code>，状态 DOWN，插线前该口不通属正常）。</p>
+</div>
+
+<div class="step">
+  <div class="step-h"><span class="step-n">STEP 3</span><span class="step-t">核对该虚拟机的地址与默认路由</span></div>
+  <pre><code># Linux
+ip -4 addr show
+ip route
+
+# Windows（管理员 PowerShell）
+ipconfig /all
+route print -4</code></pre>
+  <p class="meta"><b>预期：</b>存在<code>default via 192.168.100.1</code>（metric 100）；另一块网卡即便有地址也不抢默认路由。<br>
+  <b>判据：</b>默认路由指向物理网段（如 10.20.90.1）→ 该虚拟机的流量绕开了网关，直接改回 <code>192.168.100.1</code>。</p>
+</div>
+
+<div class="step">
+  <div class="step-h"><span class="step-n">STEP 4</span><span class="step-t">确认包进了隧道，而非漏成直连</span></div>
+  <p>虚拟机内执行：</p>
+  <pre><code>curl -s ifconfig.me; echo</code></pre>
+  <p class="meta"><b>预期：</b>返回节点出口 IP（当前节点 <code>66.154.125.150</code>）。<br>
+  <b>返回 10.20.90.45：</b>流量未命中 TProxy，走了直连——检查宿主 <code>proxy-switch.sh status</code> 与 <code>hy2_cn</code> 命中情况。<br>
+  <b>超时：</b>包到了但没人接——在宿主看 sing-box 日志是否出现 <code>inbound from 192.168.100.x</code>：</p>
+  <pre><code>docker logs --tail 200 hy2-gateway | grep '192.168.100.'</code></pre>
+</div>
+
+<div class="step">
+  <div class="step-h"><span class="step-n">STEP 5</span><span class="step-t">区分"被反共享掐断"与"隧道故障"</span></div>
+  <p>虚拟机内分别测国内与国际：</p>
+  <pre><code>curl -s -o /dev/null -w 'cn=%{http_code}\n' https://www.baidu.com
+curl -s -o /dev/null -w 'intl=%{http_code}\n' https://www.google.com</code></pre>
+  <table>
+    <thead><tr><th>现象</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td>两项都通</td><td>链路正常，问题已解决</td></tr>
+      <tr><td>intl 通、cn 不通</td><td>典型反共享：国内 IP 命中 <code>hy2_cn</code> 被内核放行 → MASQUERADE 直连 → <b>TTL=63</b>，被 AC 判定多设备共享</td></tr>
+      <tr><td>两项都不通，且宿主同时掉线</td><td>账号已被反共享策略踢下线，需重新认证</td></tr>
+      <tr><td>两项都不通，宿主正常</td><td>非反共享，回到 STEP 1—4 查转发链路</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h2>4 · 处置矩阵</h2>
+
+<table>
+  <thead><tr><th>已定位原因</th><th>处置动作</th><th>验证</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>二层：网卡归属错 / 未连接 / 桥到 Wi-Fi</td>
+      <td>VMware 中改为 Custom VMnet0（桥接锁 <code>enp55s0</code>）+ Custom VMnet1；勾选"启动时连接"；必要时先删后按序重加</td>
+      <td><code>vmnet1</code> RX 计数随 ping 增长；<code>ip neigh</code> 由 FAILED 转 REACHABLE</td>
+    </tr>
+    <tr>
+      <td>路由：默认网关缺失或被抢占</td>
+      <td>网关设为 <code>192.168.100.1</code>，metric 100；桥接网卡 metric 调高（200）</td>
+      <td><code>ip route</code> 默认项指向 vmnet1</td>
+    </tr>
+    <tr>
+      <td>反共享：TTL 特征被识别</td>
+      <td>宿主统一改写转发流量 TTL（需 <code>xt_HL</code>，本机已具备）：<br><code>iptables -t mangle -A POSTROUTING -s 192.168.100.0/24 -o wlo1 -j TTL --ttl-set 64</code></td>
+      <td>VM 内国内站点恢复；<code>iptables -t mangle -S POSTROUTING | grep TTL</code></td>
+    </tr>
+    <tr>
+      <td>反共享：仍被识别（多流 / 指纹）</td>
+      <td>让虚拟机<b>全部</b>流量走隧道（隧道流量由 sing-box 重新发起，TTL=64，与宿主流量无差别）：移除 <code>HY2_PRE</code> 的 <code>hy2_cn RETURN</code> 规则，或在控制台将通道策略设为 <code>always_proxy</code> 并观察</td>
+      <td>VM 内 <code>curl ifconfig.me</code> 恒为节点 IP</td>
+    </tr>
+    <tr>
+      <td>转发：包到了没人接</td>
+      <td>核对 <code>ip_forward=1</code>、<code>ip rule fwmark 1</code>、sing-box 监听 <code>[::]:12345</code>；用 <code>proxy-switch.sh on</code> 重建规则</td>
+      <td>sing-box 日志出现 <code>inbound from 192.168.100.x</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="grid2">
+  <div class="card">
+    <h4>为什么 MAC 认证不影响 Host-Only 方案</h4>
+    <p>认证发生在 Wi-Fi 关联/关联后的 ACL 上，认的是<b>发出该帧的 MAC</b>。虚拟机流量在宿主内核被 TPROXY 接管或 MASQUERADE 重写，出 Wi-Fi 时源 MAC 恒为 <code>wlo1</code> 的 MAC。</p>
+    <p>因此"虚拟机用宿主的认证态"是设计本身的正常表现，不需要也不应该给虚拟机单独认证。</p>
+  </div>
+  <div class="card">
+    <h4>为什么反共享偏偏掐虚拟机</h4>
+    <p>隧道流量由 sing-box 在宿主上<b>重新发起</b>，TTL、IPID、TCP 特征与宿主自己的流量一致。</p>
+    <p>而 <code>hy2_cn</code> 放行的国内流量走内核转发，TTL 被减 1 变成 63——这正是 AC 判定"下游还有一台设备"的经典特征。</p>
+  </div>
+</div>
+
+<h2>5 · 风险与回滚</h2>
+
+<div class="note">
+<b>操作前：</b>本次只做只读检查与规则新增，未改动现有配置。若执行 TTL 改写，先确认命令中的出口网卡名是 <code>wlo1</code>（换网络环境后网卡名可能变化）。
+</div>
+
+<ul>
+  <li><b>TTL 改写的回滚：</b><code>iptables -t mangle -D POSTROUTING -s 192.168.100.0/24 -o wlo1 -j TTL --ttl-set 64</code></li>
+  <li><b>规则整体回滚：</b><code>sudo /usr/local/bin/proxy-switch.sh off</code> 清除 TProxy 并恢复直连</li>
+  <li><b>风险：</b>反共享策略若已触发账号封禁，改 TTL 不会立即恢复，需在认证页重新登录；频繁触发可能导致账号被限速。</li>
+  <li><b>不要</b>为"让虚拟机通过认证"而克隆宿主 MAC 到虚拟机网卡——同网段出现重复 MAC 会造成 AP 侧 ARP 表震荡，宿主与虚拟机同时掉线。</li>
+</ul>
+
+<h2>6 · 一个已确认的工具缺陷（顺带记录）</h2>
+
+<p>在容器内直接执行 <code>proxy-switch.sh status</code> 会误报。原因是脚本默认 <code>STATE_FILE=/opt/hy2-gateway/data/gateway_state.json</code>，而容器只挂载了 <code>/data</code>；读取失败后回落到内置默认网卡名 <code>wlp2s0</code> / <code>enp3s0</code>，于是把实际存在的规则报成 <code>[无]</code>。</p>
+
+<p>宿主侧脚本与后端调用均通过 <code>proxy_switch_env()</code> 显式传入正确路径与网卡名，<b>不影响实际转发</b>，仅影响容内手工排障时的读数。核验时请以 <code>iptables -t mangle -S</code> 的实际输出为准。</p>
+
+<footer>
+Smart Hy2 Gateway · 故障定位记录 · 2026-11-01　|　文中"事实"为本次实测所得，"推断"需按第 3 节流程逐项验证。
+</footer>
+
+</div>
+</body>
+</html>
