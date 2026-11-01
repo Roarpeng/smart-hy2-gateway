@@ -15,7 +15,13 @@
 #      VMware Host-Only 的 DHCP 默认不下发 option routers, 虚拟机会"有 IP 没网关";
 #      本服务重写 dhcpd.conf 后自带网关 192.168.100.1 与 DNS。
 #      非 VMware 宿主由 unit 的 ConditionPathExists 自动跳过。
-#   7. 安装尾声 best-effort 首跑一次 ruleset-update.sh (离线失败只 WARN)
+#   7. 安装 vmnet 设备兜底 (vmnet-ensure.sh + vmnet-guard.service)
+#      /dev 为 tmpfs, 重启即清空; 若虚拟机在 /dev/vmnetN 就绪前启动, vmx 会
+#      报 "MACVNetPortOpenDevice: can't open vmnet device" 并把网卡标记为
+#      startdisconnected 后永不重试 —— 表现为虚拟机永久断网, 且宿主侧
+#      iptables/路由全部正常, 极难定位。本单元开机补建缺失的设备节点。
+#      非 VMware 宿主由 unit 的 ConditionPathExists 自动跳过。
+#   8. 安装尾声 best-effort 首跑一次 ruleset-update.sh (离线失败只 WARN)
 #
 # 幂等: 可重复执行; 已存在的状态文件不会被覆盖。
 # ============================================================================
@@ -30,10 +36,13 @@ SRC_RULESET_SERVICE="$SCRIPT_DIR/scripts/systemd/hy2-ruleset-update.service"
 SRC_RULESET_TIMER="$SCRIPT_DIR/scripts/systemd/hy2-ruleset-update.timer"
 SRC_VMNET_DHCP="$SCRIPT_DIR/scripts/hy2-vmnet1-dhcp.sh"
 SRC_VMNET_DHCP_SERVICE="$SCRIPT_DIR/scripts/systemd/hy2-vmnet1-dhcp.service"
+SRC_VMNET_ENSURE="$SCRIPT_DIR/scripts/vmnet-ensure.sh"
+SRC_VMNET_GUARD_SERVICE="$SCRIPT_DIR/scripts/systemd/vmnet-guard.service"
 
 DST_PROXY_SWITCH=/usr/local/bin/proxy-switch.sh
 DST_RULESET_UPDATE=/usr/local/bin/ruleset-update.sh
 DST_VMNET_DHCP=/usr/local/bin/hy2-vmnet1-dhcp.sh
+DST_VMNET_ENSURE=/usr/local/bin/vmnet-ensure.sh
 DISPATCHER_DIR=/etc/NetworkManager/dispatcher.d
 DST_DISPATCHER="$DISPATCHER_DIR/99-wifi-proxy.sh"
 
@@ -49,7 +58,8 @@ fi
 # --- 源文件检查 ---
 for f in "$SRC_PROXY_SWITCH" "$SRC_DISPATCHER" "$SRC_RULESET_UPDATE" \
          "$SRC_RULESET_SERVICE" "$SRC_RULESET_TIMER" \
-         "$SRC_VMNET_DHCP" "$SRC_VMNET_DHCP_SERVICE"; do
+         "$SRC_VMNET_DHCP" "$SRC_VMNET_DHCP_SERVICE" \
+         "$SRC_VMNET_ENSURE" "$SRC_VMNET_GUARD_SERVICE"; do
     if [[ ! -f "$f" ]]; then
         echo "错误: 缺少源文件 $f" >&2
         exit 1
@@ -112,6 +122,23 @@ if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
     fi
 else
     echo "警告: 非 systemd 环境, 已跳过 hy2-vmnet1-dhcp.service" >&2
+fi
+
+# --- 安装 vmnet 设备兜底服务 (补建 /dev/vmnetN, 防虚拟机开机断网) ---
+install -m 755 -o root -g root "$SRC_VMNET_ENSURE" "$DST_VMNET_ENSURE"
+echo "[OK] 已安装: $DST_VMNET_ENSURE"
+if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    install -m 644 -o root -g root "$SRC_VMNET_GUARD_SERVICE" /etc/systemd/system/vmnet-guard.service
+    systemctl daemon-reload 2>/dev/null || true
+    if [[ ! -e /dev/vmnet1 ]] && [[ ! -x /usr/lib/vmware/bin/vmware-vmx ]]; then
+        echo "[跳过] 未检测到 VMware (无 /dev/vmnet1 与 vmware-vmx), 已安装单元但不启用"
+    elif systemctl enable --now vmnet-guard.service 2>/dev/null; then
+        echo "[OK] 已安装并启用: vmnet-guard.service (开机补建 /dev/vmnet0/1/8)"
+    else
+        echo "警告: vmnet-guard.service 启用失败, 请检查 systemd 环境" >&2
+    fi
+else
+    echo "警告: 非 systemd 环境, 已跳过 vmnet-guard.service" >&2
 fi
 
 # --- 默认状态文件 (不存在才生成) ---
@@ -178,6 +205,7 @@ cat <<EOF
         proxy-switch.sh off && proxy-switch.sh status
         systemctl list-timers hy2-ruleset-update.timer
         systemctl status hy2-vmnet1-dhcp.service   # VMware 环境下 vmnet1 网关/DNS 下发
+        systemctl status vmnet-guard.service       # VMware 环境下 /dev/vmnetN 兜底
  提示: dispatcher 钩子即时生效, 断开/重连一次 Wi-Fi 即可触发切换。
 ============================================================
 EOF

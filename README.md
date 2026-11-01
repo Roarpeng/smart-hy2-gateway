@@ -84,6 +84,7 @@ flowchart TB
 - **规则集每周自动更新（systemd timer）**：`hy2-ruleset-update.timer` 每周一 04:30 触发（±10 分钟随机抖动，`Persistent=true` 错过补跑）执行 `ruleset-update.sh`：从 SagerNet 官方（sing-geosite / sing-geoip 的 rule-set 分支）下载 `geosite-cn.srs` / `geoip-cn.srs` → 尺寸校验 → 原子替换仓库 `ruleset/` → `docker cp` 投递容器 `/usr/local/share/sing-box/` → 从同一份 `geoip-cn.srs` 用 `sing-box rule-set decompile` 导出 CIDR、原子重建 ipset `hy2_cn`（单一数据源）→ 若代理在开则确保 match 规则在位 → 经后端 `/api/apply` 触发 sing-box 优雅重载。全程 fail-safe：下载失败或校验不过即保留现有规则集，重载前 `sing-box check` 通过才重启进程，坏文件不破坏运行态。`install.sh` 一并安装脚本与 timer（`enable --now`）、检查 `curl`/`jq`/`ipset` 依赖，并在安装尾声 best-effort 首跑一次。
 - **规则守护（rule-guard）**：dispatcher 每次决策落盘期望态，后端每 30s 将 iptables 实况对齐——任何原因（容器重建、系统事件）导致的规则丢失在一个周期内自动恢复；Wi-Fi 波动断连不清规则。
 - **Host-Only 虚拟机直连兜底**：代理关闭时脚本确保 `ip_forward` + MASQUERADE，虚拟机不断网。
+- **VMware 虚拟网络兜底（vmnet-guard）**：`/dev` 为 tmpfs，`vmware.service` 创建 `/dev/vmnetN` 存在时序空档——虚拟机若在节点就绪前启动，vmx 会报 `MACVNetPortOpenDevice: can't open vmnet device` 并把网卡标记为 `startdisconnected` 后**永不重试**，表现为虚拟机永久断网而宿主侧 iptables/路由全部正常，极难定位。`vmnet-guard.service` 开机等待 `vmware.service` 后就绪检查、按主设备号 119 补建 `/dev/vmnet0/1/8`（幂等，不触碰已存在节点），`install.sh` 一并安装启用；非 VMware 宿主由 `ConditionPathExists` 自动跳过。诊断依据：`ls -l /proc/$(pgrep -f bin/vmware-vmx | head -1)/fd | grep vmnet`，只有 `vmnet0` 即代理网卡未接入。
 
 ## 快速开始
 
@@ -116,9 +117,13 @@ smart-hy2-gateway/（部署目录 = /opt/hy2-gateway）
 │   ├── proxy-switch.sh              TProxy 开关 (on/off/status, 幂等, RJ45 硬直连)
 │   ├── 99-wifi-proxy.sh             NetworkManager dispatcher (wifi_policy 决策)
 │   ├── ruleset-update.sh            规则集每周更新 (下载→校验→原子替换→投递容器→重建 ipset)
+│   ├── hy2-vmnet1-dhcp.sh           VMnet1 DHCP 网关服务 (下发网关 192.168.100.1 + DNS)
+│   ├── vmnet-ensure.sh              vmnet 设备兜底 (开机补建 /dev/vmnet0/1/8)
 │   └── systemd/
 │       ├── hy2-ruleset-update.service
-│       └── hy2-ruleset-update.timer
+│       ├── hy2-ruleset-update.timer
+│       ├── hy2-vmnet1-dhcp.service
+│       └── vmnet-guard.service
 │                                    定时单元 (每周一 04:30 触发, ±10min 抖动, 错过补跑)
 ├── ruleset/                         地理分流规则集 (geosite/geoip CN 直连, 镜像内置, 每周自动更新)
 ├── web/                             控制台前端 (零框架, 自托管 Switzer 字体, 断网可用)

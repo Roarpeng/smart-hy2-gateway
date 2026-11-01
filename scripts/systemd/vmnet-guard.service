@@ -1,6 +1,7 @@
 [Unit]
 Description=Ensure VMware vmnet device nodes exist before any VM starts
 Documentation=file:/usr/local/bin/vmnet-ensure.sh
+ConditionPathExists=/usr/lib/vmware/bin/vmware-vmx
 After=vmware.service
 Wants=vmware.service
 

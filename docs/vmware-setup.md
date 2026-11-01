@@ -211,3 +211,46 @@ ping 192.168.100.1
 如果 Windows `curl.exe` 报 `URL rejected: Bad hostname`，先用浏览器打开 `https://ifconfig.me/ip` 或使用上面的 PowerShell 命令验证；这通常是本机 curl/URL 解析问题，不代表代理链路不通。
 
 若第 2 步不通，回查 [第 2 节](#2-virtual-network-editor-配置) 的 VMnet1 子网与宿主 `vmnet1` 接口 IP；若第 3 步在两种 SSID 下出口 IP 相同，回查宿主机分流状态（见 [deploy.md 第 5 节](deploy.md#5-wi-fi-切换自动分流测试)）。
+
+### 6.1 虚拟机整机断网而宿主一切正常（vmnet 设备缺失）
+
+典型症状：宿主机上网与代理都正常，`proxy-switch.sh status` 全绿，但虚拟机构不到地址、ping 不通 `192.168.100.1`。
+
+先在宿主判断代理网卡有没有真正接入（**只看界面看不出来**）：
+
+```bash
+ls -l /proc/$(pgrep -f bin/vmware-vmx | head -1)/fd | grep vmnet
+# 只有 vmnet0        -> 代理网卡未接入，即本节问题
+# vmnet0 + vmnet1    -> 已接入，转去查虚拟机内部路由
+```
+
+再看 vmx 日志确认：
+
+```bash
+grep -E "can't open vmnet device|startdisconnected" /path/to/vm/vmware.log | tail
+```
+
+出现下面三行即是根因——`/dev/vmnet1` 在虚拟机开机时还不存在（`/dev` 为 tmpfs，重启清空，`vmware.service` 重建节点有先后），vmx 打开失败后把网卡标记为断开并**永不重试**：
+
+```
+VNET: MACVNetPortOpenDevice: Ethernet1: can't open vmnet device (No such file or directory)
+[msg.vnet.connectvnet] Could not connect 'Ethernet1' to virtual network 'vmnet1'
+[msg.device.startdisconnected] Virtual device 'Ethernet1' will start disconnected.
+```
+
+处置（按有效性排序）：
+
+| 动作 | 是否有效 | 说明 |
+|---|---|---|
+| 虚拟机内 Windows 网卡「禁用/启用」 | 无效 | 只重置来宾驱动，动不了 vmx 链路层 |
+| `vmrun suspend` + `start` | 无效 | 恢复时沿用保存前的断开状态，不重新 `open` |
+| `vmrun stop <vmx> soft` + `start <vmx> gui` | 有效 | 重新上电，vmx 重新打开设备 |
+| 虚拟机设置里把「已连接」取消再勾上 | 有效 | 免重启，但需在 VMware 设置对话框中操作 |
+
+防复发：`install.sh` 会安装 `vmnet-guard.service`，开机等待 `vmware.service` 后按主设备号 119 补建 `/dev/vmnet0/1/8`。确认状态：
+
+```bash
+systemctl status vmnet-guard.service
+# 设备已齐全时日志为 done, created=0 （幂等空操作）
+journalctl -t vmnet-ensure --since today
+```
