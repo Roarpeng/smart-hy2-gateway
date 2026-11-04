@@ -220,11 +220,10 @@
             </div>
             <div class="stage-copy">
               <h1>双通道分流</h1>
-              <p>按角色选择网卡：一条恒直连，一条按策略走隧道。物理网卡与虚拟网卡均可入选。</p>
+              <p>按角色选择宿主机物理网卡：一条恒直连，一条按策略走隧道。虚拟机上网自动跟随宿主机物理网卡，无需单独映射。</p>
               <p class="stage-fact">恒直连永不进隧道 · 策略通道 <strong id="stage-policy">白名单例外</strong></p>
               <div class="stage-actions">
                 <button type="button" class="btn btn-primary" onclick="jumpToChannels()">查看通道配置</button>
-                <button type="button" class="btn btn-quiet" onclick="applySuggestedVmUplinks()">采用建议 VM 映射</button>
               </div>
             </div>
           </div>
@@ -236,7 +235,7 @@
                 <h2 id="channel-a-title">恒直连</h2>
                 <span class="badge badge-direct">Direct</span>
               </div>
-              <p class="channel-lead">该网卡入/出站在 mangle 层直接 RETURN，永不进隧道。可选以太网、Wi‑Fi 或虚拟网卡。</p>
+              <p class="channel-lead">该网卡入/出站在 mangle 层直接 RETURN，永不进隧道。可选以太网或 Wi‑Fi 物理网卡。</p>
               <label class="field"><span>恒直连网卡</span>
                 <select id="cfg-rj45-dev" class="select"></select></label>
             </section>
@@ -271,22 +270,6 @@
               <div class="row whitelist-add">
                 <input type="text" id="input-add-ssid" class="input" placeholder="输入可信 Wi-Fi 的 SSID，例如 Home_Gigabit_5G" aria-label="新增白名单 SSID">
                 <button type="button" class="btn btn-primary" onclick="addWhitelistSsid()">加入白名单</button>
-              </div>
-            </section>
-
-            <section class="tile advanced-panel" data-ui aria-labelledby="vm-uplink-title">
-              <div class="advanced-head">
-                <div>
-                  <h2 id="vm-uplink-title">虚拟机上网映射</h2>
-                  <p class="muted-note">将 VMware 虚拟网卡绑定到恒直连或策略通道，避免手工对照桥接关系。</p>
-                </div>
-              </div>
-              <div class="stack">
-                <label class="field"><span>策略通道 VM 网卡 (兼容旧 vmnet_iface)</span>
-                  <select id="cfg-vmnet-dev" class="select"></select></label>
-                <label class="field"><span>VM 网段 (CIDR)</span>
-                  <input type="text" id="cfg-vmnet-subnet" class="input" value="192.168.100.0/24"></label>
-                <p id="vm-suggest-note" class="muted-note"></p>
               </div>
             </section>
 

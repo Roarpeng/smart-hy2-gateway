@@ -16,8 +16,6 @@ const appState = {
   network: {
     rj45Dev: 'enp3s0',
     wifiDev: 'wlp2s0',
-    vmnetDev: 'vmnet1',
-    vmnetSubnet: '192.168.100.0/24',
     tproxyPort: 12345,
     fwmark: '0x1',
     table: 100,
@@ -67,6 +65,8 @@ let DEMO_MODE = false;        // true = 后端不可用，全部操作退回本�
 let DEMO_TOAST_SHOWN = false; // 「已切换演示模式」提示全局只弹一次
 const API_TIMEOUT_MS = 2500;      // 常规只读请求
 const API_LONG_TIMEOUT_MS = 40000; // 下发/切换类请求：需覆盖 check+重启的最坏耗时
+const API_DEMO_THRESHOLD = 2;     // 连续网络层失败达此值才降级演示态 (5s 轮询 × 2 = 10s 瞬断容忍)
+let consecutiveApiFailures = 0;
 const TOKEN_STORAGE_KEY = 'hy2_gateway_token';
 let statusPollTimer = null;
 let demoReconnectTimer = null;    // 演示模式下周期探测后端，恢复可达时自动回在线
@@ -149,11 +149,14 @@ async function apiFetch(path, opts = {}, timeoutMs = API_TIMEOUT_MS) {
     if (res.status === 401 && path !== '/api/health') {
       showAuthGate('需要有效的 API Token');
     } else {
+      consecutiveApiFailures = 0;
       markOnline(); // 能收到 HTTP 响应（含其它 4xx/5xx）即视为后端可达
     }
     return res;
   } catch (err) {
-    enterDemoMode();
+    // 防抖: 节点激活/规则重铺会重启 sing-box 数秒, 单次瞬断不该把控制台闪进演示态
+    consecutiveApiFailures += 1;
+    if (consecutiveApiFailures >= API_DEMO_THRESHOLD) enterDemoMode();
     throw err;
   } finally {
     clearTimeout(timer);
@@ -179,9 +182,12 @@ async function probeBackendRecovery() {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
   try {
-    const res = await fetch('/api/status', { signal: controller.signal });
+    // 探活用免鉴权的 /api/health: /api/status 无 token 恒 401, res.ok 永假,
+    // 演示态将无法自愈 (Release 1.1 加鉴权后引入的回归)
+    const res = await fetch('/api/health', { signal: controller.signal });
     if (res.ok) {
       DEMO_MODE = false;
+      consecutiveApiFailures = 0;
       clearInterval(demoReconnectTimer);
       demoReconnectTimer = null;
       setBackendChip(true);
@@ -331,8 +337,7 @@ function mapApiStateToApp(data) {
 
   appState.network.rj45Dev = data.rj45_iface || appState.network.rj45Dev;
   appState.network.wifiDev = data.wifi_iface || appState.network.wifiDev;
-  appState.network.vmnetDev = data.vmnet_iface || appState.network.vmnetDev;
-  appState.network.vmnetSubnet = data.vmnet_subnet || appState.network.vmnetSubnet;
+  // vmnet_* 不再进 UI: VM 上网由后端默认映射跟随宿主机物理网卡
   appState.network.tproxyPort = data.tproxy_port ?? appState.network.tproxyPort;
   appState.network.fwmark = (typeof data.fwmark === 'number')
     ? '0x' + data.fwmark.toString(16)   // API int 1 -> UI 显示 '0x1'
@@ -347,13 +352,8 @@ function mapApiStateToApp(data) {
 function fillNetworkForm() {
   ensureIfaceOption(document.getElementById('cfg-rj45-dev'), appState.network.rj45Dev);
   ensureIfaceOption(document.getElementById('cfg-wifi-dev'), appState.network.wifiDev);
-  ensureIfaceOption(document.getElementById('cfg-vmnet-dev'), appState.network.vmnetDev);
   document.getElementById('cfg-rj45-dev').value = appState.network.rj45Dev;
   document.getElementById('cfg-wifi-dev').value = appState.network.wifiDev;
-  const vmSel = document.getElementById('cfg-vmnet-dev');
-  if (vmSel) vmSel.value = appState.network.vmnetDev;
-  const vmSubnet = document.getElementById('cfg-vmnet-subnet');
-  if (vmSubnet) vmSubnet.value = appState.network.vmnetSubnet || '192.168.100.0/24';
   document.getElementById('cfg-wifi-policy').value = appState.network.wifiPolicy;
   updateWhitelistAvailability();
   document.getElementById('cfg-tproxy-port').value = appState.network.tproxyPort;
@@ -397,13 +397,8 @@ function buildApplyPayload() {
     },
     wifi_iface: appState.network.wifiDev,
     rj45_iface: appState.network.rj45Dev,
-    vmnet_iface: appState.network.vmnetDev || 'vmnet1',
-    vmnet_subnet: appState.network.vmnetSubnet || '192.168.100.0/24',
-    vm_uplinks: [{
-      vm_iface: appState.network.vmnetDev || 'vmnet1',
-      bind: 'managed',
-      subnet: appState.network.vmnetSubnet || '192.168.100.0/24'
-    }],
+    // vmnet 字段不随 payload 下发: 后端按默认映射 (vmnet1/192.168.100.0/24 managed)
+    // 让 VM 流量经宿主机物理网卡 NAT + TProxy, 与宿主机同策略
     tproxy_port: parseInt(appState.network.tproxyPort, 10) || 12345,
     fwmark: parseFwmarkToInt(appState.network.fwmark),
     table: parseInt(appState.network.table, 10) || 100,
@@ -1710,10 +1705,6 @@ async function deleteNode(id) {
 function saveNetworkCardSettings() {
   appState.network.rj45Dev = document.getElementById('cfg-rj45-dev').value;
   appState.network.wifiDev = document.getElementById('cfg-wifi-dev').value;
-  const vmSel = document.getElementById('cfg-vmnet-dev');
-  const vmSubnet = document.getElementById('cfg-vmnet-subnet');
-  if (vmSel) appState.network.vmnetDev = vmSel.value;
-  if (vmSubnet) appState.network.vmnetSubnet = vmSubnet.value.trim() || '192.168.100.0/24';
   if (appState.network.rj45Dev && appState.network.rj45Dev === appState.network.wifiDev) {
     showToast('恒直连与策略代理不能选择同一网卡', 'warning');
     return;
@@ -1745,20 +1736,15 @@ const IFACE_DEMO_LIST = [
   { name: 'wlp2s0', kind: 'wifi', label: 'wlp2s0 · Wi-Fi' },
   { name: 'wlo1', kind: 'wifi', label: 'wlo1 · Wi-Fi' },
   { name: 'wlan0', kind: 'wifi', label: 'wlan0 · Wi-Fi' },
-  { name: 'vmnet0', kind: 'vmware', label: 'vmnet0 · 桥接', suggest_role: 'direct' },
-  { name: 'vmnet1', kind: 'vmware', label: 'vmnet1 · Host-Only', suggest_role: 'managed' },
-  { name: 'vmnet8', kind: 'vmware', label: 'vmnet8 · NAT' },
   { name: 'br0', kind: 'bridge', label: 'br0 · 网桥' },
   { name: 'virbr0', kind: 'bridge', label: 'virbr0 · 网桥' }
 ];
-let IFACE_SUGGESTIONS = [];
 let IFACE_CACHE = IFACE_DEMO_LIST;
 
-// 通道角色可选物理/虚拟网卡 (排除回环与隧道)
+// 通道角色只选宿主机物理网卡 (以太网/Wi-Fi); 虚拟机上网跟随宿主机, 不再单选虚拟网卡
 const IFACE_FIELD_KINDS = {
-  'cfg-rj45-dev': ['ethernet', 'wifi', 'vmware', 'bridge'],
-  'cfg-wifi-dev': ['ethernet', 'wifi', 'vmware', 'bridge'],
-  'cfg-vmnet-dev': ['vmware', 'bridge']
+  'cfg-rj45-dev': ['ethernet', 'wifi'],
+  'cfg-wifi-dev': ['ethernet', 'wifi']
 };
 
 // select 中保证存在指定值的选项 (后端列表未含当前值时补一项, 不丢配置)
@@ -1806,10 +1792,6 @@ function populateInterfaceSelects(interfaces) {
     }
   });
   updateWhitelistAvailability();
-  const note = document.getElementById('vm-suggest-note');
-  if (note && IFACE_SUGGESTIONS.length) {
-    note.textContent = '建议: ' + IFACE_SUGGESTIONS.map(s => `${s.vm_iface}→${s.bind}`).join(' · ');
-  }
 }
 
 function updateWhitelistAvailability() {
@@ -1830,28 +1812,8 @@ function updateWhitelistAvailability() {
   if (addRow) addRow.style.opacity = isWifi ? '1' : '0.45';
 }
 
-function applySuggestedVmUplinks() {
-  if (!IFACE_SUGGESTIONS.length) {
-    showToast('暂无 VM 映射建议 (未检测到 vmnet 或 VMware 配置)', 'info');
-    return;
-  }
-  const managed = IFACE_SUGGESTIONS.find(s => s.bind === 'managed') || IFACE_SUGGESTIONS[0];
-  const sel = document.getElementById('cfg-vmnet-dev');
-  const subnet = document.getElementById('cfg-vmnet-subnet');
-  if (sel && managed.vm_iface) {
-    ensureIfaceOption(sel, managed.vm_iface);
-    sel.value = managed.vm_iface;
-  }
-  if (subnet && managed.subnet) subnet.value = managed.subnet;
-  showToast(`已填入建议: ${managed.vm_iface} (${managed.bind})`, 'success');
-}
-
 async function refreshInterfaces() {
   if (DEMO_MODE) {
-    IFACE_SUGGESTIONS = [
-      { vm_iface: 'vmnet0', bind: 'direct', subnet: '', reason: '演示' },
-      { vm_iface: 'vmnet1', bind: 'managed', subnet: '192.168.100.0/24', reason: '演示' }
-    ];
     populateInterfaceSelects(IFACE_DEMO_LIST);
     showToast('演示模式: 已载入常见网卡名称列表', 'info');
     return;
@@ -1861,7 +1823,6 @@ async function refreshInterfaces() {
     if (res.ok) {
       const data = await res.json().catch(() => null);
       if (data && Array.isArray(data.interfaces) && data.interfaces.length) {
-        IFACE_SUGGESTIONS = Array.isArray(data.suggestions) ? data.suggestions : [];
         populateInterfaceSelects(data.interfaces);
         return;
       }
