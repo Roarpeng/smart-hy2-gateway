@@ -1,7 +1,7 @@
 """v2rayN 式节点链接解析器 (独立模块, 无第三方依赖)。
 
 职责:
-  1. 解析 hy2:// / hysteria2:// 分享链接 (v2rayN 语义)
+  1. 解析 hy2/hysteria2/vless/trojan/ss 分享链接 (v2rayN 语义)
   2. 解析多行链接、base64 订阅、sing-box JSON (完整配置/单 outbound/数组)
   3. 安全抓取远程订阅 (仅公网 http/https, 防 SSRF)
   4. 节点指纹 / 标签清洗 / 端口跳跃规范化
@@ -34,12 +34,13 @@ FALLBACK_TAG = "hy2-node"
 USER_AGENT = "v2rayN/6.60"
 
 # 链接/订阅解析时允许的 scheme
-_SCHEMES = ("hy2://", "hysteria2://")
+_SCHEMES = ("hy2://", "hysteria2://", "vless://", "trojan://", "ss://")
+_JSON_TYPES = frozenset({"hysteria2", "vless", "trojan", "shadowsocks"})
 
 # 脱敏正则: 链接 userinfo / JSON password / query 中的敏感参数
 _USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s?#]*@")
-_PASSWORD_JSON_RE = re.compile(r'(?i)("(?:password|obfs[-_]?password)"\s*:\s*")[^"]*(")')
-_PASSWORD_QUERY_RE = re.compile(r"(?i)((?:auth|password|obfs[-_]?password)=)[^&\s#]+")
+_PASSWORD_JSON_RE = re.compile(r'(?i)("(?:password|uuid|obfs[-_]?password)"\s*:\s*")[^"]*(")')
+_PASSWORD_QUERY_RE = re.compile(r"(?i)((?:auth|password|uuid|obfs[-_]?password|pbk)=)[^&\s#]+")
 # 首尾空白与控制字符 (标签清洗)
 _TAG_EDGE_RE = re.compile(r"^[\s\x00-\x1f\x7f]+|[\s\x00-\x1f\x7f]+$")
 _PROXIES_RE = re.compile(r"(?im)^\s*proxies\s*:")
@@ -51,20 +52,35 @@ CLASH_ERROR = "暂不支持 Clash 配置，请使用 v2rayN 分享链接或 base
 
 # ---------------- 基础工具 ----------------
 def node_fingerprint(node: dict) -> str:
-    """节点内容指纹 (server/port/password/obfs), 用于导入去重。"""
+    """节点内容指纹 (protocol/server/port/auth), 用于导入去重。"""
+    protocol = str(node.get("protocol") or "hysteria2").strip().lower() or "hysteria2"
     server = str(node.get("server") or "")
     port = node.get("port")
     if port in (None, ""):
         port = DEFAULT_PORT
-    password = str(node.get("password") or "")
-    obfs_type = str(node.get("obfs_type") or "")
-    obfs_password = str(node.get("obfs_password") or "")
-    port_hopping = str(node.get("port_hopping") or "")
-    raw = f"{server}|{port}|{password}|{obfs_type}|{obfs_password}"
-    # 端口跳跃未显式配置时保持 5 字段契约哈希; 配置后追加该字段, 避免仅端口跳跃
-    # 不同的节点在导入时被误判为同一节点
-    if port_hopping:
-        raw += f"|{port_hopping}"
+    password = str(node.get("password") or node.get("uuid") or "")
+
+    if protocol == "shadowsocks":
+        method = str(node.get("method") or node.get("obfs_type") or "")
+        plugin = str(node.get("plugin") or "")
+        raw = f"{protocol}|{server}|{port}|{password}|{method}|{plugin}"
+    elif protocol == "vless":
+        flow = str(node.get("flow") or "")
+        transport = str(node.get("transport") or "")
+        reality_pk = str(node.get("reality_public_key") or "")
+        raw = f"{protocol}|{server}|{port}|{password}|{flow}|{transport}|{reality_pk}"
+    elif protocol == "trojan":
+        transport = str(node.get("transport") or "")
+        sni = str(node.get("sni") or "")
+        raw = f"{protocol}|{server}|{port}|{password}|{transport}|{sni}"
+    else:
+        # hysteria2 (缺省 protocol 按 hysteria2 处理, 保持与旧节点兼容)
+        obfs_type = str(node.get("obfs_type") or "")
+        obfs_password = str(node.get("obfs_password") or "")
+        port_hopping = str(node.get("port_hopping") or "")
+        raw = f"{protocol}|{server}|{port}|{password}|{obfs_type}|{obfs_password}"
+        if port_hopping:
+            raw += f"|{port_hopping}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -172,21 +188,10 @@ def _redact_input(text: str) -> str:
 
 
 # ---------------- 分享链接 ----------------
-def parse_share_link(line: str, source: str = "clipboard") -> dict:
-    """解析单条 hy2/hysteria2 分享链接为节点字典。
-
-    Hysteria 2 的 userinfo 整体即认证串 (可能含未编码冒号), 不做 username/password 拆分。
-    """
-    raw = str(line or "").strip()
-    if not raw:
-        raise ValueError("链接为空")
-    lower = raw.lower()
-    if not lower.startswith(_SCHEMES):
-        raise ValueError("不是 hy2/hysteria2 分享链接")
-
+def _split_link_parts(raw: str) -> tuple[str, str, str]:
+    """拆出 scheme 后的 userinfo / hostport / tail(?query#frag)。"""
     scheme_end = raw.index("://") + 3
     rest = raw[scheme_end:]
-    # authority 到第一个 / ? # 为止; 只在该区间内找最后一个 @
     boundary = len(rest)
     for sep in ("/", "?", "#"):
         pos = rest.find(sep)
@@ -198,12 +203,15 @@ def parse_share_link(line: str, source: str = "clipboard") -> dict:
         userinfo_raw, hostport = authority.rsplit("@", 1)
     else:
         userinfo_raw, hostport = "", authority
+    return userinfo_raw, hostport, tail
 
+
+def _parse_hostport_tail(hostport: str, tail: str, scheme: str = "https") -> tuple[str, int, dict[str, str], str]:
+    """解析 host:port + query/fragment, 返回 (server, port, query, tag)。"""
     if not hostport:
         raise ValueError("缺少服务器地址")
-
     try:
-        split = urllib.parse.urlsplit("hysteria2://" + hostport + tail)
+        split = urllib.parse.urlsplit(f"{scheme}://" + hostport + tail)
     except ValueError as exc:
         raise ValueError(f"链接格式非法: {exc}") from exc
 
@@ -218,6 +226,66 @@ def parse_share_link(line: str, source: str = "clipboard") -> dict:
         raise ValueError("端口超出范围 1..65535")
 
     query = _query_dict(split.query)
+    tag = urllib.parse.unquote(split.fragment).strip()
+    if not tag:
+        tag = (query.get("remarks") or query.get("remark") or query.get("tag") or "").strip()
+    if not tag:
+        tag = f"{server}:{port}"
+    return server, port, query, tag
+
+
+def _b64_decode_bytes(text: str) -> bytes:
+    compact = re.sub(r"\s+", "", str(text or ""))
+    if not compact:
+        raise ValueError("base64 内容为空")
+    candidate = compact.replace("-", "+").replace("_", "/")
+    candidate += "=" * (-len(candidate) % 4)
+    try:
+        return base64.b64decode(candidate, validate=False)
+    except Exception as exc:
+        raise ValueError("base64 解码失败") from exc
+
+
+def _b64_decode_text(text: str) -> str:
+    try:
+        return _b64_decode_bytes(text).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("base64 内容不是合法 UTF-8") from exc
+
+
+def _normalize_transport(raw: Optional[str]) -> str:
+    value = str(raw or "tcp").strip().lower()
+    aliases = {
+        "": "tcp",
+        "tcp": "tcp",
+        "ws": "ws",
+        "websocket": "ws",
+        "http": "http",
+        "h2": "http",
+        "grpc": "grpc",
+        "httpupgrade": "httpupgrade",
+        "http_upgrade": "httpupgrade",
+    }
+    if value not in aliases:
+        raise ValueError(f"不支持的传输类型: {value}")
+    return aliases[value]
+
+
+def _tls_flags_from_security(security: str) -> tuple[bool, bool]:
+    sec = str(security or "").strip().lower()
+    if sec in ("", "none", "0", "false"):
+        return False, False
+    if sec == "reality":
+        return True, True
+    # tls / xtls / 其它显式安全层
+    return True, False
+
+
+def _parse_hy2_link(raw: str, source: str) -> dict:
+    """解析 hy2/hysteria2。userinfo 整体即认证串, 不做 username/password 拆分。"""
+    userinfo_raw, hostport, tail = _split_link_parts(raw)
+    server, port, query, tag = _parse_hostport_tail(hostport, tail, scheme="hysteria2")
+
     password = urllib.parse.unquote(userinfo_raw)
     if not password.strip():
         password = query.get("auth", "")
@@ -225,7 +293,9 @@ def parse_share_link(line: str, source: str = "clipboard") -> dict:
         raise ValueError("缺少密码")
 
     sni = _first_query(query, ("sni", "peer", "server_name", "servername")) or ""
-    insecure = _truthy(_first_query(query, ("insecure", "allowinsecure", "allow_insecure", "skip-cert-verify")) or "")
+    insecure = _truthy(
+        _first_query(query, ("insecure", "allowinsecure", "allow_insecure", "skip-cert-verify")) or ""
+    )
 
     obfs_raw = (query.get("obfs") or "").strip().lower()
     if obfs_raw not in ("", "salamander"):
@@ -236,17 +306,11 @@ def parse_share_link(line: str, source: str = "clipboard") -> dict:
 
     up_mbps = _positive_bw(_first_query(query, ("upmbps", "up")), "上行带宽")
     down_mbps = _positive_bw(_first_query(query, ("downmbps", "down")), "下行带宽")
-
     hopping_raw = _first_query(query, ("mport", "ports", "port-hopping", "port_hopping")) or ""
     port_hopping = normalize_port_hopping(hopping_raw)
 
-    tag = urllib.parse.unquote(split.fragment).strip()
-    if not tag:
-        tag = (query.get("remarks") or query.get("remark") or query.get("tag") or "").strip()
-    if not tag:
-        tag = f"{server}:{port}"
-
     return {
+        "protocol": "hysteria2",
         "tag": tag,
         "server": server,
         "port": port,
@@ -260,6 +324,193 @@ def parse_share_link(line: str, source: str = "clipboard") -> dict:
         "port_hopping": port_hopping,
         "source": source,
     }
+
+
+def _parse_vless_link(raw: str, source: str) -> dict:
+    userinfo_raw, hostport, tail = _split_link_parts(raw)
+    server, port, query, tag = _parse_hostport_tail(hostport, tail, scheme="vless")
+
+    uuid = urllib.parse.unquote(userinfo_raw).strip()
+    if not uuid:
+        uuid = (query.get("uuid") or "").strip()
+    if not uuid:
+        raise ValueError("缺少 UUID")
+
+    security = (_first_query(query, ("security", "tls")) or "").strip().lower()
+    tls_enabled, reality_enabled = _tls_flags_from_security(security)
+    transport = _normalize_transport(_first_query(query, ("type", "network", "transport")))
+
+    encryption = (_first_query(query, ("encryption",)) or "none").strip() or "none"
+    flow = (_first_query(query, ("flow",)) or "").strip()
+    packet_encoding = (_first_query(query, ("packetencoding", "packet_encoding")) or "").strip()
+    sni = (_first_query(query, ("sni", "peer", "servername", "server_name")) or "").strip()
+    insecure = _truthy(
+        _first_query(query, ("insecure", "allowinsecure", "allow_insecure", "skip-cert-verify")) or ""
+    )
+    fingerprint = (_first_query(query, ("fp", "fingerprint")) or "").strip()
+    public_key = (_first_query(query, ("pbk", "publickey", "public_key")) or "").strip()
+    short_id = (_first_query(query, ("sid", "shortid", "short_id")) or "").strip()
+    spider_x = (_first_query(query, ("spx", "spiderx", "spider_x")) or "").strip()
+    path = (_first_query(query, ("path",)) or "").strip()
+    host = (_first_query(query, ("host", "authority")) or "").strip()
+    service_name = (_first_query(query, ("servicename", "service_name")) or "").strip()
+
+    if reality_enabled and not public_key:
+        raise ValueError("Reality 缺少公钥 (pbk)")
+
+    return {
+        "protocol": "vless",
+        "tag": tag,
+        "server": server,
+        "port": port,
+        "password": uuid,
+        "uuid": uuid,
+        "flow": flow,
+        "encryption": encryption,
+        "packet_encoding": packet_encoding,
+        "transport": transport,
+        "transport_path": path,
+        "transport_host": host,
+        "transport_service_name": service_name,
+        "tls_enabled": tls_enabled,
+        "reality_enabled": reality_enabled,
+        "reality_public_key": public_key,
+        "reality_short_id": short_id,
+        "spider_x": spider_x,
+        "utls_fingerprint": fingerprint,
+        "sni": sni,
+        "insecure": insecure,
+        "source": source,
+    }
+
+
+def _parse_trojan_link(raw: str, source: str) -> dict:
+    userinfo_raw, hostport, tail = _split_link_parts(raw)
+    server, port, query, tag = _parse_hostport_tail(hostport, tail, scheme="trojan")
+
+    password = urllib.parse.unquote(userinfo_raw)
+    if not str(password).strip():
+        password = query.get("password", "")
+    if not str(password).strip():
+        raise ValueError("缺少密码")
+
+    transport = _normalize_transport(_first_query(query, ("type", "network", "transport")))
+    sni = (_first_query(query, ("sni", "peer", "servername", "server_name")) or "").strip()
+    insecure = _truthy(
+        _first_query(query, ("insecure", "allowinsecure", "allow_insecure", "skip-cert-verify")) or ""
+    )
+    path = (_first_query(query, ("path",)) or "").strip()
+    host = (_first_query(query, ("host", "authority")) or "").strip()
+
+    return {
+        "protocol": "trojan",
+        "tag": tag,
+        "server": server,
+        "port": port,
+        "password": str(password),
+        "sni": sni,
+        "insecure": insecure,
+        "transport": transport,
+        "transport_path": path,
+        "transport_host": host,
+        "tls_enabled": True,
+        "reality_enabled": False,
+        "source": source,
+    }
+
+
+def _parse_ss_link(raw: str, source: str) -> dict:
+    """解析 ss:// SIP002 或 legacy base64 分享链接。"""
+    scheme_end = raw.index("://") + 3
+    rest = raw[scheme_end:]
+
+    tag = ""
+    if "#" in rest:
+        rest, frag = rest.rsplit("#", 1)
+        tag = urllib.parse.unquote(frag).strip()
+
+    query: dict[str, str] = {}
+    if "?" in rest:
+        rest, qpart = rest.split("?", 1)
+        query = _query_dict(qpart)
+
+    method = ""
+    password = ""
+    server = ""
+    port = DEFAULT_PORT
+
+    if "@" in rest:
+        # SIP002: base64(method:password)@host:port  或  method:password@host:port
+        userinfo_raw, hostport = rest.rsplit("@", 1)
+        userinfo = urllib.parse.unquote(userinfo_raw)
+        if ":" in userinfo:
+            method, password = userinfo.split(":", 1)
+        else:
+            decoded = _b64_decode_text(userinfo)
+            if ":" not in decoded:
+                raise ValueError("SS 用户信息缺少 method:password")
+            method, password = decoded.split(":", 1)
+        server, port, _, default_tag = _parse_hostport_tail(hostport, "", scheme="ss")
+        if not tag:
+            tag = default_tag
+    else:
+        # legacy: base64(method:password@host:port)
+        decoded = _b64_decode_text(rest)
+        if "@" not in decoded:
+            raise ValueError("SS legacy 链接缺少 @host:port")
+        userinfo, hostport = decoded.rsplit("@", 1)
+        if ":" not in userinfo:
+            raise ValueError("SS 用户信息缺少 method:password")
+        method, password = userinfo.split(":", 1)
+        hostport = hostport.split("/")[0].split("?")[0]
+        server, port, _, default_tag = _parse_hostport_tail(hostport, "", scheme="ss")
+        if not tag:
+            tag = default_tag
+
+    method = str(method).strip()
+    password = str(password)
+    if not method:
+        raise ValueError("缺少加密方法")
+    if not password:
+        raise ValueError("缺少密码")
+
+    plugin = (query.get("plugin") or "").strip()
+    plugin_opts = ""
+    if plugin and ";" in plugin:
+        plugin, plugin_opts = plugin.split(";", 1)
+
+    return {
+        "protocol": "shadowsocks",
+        "tag": tag or f"{server}:{port}",
+        "server": server,
+        "port": port,
+        "password": password,
+        "method": method,
+        "obfs_type": method,
+        "plugin": plugin,
+        "plugin_opts": plugin_opts,
+        "source": source,
+    }
+
+
+def parse_share_link(line: str, source: str = "clipboard") -> dict:
+    """解析单条 hy2/vless/trojan/ss 分享链接为节点字典。"""
+    raw = str(line or "").strip()
+    if not raw:
+        raise ValueError("链接为空")
+    lower = raw.lower()
+    if not lower.startswith(_SCHEMES):
+        raise ValueError("不支持的分享链接 (仅 hy2/hysteria2/vless/trojan/ss)")
+
+    if lower.startswith(("hy2://", "hysteria2://")):
+        return _parse_hy2_link(raw, source)
+    if lower.startswith("vless://"):
+        return _parse_vless_link(raw, source)
+    if lower.startswith("trojan://"):
+        return _parse_trojan_link(raw, source)
+    if lower.startswith("ss://"):
+        return _parse_ss_link(raw, source)
+    raise ValueError("不支持的分享链接")
 
 
 # ---------------- sing-box JSON ----------------
@@ -285,13 +536,7 @@ def _json_bandwidth(value: Any, label: str) -> Optional[int]:
     return number if number > 0 else None
 
 
-def _node_from_json(obj: dict, source: str) -> dict:
-    """把 sing-box hysteria2 outbound 映射为节点字典。"""
-    if not isinstance(obj, dict):
-        raise ValueError("JSON 节点必须是对象")
-    if str(obj.get("type") or "").strip().lower() != "hysteria2":
-        raise ValueError("不是 hysteria2 出站")
-
+def _json_server_port(obj: dict) -> tuple[str, int]:
     server = _valid_server(str(obj.get("server") or ""))
     raw_port = obj.get("server_port", obj.get("port", DEFAULT_PORT))
     try:
@@ -300,15 +545,67 @@ def _node_from_json(obj: dict, source: str) -> dict:
         raise ValueError("端口非法") from exc
     if not (1 <= port <= 65535):
         raise ValueError("端口超出范围 1..65535")
+    return server, port
 
+
+def _json_tls_fields(obj: dict) -> dict[str, Any]:
+    tls = obj.get("tls") if isinstance(obj.get("tls"), dict) else {}
+    sni = str(tls.get("server_name") or tls.get("sni") or "").strip()
+    insecure = _truthy(tls.get("insecure", False))
+    tls_enabled = bool(tls) and _truthy(tls.get("enabled", True))
+
+    reality = tls.get("reality") if isinstance(tls.get("reality"), dict) else {}
+    reality_enabled = bool(reality) and _truthy(reality.get("enabled", True))
+    reality_public_key = str(reality.get("public_key") or "").strip()
+    reality_short_id = str(reality.get("short_id") or "").strip()
+
+    utls = tls.get("utls") if isinstance(tls.get("utls"), dict) else {}
+    fingerprint = str(utls.get("fingerprint") or "").strip()
+
+    return {
+        "sni": sni,
+        "insecure": insecure,
+        "tls_enabled": tls_enabled,
+        "reality_enabled": reality_enabled,
+        "reality_public_key": reality_public_key,
+        "reality_short_id": reality_short_id,
+        "utls_fingerprint": fingerprint,
+    }
+
+
+def _json_transport_fields(obj: dict) -> dict[str, str]:
+    transport_obj = obj.get("transport") if isinstance(obj.get("transport"), dict) else {}
+    if not transport_obj:
+        return {
+            "transport": "tcp",
+            "transport_path": "",
+            "transport_host": "",
+            "transport_service_name": "",
+        }
+    ttype = _normalize_transport(str(transport_obj.get("type") or "tcp"))
+    path = str(transport_obj.get("path") or "").strip()
+    headers = transport_obj.get("headers") if isinstance(transport_obj.get("headers"), dict) else {}
+    host_raw = transport_obj.get("host") or headers.get("Host") or headers.get("host") or ""
+    if isinstance(host_raw, (list, tuple)):
+        host = str(host_raw[0]).strip() if host_raw else ""
+    else:
+        host = str(host_raw).strip()
+    service_name = str(transport_obj.get("service_name") or "").strip()
+    return {
+        "transport": ttype,
+        "transport_path": path,
+        "transport_host": host,
+        "transport_service_name": service_name,
+    }
+
+
+def _node_from_hy2_json(obj: dict, source: str) -> dict:
+    server, port = _json_server_port(obj)
     password = str(obj.get("password") or "")
     if not password.strip():
         raise ValueError("缺少密码")
 
-    tls = obj.get("tls") if isinstance(obj.get("tls"), dict) else {}
-    sni = str(tls.get("server_name") or tls.get("sni") or "").strip()
-    insecure = _truthy(tls.get("insecure", False))
-
+    tls = _json_tls_fields(obj)
     obfs = obj.get("obfs") if isinstance(obj.get("obfs"), dict) else {}
     obfs_type = str(obfs.get("type") or "").strip().lower()
     if obfs_type not in ("", "salamander"):
@@ -318,20 +615,125 @@ def _node_from_json(obj: dict, source: str) -> dict:
         raise ValueError("启用混淆时必须提供混淆口令")
 
     return {
+        "protocol": "hysteria2",
         "tag": str(obj.get("tag") or "").strip() or f"{server}:{port}",
         "server": server,
         "port": port,
         "password": password,
-        "sni": sni,
-        "insecure": insecure,
+        "sni": tls["sni"],
+        "insecure": tls["insecure"],
         "obfs_type": obfs_type,
         "obfs_password": obfs_password,
         "up_mbps": _json_bandwidth(obj.get("up_mbps"), "up_mbps"),
         "down_mbps": _json_bandwidth(obj.get("down_mbps"), "down_mbps"),
-        # sing-box >=1.11 用 server_ports (列表), 兼容旧 port_hopping 字段
         "port_hopping": _json_port_hopping(obj.get("server_ports", obj.get("port_hopping"))),
         "source": source,
     }
+
+
+def _node_from_vless_json(obj: dict, source: str) -> dict:
+    server, port = _json_server_port(obj)
+    uuid = str(obj.get("uuid") or obj.get("password") or "").strip()
+    if not uuid:
+        raise ValueError("缺少 UUID")
+
+    tls = _json_tls_fields(obj)
+    transport = _json_transport_fields(obj)
+    # 无 tls 块时, sing-box 默认不启 TLS; Reality 块则强制 TLS
+    if not obj.get("tls"):
+        tls["tls_enabled"] = False
+
+    return {
+        "protocol": "vless",
+        "tag": str(obj.get("tag") or "").strip() or f"{server}:{port}",
+        "server": server,
+        "port": port,
+        "password": uuid,
+        "uuid": uuid,
+        "flow": str(obj.get("flow") or "").strip(),
+        "encryption": str(obj.get("encryption") or "none").strip() or "none",
+        "packet_encoding": str(obj.get("packet_encoding") or "").strip(),
+        "transport": transport["transport"],
+        "transport_path": transport["transport_path"],
+        "transport_host": transport["transport_host"],
+        "transport_service_name": transport["transport_service_name"],
+        "tls_enabled": tls["tls_enabled"],
+        "reality_enabled": tls["reality_enabled"],
+        "reality_public_key": tls["reality_public_key"],
+        "reality_short_id": tls["reality_short_id"],
+        "utls_fingerprint": tls["utls_fingerprint"],
+        "sni": tls["sni"],
+        "insecure": tls["insecure"],
+        "source": source,
+    }
+
+
+def _node_from_trojan_json(obj: dict, source: str) -> dict:
+    server, port = _json_server_port(obj)
+    password = str(obj.get("password") or "")
+    if not password.strip():
+        raise ValueError("缺少密码")
+
+    tls = _json_tls_fields(obj)
+    transport = _json_transport_fields(obj)
+    if not obj.get("tls"):
+        # trojan 通常强制 TLS; 无块时仍标记启用, 与分享链接一致
+        tls["tls_enabled"] = True
+
+    return {
+        "protocol": "trojan",
+        "tag": str(obj.get("tag") or "").strip() or f"{server}:{port}",
+        "server": server,
+        "port": port,
+        "password": password,
+        "sni": tls["sni"],
+        "insecure": tls["insecure"],
+        "transport": transport["transport"],
+        "transport_path": transport["transport_path"],
+        "transport_host": transport["transport_host"],
+        "tls_enabled": tls["tls_enabled"],
+        "reality_enabled": tls["reality_enabled"],
+        "source": source,
+    }
+
+
+def _node_from_ss_json(obj: dict, source: str) -> dict:
+    server, port = _json_server_port(obj)
+    password = str(obj.get("password") or "")
+    if not password.strip():
+        raise ValueError("缺少密码")
+    method = str(obj.get("method") or "").strip()
+    if not method:
+        raise ValueError("缺少加密方法")
+
+    return {
+        "protocol": "shadowsocks",
+        "tag": str(obj.get("tag") or "").strip() or f"{server}:{port}",
+        "server": server,
+        "port": port,
+        "password": password,
+        "method": method,
+        "obfs_type": method,
+        "plugin": str(obj.get("plugin") or "").strip(),
+        "plugin_opts": str(obj.get("plugin_opts") or "").strip(),
+        "source": source,
+    }
+
+
+def _node_from_json(obj: dict, source: str) -> dict:
+    """把 sing-box outbound 映射为节点字典 (hy2/vless/trojan/ss)。"""
+    if not isinstance(obj, dict):
+        raise ValueError("JSON 节点必须是对象")
+    typ = str(obj.get("type") or "").strip().lower()
+    if typ not in _JSON_TYPES:
+        raise ValueError(f"不支持的出站类型: {typ or '(空)'}")
+    if typ == "hysteria2":
+        return _node_from_hy2_json(obj, source)
+    if typ == "vless":
+        return _node_from_vless_json(obj, source)
+    if typ == "trojan":
+        return _node_from_trojan_json(obj, source)
+    return _node_from_ss_json(obj, source)
 
 
 def _extract_json_nodes(data: Any, source: str, raw_text: str) -> tuple[list[dict], list[dict]]:
@@ -351,7 +753,8 @@ def _extract_json_nodes(data: Any, source: str, raw_text: str) -> tuple[list[dic
     for item in candidates:
         if not isinstance(item, dict):
             continue
-        if str(item.get("type") or "").strip().lower() != "hysteria2":
+        typ = str(item.get("type") or "").strip().lower()
+        if typ not in _JSON_TYPES:
             continue  # 完整配置中的 direct/dns 等出站直接跳过
         try:
             nodes.append(_node_from_json(item, source))
@@ -359,8 +762,9 @@ def _extract_json_nodes(data: Any, source: str, raw_text: str) -> tuple[list[dic
             errors.append({"line": None, "input": snippets, "error": str(exc)})
 
     if not nodes and not errors:
-        errors.append({"line": None, "input": snippets, "error": "JSON 中未找到 hysteria2 节点"})
+        errors.append({"line": None, "input": snippets, "error": "JSON 中未找到可导入节点"})
     return nodes, errors
+
 
 
 # ---------------- 批量导入文本 ----------------

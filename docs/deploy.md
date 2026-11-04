@@ -18,10 +18,11 @@
 
 | 项目 | 要求 |
 |------|------|
-| 操作系统 | Ubuntu 22.04 / 24.04（宿主机，双网卡 enp3s0 + wlp2s0） |
+| 操作系统 | Ubuntu 22.04 / 24.04（宿主机，建议双网卡） |
 | 容器环境 | Docker Engine + docker compose 插件 |
-| 虚拟化 | VMware Workstation 17 |
-| 系统工具 | `jq`、`ipset`、NetworkManager（`nmcli`） |
+| 虚拟化 | 可选：VMware Workstation 17（纯宿主见 [bare-metal.md](bare-metal.md)） |
+| 系统工具 | `jq`、`ipset`、NetworkManager（`nmcli`；策略网卡为 Wi‑Fi 时需要） |
+| 访问控制 | API Token（`data/api_token`）；默认仅 `127.0.0.1`，局域网需 `ALLOW_LAN=1` |
 
 > **仅接管 IPv4**：TProxy 规则集只覆盖 iptables（IPv4），IPv6 流量不进隧道。双栈 Wi-Fi 环境下如需避免 IPv6 出口，建议对 Wi-Fi 连接禁用 IPv6：`nmcli connection modify "<连接名>" ipv6.method disabled`。
 

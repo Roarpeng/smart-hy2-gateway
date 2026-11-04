@@ -38,7 +38,7 @@ class NodeParserTestCase(unittest.TestCase):
                 return node
         self.fail("未找到 tag=%r 的节点，实际 tags=%r" % (tag, [n.get("tag") for n in nodes]))
 
-    # 1. 基础 hy2 链接：全部字段
+# 1. 基础 hy2 链接：全部字段
     def test_basic_hy2_link_all_fields(self):
         link = (
             "hy2://secret@node.example.com:8443"
@@ -48,6 +48,7 @@ class NodeParserTestCase(unittest.TestCase):
         node = node_parser.parse_share_link(link)
 
         self.assertTrue(self.NODE_KEYS.issubset(node.keys()), node.keys())
+        self.assertEqual(node["protocol"], "hysteria2")
         self.assertEqual(node["tag"], "Tokyo-01")
         self.assertEqual(node["server"], "node.example.com")
         self.assertEqual(node["port"], 8443)
@@ -62,6 +63,7 @@ class NodeParserTestCase(unittest.TestCase):
 
         node_web = node_parser.parse_share_link(link, source="web")
         self.assertEqual(node_web["source"], "web")
+
 
     # 2. hysteria2 协议名 + allowInsecure 别名 + 大小写不敏感
     def test_hysteria2_scheme_and_allow_insecure_alias(self):
@@ -339,9 +341,12 @@ class NodeParserTestCase(unittest.TestCase):
             "port_hopping": "",
             "source": "clipboard",
         }
+        # 缺省 protocol 与显式 hysteria2 指纹一致
+        with_proto = dict(base)
+        with_proto["protocol"] = "hysteria2"
         self.assertEqual(
             node_parser.node_fingerprint(dict(base)),
-            node_parser.node_fingerprint(dict(base)),
+            node_parser.node_fingerprint(with_proto),
         )
 
         changes = {
@@ -352,6 +357,7 @@ class NodeParserTestCase(unittest.TestCase):
             "obfs_type": "salamander",
             "obfs_password": "changed" + "-obfs",
             "port_hopping": "20000:30000",
+            "protocol": "vless",
         }
         for field, value in changes.items():
             with self.subTest(field=field):
@@ -378,6 +384,236 @@ class NodeParserTestCase(unittest.TestCase):
                 with self.assertRaises((ValueError, RuntimeError), msg=url):
                     node_parser.fetch_subscription(url)
 
+    # 17. vless Reality 分享链接
+    def test_vless_reality_share_link(self):
+        uuid = "11111111-2222-3333-4444-555555555555"
+        link = (
+            f"vless://{uuid}@v.example.com:443"
+            "?encryption=none&flow=xtls-rprx-vision&security=reality"
+            "&sni=www.example.com&fp=chrome&pbk=AbCdEfGh&sid=1a2b"
+            "&type=tcp&spx=%2F#VLESS-R"
+        )
+        node = node_parser.parse_share_link(link)
+        self.assertEqual(node["protocol"], "vless")
+        self.assertEqual(node["tag"], "VLESS-R")
+        self.assertEqual(node["server"], "v.example.com")
+        self.assertEqual(node["port"], 443)
+        self.assertEqual(node["password"], uuid)
+        self.assertEqual(node["uuid"], uuid)
+        self.assertEqual(node["flow"], "xtls-rprx-vision")
+        self.assertEqual(node["encryption"], "none")
+        self.assertEqual(node["transport"], "tcp")
+        self.assertIs(node["tls_enabled"], True)
+        self.assertIs(node["reality_enabled"], True)
+        self.assertEqual(node["reality_public_key"], "AbCdEfGh")
+        self.assertEqual(node["reality_short_id"], "1a2b")
+        self.assertEqual(node["utls_fingerprint"], "chrome")
+        self.assertEqual(node["sni"], "www.example.com")
+        self.assertEqual(node["spider_x"], "/")
+
+    def test_vless_ws_tls_share_link(self):
+        uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        link = (
+            f"vless://{uuid}@ws.example.com:8443"
+            "?encryption=none&security=tls&type=ws&path=%2Fvless"
+            "&host=ws.example.com&sni=ws.example.com&fp=firefox#VLESS-WS"
+        )
+        node = node_parser.parse_share_link(link)
+        self.assertEqual(node["protocol"], "vless")
+        self.assertEqual(node["transport"], "ws")
+        self.assertEqual(node["transport_path"], "/vless")
+        self.assertEqual(node["transport_host"], "ws.example.com")
+        self.assertIs(node["tls_enabled"], True)
+        self.assertIs(node["reality_enabled"], False)
+        self.assertEqual(node["utls_fingerprint"], "firefox")
+
+    def test_vless_reality_requires_pbk(self):
+        with self.assertRaises(ValueError):
+            node_parser.parse_share_link(
+                "vless://11111111-2222-3333-4444-555555555555@x.example.com:443"
+                "?security=reality&type=tcp#bad"
+            )
+
+    # 18. trojan 分享链接
+    def test_trojan_ws_share_link(self):
+        link = (
+            "trojan://trojan-secret@t.example.com:443"
+            "?sni=cdn.example.com&allowInsecure=1&type=ws"
+            "&path=%2Ftrojan&host=cdn.example.com#TR-WS"
+        )
+        node = node_parser.parse_share_link(link)
+        self.assertEqual(node["protocol"], "trojan")
+        self.assertEqual(node["tag"], "TR-WS")
+        self.assertEqual(node["server"], "t.example.com")
+        self.assertEqual(node["password"], "trojan-secret")
+        self.assertEqual(node["sni"], "cdn.example.com")
+        self.assertIs(node["insecure"], True)
+        self.assertEqual(node["transport"], "ws")
+        self.assertEqual(node["transport_path"], "/trojan")
+        self.assertEqual(node["transport_host"], "cdn.example.com")
+        self.assertIs(node["tls_enabled"], True)
+
+    # 19. shadowsocks SIP002 + legacy
+    def test_ss_sip002_base64_userinfo(self):
+        user = base64.urlsafe_b64encode(b"aes-256-gcm:ss-secret").decode("ascii").rstrip("=")
+        link = f"ss://{user}@ss.example.com:8388#SS-SIP002"
+        node = node_parser.parse_share_link(link)
+        self.assertEqual(node["protocol"], "shadowsocks")
+        self.assertEqual(node["tag"], "SS-SIP002")
+        self.assertEqual(node["server"], "ss.example.com")
+        self.assertEqual(node["port"], 8388)
+        self.assertEqual(node["method"], "aes-256-gcm")
+        self.assertEqual(node["obfs_type"], "aes-256-gcm")
+        self.assertEqual(node["password"], "ss-secret")
+
+    def test_ss_sip002_plain_userinfo(self):
+        link = "ss://chacha20-ietf-poly1305:plain-pw@plain.example.com:8388#SS-PLAIN"
+        node = node_parser.parse_share_link(link)
+        self.assertEqual(node["protocol"], "shadowsocks")
+        self.assertEqual(node["method"], "chacha20-ietf-poly1305")
+        self.assertEqual(node["password"], "plain-pw")
+        self.assertEqual(node["server"], "plain.example.com")
+
+    def test_ss_legacy_full_base64(self):
+        payload = base64.urlsafe_b64encode(
+            b"aes-128-gcm:legacy-pw@legacy.example.com:8388"
+        ).decode("ascii").rstrip("=")
+        node = node_parser.parse_share_link(f"ss://{payload}#SS-LEGACY")
+        self.assertEqual(node["protocol"], "shadowsocks")
+        self.assertEqual(node["method"], "aes-128-gcm")
+        self.assertEqual(node["password"], "legacy-pw")
+        self.assertEqual(node["server"], "legacy.example.com")
+        self.assertEqual(node["port"], 8388)
+        self.assertEqual(node["tag"], "SS-LEGACY")
+
+    def test_ss_with_plugin_query(self):
+        user = base64.urlsafe_b64encode(b"aes-256-gcm:plugpw").decode("ascii").rstrip("=")
+        link = f"ss://{user}@p.example.com:8388?plugin=v2ray-plugin%3Bmode%3Dwebsocket%3Bhost%3Dcdn.example.com#SS-P"
+        node = node_parser.parse_share_link(link)
+        self.assertEqual(node["plugin"], "v2ray-plugin")
+        self.assertIn("mode=websocket", node["plugin_opts"])
+
+    # 20. 多协议混合导入 + Clash 仍拒绝
+    def test_mixed_protocol_multiline_import(self):
+        uuid = "11111111-2222-3333-4444-555555555555"
+        user = base64.urlsafe_b64encode(b"aes-256-gcm:mixpw").decode("ascii").rstrip("=")
+        text = "\n".join(
+            [
+                "hy2://hy2pw@hy.example.com:443#HY",
+                f"vless://{uuid}@v.example.com:443?encryption=none&security=tls&type=tcp#VL",
+                "trojan://trpw@t.example.com:443?sni=t.example.com#TR",
+                f"ss://{user}@ss.example.com:8388#SS",
+            ]
+        )
+        nodes, errors = node_parser.parse_import_text(text)
+        self.assertEqual(errors, [])
+        self.assertEqual([n["protocol"] for n in nodes], [
+            "hysteria2", "vless", "trojan", "shadowsocks",
+        ])
+        self.assertEqual([n["tag"] for n in nodes], ["HY", "VL", "TR", "SS"])
+
+    # 21. sing-box JSON 多协议 outbound
+    def test_sing_box_multi_protocol_outbounds(self):
+        config = {
+            "outbounds": [
+                {"type": "direct", "tag": "direct"},
+                {
+                    "type": "hysteria2",
+                    "tag": "json-hy2",
+                    "server": "hy.example.com",
+                    "server_port": 443,
+                    "password": "hy2pw",
+                    "tls": {"enabled": True, "server_name": "hy.example.com"},
+                },
+                {
+                    "type": "vless",
+                    "tag": "json-vless",
+                    "server": "v.example.com",
+                    "server_port": 443,
+                    "uuid": "11111111-2222-3333-4444-555555555555",
+                    "flow": "xtls-rprx-vision",
+                    "tls": {
+                        "enabled": True,
+                        "server_name": "www.example.com",
+                        "utls": {"enabled": True, "fingerprint": "chrome"},
+                        "reality": {
+                            "enabled": True,
+                            "public_key": "PkExample",
+                            "short_id": "abcd",
+                        },
+                    },
+                },
+                {
+                    "type": "trojan",
+                    "tag": "json-trojan",
+                    "server": "t.example.com",
+                    "server_port": 443,
+                    "password": "trpw",
+                    "tls": {"enabled": True, "server_name": "t.example.com", "insecure": True},
+                    "transport": {
+                        "type": "ws",
+                        "path": "/tr",
+                        "headers": {"Host": "t.example.com"},
+                    },
+                },
+                {
+                    "type": "shadowsocks",
+                    "tag": "json-ss",
+                    "server": "ss.example.com",
+                    "server_port": 8388,
+                    "method": "aes-256-gcm",
+                    "password": "sspw",
+                },
+            ]
+        }
+        nodes, errors = node_parser.parse_import_text(json.dumps(config))
+        self.assertEqual(errors, [])
+        by_tag = {n["tag"]: n for n in nodes}
+        self.assertEqual(set(by_tag), {"json-hy2", "json-vless", "json-trojan", "json-ss"})
+
+        hy2 = by_tag["json-hy2"]
+        self.assertEqual(hy2["protocol"], "hysteria2")
+        self.assertEqual(hy2["password"], "hy2pw")
+
+        vl = by_tag["json-vless"]
+        self.assertEqual(vl["protocol"], "vless")
+        self.assertEqual(vl["uuid"], "11111111-2222-3333-4444-555555555555")
+        self.assertEqual(vl["password"], vl["uuid"])
+        self.assertEqual(vl["flow"], "xtls-rprx-vision")
+        self.assertIs(vl["reality_enabled"], True)
+        self.assertEqual(vl["reality_public_key"], "PkExample")
+        self.assertEqual(vl["utls_fingerprint"], "chrome")
+
+        tr = by_tag["json-trojan"]
+        self.assertEqual(tr["protocol"], "trojan")
+        self.assertEqual(tr["transport"], "ws")
+        self.assertEqual(tr["transport_path"], "/tr")
+        self.assertEqual(tr["transport_host"], "t.example.com")
+        self.assertIs(tr["insecure"], True)
+
+        ss = by_tag["json-ss"]
+        self.assertEqual(ss["protocol"], "shadowsocks")
+        self.assertEqual(ss["method"], "aes-256-gcm")
+        self.assertEqual(ss["password"], "sspw")
+
+    def test_sing_box_full_config_sets_protocol(self):
+        config = {
+            "outbounds": [
+                {
+                    "type": "hysteria2",
+                    "tag": "json-node",
+                    "server": "hy.example.com",
+                    "server_port": 8443,
+                    "password": "jsonpw",
+                    "tls": {"enabled": True, "server_name": "cdn.example.com"},
+                }
+            ]
+        }
+        nodes, errors = node_parser.parse_import_text(json.dumps(config))
+        self.assertEqual(errors, [])
+        self.assertEqual(nodes[0]["protocol"], "hysteria2")
+
 
 if __name__ == "__main__":
     unittest.main()
+

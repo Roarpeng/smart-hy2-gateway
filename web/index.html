@@ -17,6 +17,19 @@
 
   <div id="toast-hub" aria-live="polite"></div>
 
+  <div id="auth-gate" class="auth-gate" hidden>
+    <div class="auth-card" role="dialog" aria-labelledby="auth-title">
+      <h2 id="auth-title">API Token</h2>
+      <p class="muted-note">控制台 API 需要 Bearer Token。默认仅监听本机；Token 见 <code>data/api_token</code> 或安装脚本输出。</p>
+      <label class="field"><span>Token</span>
+        <input type="password" id="auth-token-input" class="input" autocomplete="current-password" spellcheck="false"></label>
+      <div class="stage-actions">
+        <button type="button" class="btn btn-primary" id="auth-save-btn">保存并连接</button>
+      </div>
+      <p id="auth-error" class="auth-error" hidden></p>
+    </div>
+  </div>
+
   <div class="shell">
 
     <!-- ================= 侧栏: 身份 / 导航 / 实况 ================= -->
@@ -25,7 +38,7 @@
         <span class="brand-mark">HY2</span>
         <span class="brand-name">Gateway</span>
       </a>
-      <p class="rail-note">本地 Hysteria 2 网关<br>双通道分流 · 规则守护</p>
+      <p class="rail-note">本地多协议网关<br>双通道分流 · 规则守护</p>
 
       <nav class="tabs" aria-label="主导航">
         <button type="button" class="tab active" id="nav-btn-node" onclick="switchTab('node')">节点管理</button>
@@ -100,13 +113,13 @@
               <div class="split">
                 <div class="split-copy">
                   <h2 id="import-title">把节点链接粘进来</h2>
-                  <p>支持 v2rayN 分享链接、Base64 订阅内容、订阅 URL 与 sing-box JSON。一行一条，允许混合粘贴。</p>
+                  <p>支持 hy2 / vless / trojan / ss 分享链接、Base64 订阅、订阅 URL 与 sing-box JSON。一行一条，允许混合粘贴。</p>
                   <p class="muted-note">解析与校验都在后端完成。坏链接会逐条报错，不会覆盖当前可用节点。</p>
                 </div>
                 <div class="split-body">
                   <label class="field" for="raw-link-input">
                     <span>链接、订阅内容或 URL</span>
-                    <textarea id="raw-link-input" class="textarea" rows="5" spellcheck="false" placeholder="hy2://token@node.example.com:443?sni=www.example.com&insecure=0#US_Node&#10;hysteria2://token@node2.example.com:8443?sni=www.example.com&obfs=salamander&obfs-password=...#HK_Node&#10;也可以粘贴 Base64 订阅、v2rayN 订阅 URL 或 sing-box JSON"></textarea>
+                    <textarea id="raw-link-input" class="textarea" rows="5" spellcheck="false" placeholder="hy2://token@node.example.com:443?sni=www.example.com#US&#10;vless://uuid@host:443?security=reality&pbk=...&sni=www.example.com&fp=chrome#VL&#10;trojan://pw@host:443?sni=cdn.example.com#TR&#10;ss://method:pass@host:8388#SS&#10;也可粘贴 Base64 订阅 / URL / sing-box JSON"></textarea>
                   </label>
                   <div class="row import-toolbar">
                     <button type="button" class="btn btn-primary" id="btn-import-nodes" onclick="importNodesFromInput()">解析并导入</button>
@@ -207,10 +220,11 @@
             </div>
             <div class="stage-copy">
               <h1>双通道分流</h1>
-              <p>有线恒直连，无线按策略走隧道。白名单是唯一例外，规则由宿主机 dispatcher 执行。</p>
-              <p class="stage-fact">有线流量不经过代理 · 无线策略 <strong id="stage-policy">白名单例外</strong></p>
+              <p>按角色选择网卡：一条恒直连，一条按策略走隧道。物理网卡与虚拟网卡均可入选。</p>
+              <p class="stage-fact">恒直连永不进隧道 · 策略通道 <strong id="stage-policy">白名单例外</strong></p>
               <div class="stage-actions">
                 <button type="button" class="btn btn-primary" onclick="jumpToChannels()">查看通道配置</button>
+                <button type="button" class="btn btn-quiet" onclick="applySuggestedVmUplinks()">采用建议 VM 映射</button>
               </div>
             </div>
           </div>
@@ -219,22 +233,22 @@
 
             <section class="tile channel channel-direct" data-ui aria-labelledby="channel-a-title">
               <div class="channel-head">
-                <h2 id="channel-a-title">有线</h2>
-                <span class="badge badge-direct">恒直连</span>
+                <h2 id="channel-a-title">恒直连</h2>
+                <span class="badge badge-direct">Direct</span>
               </div>
-              <p class="channel-lead">不过隧道，不看策略。宿主机有线流量与虚拟机 eth0（工控 / 内网）全部直连。</p>
-              <label class="field"><span>RJ45 物理网卡 (VMnet0 桥接目标)</span>
+              <p class="channel-lead">该网卡入/出站在 mangle 层直接 RETURN，永不进隧道。可选以太网、Wi‑Fi 或虚拟网卡。</p>
+              <label class="field"><span>恒直连网卡</span>
                 <select id="cfg-rj45-dev" class="select"></select></label>
             </section>
 
             <section class="tile channel channel-proxy" data-ui aria-labelledby="channel-b-title">
               <div class="channel-head">
-                <h2 id="channel-b-title">无线</h2>
-                <span class="badge badge-proxy">按策略</span>
+                <h2 id="channel-b-title">策略代理</h2>
+                <span class="badge badge-proxy">Managed</span>
               </div>
-              <p class="channel-lead">宿主机 Wi-Fi 流量与虚拟机 eth1（日常互联网）走此通道，由策略与白名单共同决定。</p>
+              <p class="channel-lead">该网卡按下方策略决定是否进隧道。SSID 白名单仅在所选网卡为 Wi‑Fi 时生效。</p>
               <div class="stack">
-                <label class="field"><span>Wi-Fi 网卡 (分流监听)</span>
+                <label class="field"><span>策略代理网卡</span>
                   <select id="cfg-wifi-dev" class="select"></select></label>
                 <label class="field"><span>通道策略</span>
                   <select id="cfg-wifi-policy" class="select">
@@ -249,7 +263,7 @@
               <div class="whitelist-head">
                 <div>
                   <h2 id="whitelist-title">可信 Wi-Fi</h2>
-                  <p class="muted-note">仅在「白名单例外」策略下生效。命中的 SSID 直接绕过隧道。</p>
+                  <p class="muted-note" id="whitelist-note">仅当策略通道为 Wi‑Fi 且策略为「白名单例外」时生效。</p>
                 </div>
                 <span id="policy-match-badge" class="badge badge-direct">状态待检测</span>
               </div>
@@ -257,6 +271,22 @@
               <div class="row whitelist-add">
                 <input type="text" id="input-add-ssid" class="input" placeholder="输入可信 Wi-Fi 的 SSID，例如 Home_Gigabit_5G" aria-label="新增白名单 SSID">
                 <button type="button" class="btn btn-primary" onclick="addWhitelistSsid()">加入白名单</button>
+              </div>
+            </section>
+
+            <section class="tile advanced-panel" data-ui aria-labelledby="vm-uplink-title">
+              <div class="advanced-head">
+                <div>
+                  <h2 id="vm-uplink-title">虚拟机上网映射</h2>
+                  <p class="muted-note">将 VMware 虚拟网卡绑定到恒直连或策略通道，避免手工对照桥接关系。</p>
+                </div>
+              </div>
+              <div class="stack">
+                <label class="field"><span>策略通道 VM 网卡 (兼容旧 vmnet_iface)</span>
+                  <select id="cfg-vmnet-dev" class="select"></select></label>
+                <label class="field"><span>VM 网段 (CIDR)</span>
+                  <input type="text" id="cfg-vmnet-subnet" class="input" value="192.168.100.0/24"></label>
+                <p id="vm-suggest-note" class="muted-note"></p>
               </div>
             </section>
 

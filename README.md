@@ -1,6 +1,6 @@
 # Smart Hy2 Gateway
 
-**Ubuntu 宿主机双通道智能网关**：RJ45 有线恒直连，Wi-Fi 无线自动走 [Hysteria 2](https://v2.hysteria.network/) (QUIC) 隧道——白名单 SSID 例外直连。VMware 虚拟机双网卡分别搭在两条通道上：工控/内网流量桥接直连，日常互联网流量经宿主机透明代理出站。单容器部署，自带 Web 控制台。
+**Ubuntu 宿主机双通道透明代理网关**（v1.1）：按角色自选「恒直连 / 策略代理」网卡（物理或虚拟均可），出站经 [sing-box](https://sing-box.sagernet.org/) 支持 **Hysteria 2 / VLESS(+Reality) / Trojan / Shadowsocks**；可选 VMware 双网卡分流。单容器部署，自带鉴权 Web 控制台。
 
 ![控制台·节点管理页](docs/screenshot-console.png)
 
@@ -10,10 +10,10 @@
 
 | 通道 | 载体 | 策略 | 流量 |
 |---|---|---|---|
-| **A · 有线** | RJ45 网卡（`rj45_iface`） | 恒直连，规则级硬保证（`-i/-o` 显式 RETURN），永不进隧道 | 宿主机有线 + 虚拟机 eth0 (VMnet0 桥接) |
-| **B · 无线** | Wi-Fi 网卡（`wifi_iface`） | `wifi_policy` 三态：`whitelist`（默认，白名单 SSID 例外直连）/ `always_proxy`（强制代理）/ `always_direct`（强制直连） | 宿主机 Wi-Fi + 虚拟机 eth1 (VMnet1 Host-Only) |
+| **A · 恒直连** | 用户自选网卡（字段 `rj45_iface`，介质不限） | 恒直连，mangle `-i/-o` RETURN，永不进隧道 | 常映射到桥接物理口 / 虚拟机直连网卡 |
+| **B · 策略代理** | 用户自选网卡（字段 `wifi_iface`，介质不限） | `wifi_policy` 三态：`whitelist` / `always_proxy` / `always_direct`（SSID 白名单仅 Wi‑Fi 有效） | 常映射到 Wi‑Fi 或 Host-Only VM 上行 |
 
-Wi-Fi 连接事件由 NetworkManager dispatcher 感知，按 `wifi_policy` 与白名单自动写入/清除 iptables TProxy 规则——全程无感切换，断网自动恢复直连。
+策略通道为 Wi‑Fi 时，NetworkManager dispatcher 按 `wifi_policy` 与白名单自动开/关 TProxy；非 Wi‑Fi 时用控制台手动开关或 `always_*` 策略。虚拟网卡可在控制台选择，并尽量标注 VMware 桥接关系。
 
 ## 架构总览
 
@@ -34,17 +34,17 @@ flowchart TB
         MASQ["ip_forward + MASQUERADE<br/>off 态直连兜底"]
 
         subgraph DOCKER["Docker 容器 hy2-gateway（network_mode:host · privileged · NET_ADMIN）"]
-            SB["sing-box 1.11.x<br/>TProxy 入站 :12345 · UID 930 运行"]
-            API["FastAPI :8080<br/>托管 Web 控制台"]
+            SB["sing-box 1.11.x<br/>TProxy :12345 · 多协议出站 · UID 930"]
+            API["FastAPI :8080<br/>Bearer Token · Web 控制台"]
         end
 
-        STATE[("gateway_state.json<br/>白名单 + wifi_policy + 节点列表<br/>权限 600")]
+        STATE[("gateway_state.json + api_token<br/>白名单 + 通道策略 + 节点<br/>权限 600")]
         TIMER["hy2-ruleset-update.timer<br/>每周一 04:30 · ruleset-update.sh<br/>更新 .srs + 重建 ipset hy2_cn"]
     end
 
     subgraph OUT["外部网络"]
         LAN["工控 / 内网"]
-        NODE["Hysteria 2 服务端<br/>QUIC"]
+        NODE["远端节点<br/>Hy2 / VLESS / Trojan / SS"]
         INET["互联网"]
     end
 
@@ -53,16 +53,16 @@ flowchart TB
     ETH0 -->|"VMnet0 二层桥接，不经宿主防火墙"| LAN
     ENP -->|"物理直连"| LAN
     ETH1 -->|"默认路由 via 192.168.100.1"| RULES
-    NM -->|"监听 Wi-Fi 事件"| PS
+    NM -->|"监听策略网卡事件"| PS
     NM -->|"读取白名单 / wifi_policy"| STATE
     PS --> RULES
     PS --> MASQ
     RULES -->|"命中 → TPROXY"| SB
-    SB -->|"Hysteria 2 / QUIC 加密"| NODE
+    SB -->|"加密隧道"| NODE
     NODE --> INET
     RULES -.->|"白名单/直连态：清 TProxy + MASQUERADE 直连"| WLP
     WLP --> INET
-    BROWSER -->|"http://宿主IP:8080"| API
+    BROWSER -->|"http://127.0.0.1:8080 + Token"| API
     API -->|"读写状态"| STATE
     API -->|"sing-box check 通过后重启"| SB
     TIMER -->|".srs 投递 + ipset swap"| SB
@@ -72,15 +72,15 @@ flowchart TB
 
 ## 核心特性
 
-- **双通道自动分流**：通道A 有线恒直连（iptables 规则级硬保证）；通道B 无线按 `wifi_policy` 三态 + SSID 白名单自动开/关 TProxy，事件驱动、断网自动恢复直连。
-- **TProxy 透明代理**：mangle `HY2_PRE`（PREROUTING）+ `HY2_OUT`（OUTPUT）配合 fwmark 1 / table 100 策略路由，宿主机与虚拟机流量无感接管；UID 930 owner 放行杜绝 sing-box 自身回环；`on` 时在 TPROXY/MARK 兜底规则之前插入 `-m set --match-set hy2_cn dst -j RETURN`（HY2_PRE 第 2 条 / HY2_OUT 第 3 条），命中中国 IP 的流量在内核层直接绕过 TProxy、免进用户态转发；ipset `hy2_cn`（hash:net，maxelem 65536）或其数据缺失时仅告警、回落 sing-box 判定（行为与原先相同）——切换脚本绝不 create/destroy/flush 该 set，数据由每周更新脚本原子 swap，swap 后既有 iptables 规则即时命中新数据；`on` 同时 best-effort 设置 `sysctl net.core.default_qdisc=fq`（对 QUIC/Hysteria 2 pacing 友好）。
-- **Hysteria 2 (QUIC) 出站**：sing-box 1.11.x 以专用 UID + `cap_net_admin` 运行，配置经 `sing-box check` 校验通过后才落盘重启，坏配置不破坏运行态。
-- **Web 控制台**（节点管理 / 双通道 / 运行状态三视图；深色控制台外壳，桌面左侧导航、移动端顶部导航；断网自动演示模式、恢复自动回在线）：
-  - **节点管理（v2rayN 式）**：多节点列表与启用切换；首屏显示当前**出口 IP、端口、Hysteria 2 · QUIC 协议与实测延迟**；粘贴单条/多条 v2rayN `hy2://` 分享链接、整段 base64 订阅内容或订阅 URL 批量导入，亦支持 sing-box JSON（完整配置 / 单 outbound）。导入自动去重、标签冲突加后缀，兼容 `hysteria2://`、`allowInsecure` 别名、`pinSHA256`（sing-box 不支持证书锁定，insecure 下显式忽略）、`mport`/`ports` 端口跳跃（需 sing-box 1.11+；带宽缺省 = BBR 自适应）；支持真实延迟测试、编辑 / 重命名 / 删除；连通性分段诊断（DNS / 国内·国际直连 TCP / 节点解析 / 节点 UDP 静默探测）
-  - **双通道**：宿主真实网卡下拉选择（类型过滤）；通道策略三态切换；白名单管理；顶部使用虚化实景背景，不占用配置版面
-  - **运行状态**：sing-box / TProxy 规则实况 / 通道策略 / Wi-Fi 通道四读数，手动启停，运维速查
-- **REST API**：`/api/state` · `/api/apply` · `/api/status` · `/api/proxy` · `/api/interfaces` · `/api/nettest` · `/api/egress`（实测出口公网 IP：代理开启时为隧道出口、关闭时为本地宽带出口） · `/api/nodes`（节点列表） · `/api/nodes/import`（批量导入） · `/api/nodes/{id}/activate`（启用切换） · `PATCH/DELETE /api/nodes/{id}`（编辑 / 删除） · `/api/nodes/test`（真实延迟测试）
-- **地理分流（v2rayN 式「绕过大陆」，三层递进）**：代理开启时 ① **通道策略**——通道A 有线恒直连、白名单 SSID 直连，永不进隧道；② **内核截流**——目的 IP 命中 ipset `hy2_cn` 中国网段即在 mangle 层直接放行，不进 TProxy（见上条）；③ **sing-box 判定**——其余流量由 geosite-cn / geoip-cn 规则集二次识别，中国域名/IP 直连、其余走 Hysteria 2 隧道；DNS 同步拆分——国内域名用 223.5.5.5 解析（CDN 友好），国外域名经隧道解析（防污染）。规则集随镜像内置，**首次启动零外联**；之后每周定时自动更新（见下条）。
+- **双通道角色分流**：恒直连 / 策略代理网卡由用户自选（以太网、Wi‑Fi、vmnet、网桥均可）；SSID 白名单仅在策略网卡为 Wi‑Fi 时生效；控制台可标注并建议 VMware 虚拟网卡映射。
+- **TProxy 透明代理**：mangle `HY2_PRE` + `HY2_OUT` 配合 fwmark / 策略路由；UID 930 防回环；`hy2_cn` 中国 IP 内核直连；`sysctl fq` 对 QUIC pacing 友好。
+- **多协议出站**：sing-box 1.11.x 支持 Hysteria 2、VLESS（含 Reality）、Trojan、Shadowsocks；配置经 `sing-box check` 后才落盘重启。可设备用节点组成 **urltest**，主节点不可用时自动降级。
+- **Web 控制台**（节点 / 双通道 / 运行状态；API Token 门禁；断网演示模式）：
+  - **节点管理**：导入 `hy2://` `vless://` `trojan://` `ss://`、base64 订阅、订阅 URL、sing-box JSON；启用 / 备用 / 延迟测试 / 编辑删除
+  - **双通道**：网卡下拉（含虚拟网卡标签）、策略三态、白名单、VM 上网映射
+  - **运行状态**：sing-box / TProxy / 策略 / Wi‑Fi 读数，手动启停，连通性诊断
+- **REST API**（除 `/api/health` 外需 Bearer Token）：`/api/state` · `/api/apply` · `/api/status` · `/api/proxy` · `/api/interfaces` · `/api/nettest` · `/api/egress` · `/api/nodes*`（含 `…/fallback`）· `/api/nodes/test`
+- **地理分流（绕过大陆）**：通道策略 → ipset `hy2_cn` 内核直连 → sing-box geosite/geoip；DNS 国内/隧道拆分。规则集镜像内置、每周自动更新。
 - **规则集每周自动更新（systemd timer）**：`hy2-ruleset-update.timer` 每周一 04:30 触发（±10 分钟随机抖动，`Persistent=true` 错过补跑）执行 `ruleset-update.sh`：从 SagerNet 官方（sing-geosite / sing-geoip 的 rule-set 分支）下载 `geosite-cn.srs` / `geoip-cn.srs` → 尺寸校验 → 原子替换仓库 `ruleset/` → `docker cp` 投递容器 `/usr/local/share/sing-box/` → 从同一份 `geoip-cn.srs` 用 `sing-box rule-set decompile` 导出 CIDR、原子重建 ipset `hy2_cn`（单一数据源）→ 若代理在开则确保 match 规则在位 → 经后端 `/api/apply` 触发 sing-box 优雅重载。全程 fail-safe：下载失败或校验不过即保留现有规则集，重载前 `sing-box check` 通过才重启进程，坏文件不破坏运行态。`install.sh` 一并安装脚本与 timer（`enable --now`）、检查 `curl`/`jq`/`ipset` 依赖，并在安装尾声 best-effort 首跑一次。
 - **规则守护（rule-guard）**：dispatcher 每次决策落盘期望态，后端每 30s 将 iptables 实况对齐——任何原因（容器重建、系统事件）导致的规则丢失在一个周期内自动恢复；Wi-Fi 波动断连不清规则。
 - **Host-Only 虚拟机直连兜底**：代理关闭时脚本确保 `ip_forward` + MASQUERADE，虚拟机不断网。
@@ -93,23 +93,25 @@ flowchart TB
 git clone https://github.com/Roarpeng/smart-hy2-gateway.git /opt/hy2-gateway
 cd /opt/hy2-gateway
 
-# 2. 安装宿主侧脚本 (TProxy 开关 + NetworkManager 钩子 + 种子状态)
+# 2. 安装宿主侧脚本 (TProxy 开关 + NetworkManager 钩子 + 种子状态 + API Token)
 sudo ./install.sh
 
-# 3. 构建并启动容器
+# 3. 构建并启动容器（默认仅本机访问控制台）
 docker compose up -d --build
+# 局域网访问: ALLOW_LAN=1 docker compose up -d --build
 ```
 
-浏览器打开 `http://宿主IP:8080`：节点管理页粘贴一条或多条 v2rayN 分享链接 / base64 订阅 / 订阅 URL → 导入列表 → 启用节点（自动校验并重启 sing-box）→ 做延迟测试；「双通道」页选好两张网卡与通道策略（默认「走代理·白名单例外」）→ 点「保存网卡配置」；断开重连一次 Wi-Fi 即生效。
+浏览器打开 `http://127.0.0.1:8080`，粘贴 `install.sh` 打印的 API Token（或 `data/api_token`）；导入节点 → 启用（可选「设为备用」）→「双通道」页选择恒直连 / 策略代理网卡 → 保存。策略网卡为 Wi‑Fi 时，断开重连一次即可触发 dispatcher。
 
-> 仅接管 IPv4。VMware 虚拟网络（VMnet0 桥接 / VMnet1 Host-Only）配置见 [docs/vmware-setup.md](docs/vmware-setup.md)。
+> 仅接管 IPv4。纯宿主见 [docs/bare-metal.md](docs/bare-metal.md)；VMware 见 [docs/vmware-setup.md](docs/vmware-setup.md)。
 
 ## 仓库文件
 
 ```
 smart-hy2-gateway/（部署目录 = /opt/hy2-gateway）
-├── README.md · LICENSE
-├── install.sh                       一键安装宿主脚本 + 种子状态 (幂等)
+├── README.md · LICENSE · CHANGELOG.md · SECURITY.md · CONTRIBUTING.md
+├── .github/workflows/               CI + GHCR 镜像发布
+├── install.sh                       一键安装宿主脚本 + 种子状态 + API Token (幂等)
 ├── docker-compose.yml · Dockerfile · entrypoint.sh · requirements.txt
 ├── backend_app.py                   FastAPI 后端 (API + sing-box 进程守护)
 ├── node_parser.py                   分享链接 / base64 订阅 / sing-box JSON 解析与去重
@@ -143,17 +145,23 @@ smart-hy2-gateway/（部署目录 = /opt/hy2-gateway）
 
 ## 安全须知
 
-- **明文口令**：`data/gateway_state.json` 以明文保存全部节点口令，权限 600，仅 root 可读，已列入 `.gitignore`——**严禁提交或拷贝到不可信介质**。
+- **API Token**：`/api/*`（除 `/api/health`）需要 `Authorization: Bearer <token>`。Token 来自环境变量 `GATEWAY_TOKEN` 或文件 `data/api_token`（`install.sh` / 容器首次启动会生成）。控制台首次打开会提示粘贴 Token。
+- **默认本机监听**：Web 默认绑定 `127.0.0.1`；需要局域网访问时设置 `ALLOW_LAN=1`（仍须携带 Token）。
+- **明文口令**：`data/gateway_state.json` 以明文保存全部节点口令，权限 600，仅 root 可读，已列入 `.gitignore`——**严禁提交或拷贝到不可信介质**。API 响应默认打码口令。
 - **订阅拉取 SSRF 防护**：订阅 URL 仅允许 `http/https`，后端在发起请求前拒绝私网、回环、链路本地地址；同时限制超时与响应大小，避免被用作内网探测或内存耗尽入口。
 - **特权容器**：`network_mode: host` + `privileged` 等价于直接操作宿主网络栈，只能在自有可信设备上部署。
-- **WebUI 无鉴权**：:8080 请勿暴露到不可信网络（建议仅局域网/回环访问）。
 - **仅接管 IPv4**：双栈 Wi-Fi 下 IPv6 直连出站；如需封死请对 Wi-Fi 连接 `nmcli connection modify "<名>" ipv6.method disabled`。
 - **排障恢复**：`sudo /usr/local/bin/proxy-switch.sh off` 一键清规则恢复直连。
+- 漏洞披露见 [SECURITY.md](SECURITY.md)。赞助 / 赞赏：GitHub Sponsors（软件 MIT 免费，不卖节点）。
 
 ## 文档
 
 - [docs/deploy.md](docs/deploy.md) — 部署步骤、验证清单、Wi-Fi 切换与策略模式测试、故障排查、卸载
+- [docs/bare-metal.md](docs/bare-metal.md) — 非 VMware 纯宿主精简路径
 - [docs/vmware-setup.md](docs/vmware-setup.md) — Virtual Network Editor、虚拟机 netplan 双网卡、为何 Host-Only 而非 NAT
+- [CHANGELOG.md](CHANGELOG.md) · [SECURITY.md](SECURITY.md) · [CONTRIBUTING.md](CONTRIBUTING.md)
+
+预构建镜像（打 `v*` tag 后推送）：`ghcr.io/<owner>/smart-hy2-gateway`（以仓库 Actions 为准）。
 
 ## License
 

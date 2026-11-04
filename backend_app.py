@@ -34,9 +34,11 @@ from pathlib import Path
 from typing import Literal, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from node_parser import (
     fetch_subscription,
@@ -47,8 +49,9 @@ from node_parser import (
 )
 
 # ---------------- 冻结常量 ----------------
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 STATE_FILE = Path("/data/gateway_state.json")
+TOKEN_FILE = Path("/data/api_token")
 SINGBOX_CONFIG_FILE = Path("/data/singbox.json")
 WEB_DIR = Path("/app/web")
 SINGBOX_BIN = "sing-box"
@@ -62,6 +65,9 @@ STABLE_UPTIME = 60         # 存活超过该秒数则重置崩溃退避
 LAST_DECISION_FILE = Path("/data/last_decision")  # proxy-switch on/off 落盘的期望态
 CURRENT_SSID_FILE = Path("/data/current_ssid")    # 宿主 dispatcher 落盘的当前 SSID
 GUARD_INTERVAL = 30        # 规则守护巡检周期 (秒)
+# API 鉴权: 环境变量 GATEWAY_TOKEN 优先; 否则读/写 /data/api_token
+# 监听: 默认 127.0.0.1; ALLOW_LAN=1 时绑定 0.0.0.0
+AUTH_PUBLIC_PATHS = frozenset({"/api/health"})
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 log = logging.getLogger("hy2-gateway")
@@ -69,12 +75,72 @@ log = logging.getLogger("hy2-gateway")
 app = FastAPI(title="Smart Hysteria 2 Gateway Daemon", version=APP_VERSION)
 
 
+def ensure_api_token() -> str:
+    """返回 API token: 环境变量 > 落盘文件 > 首次生成。"""
+    env_token = (os.environ.get("GATEWAY_TOKEN") or "").strip()
+    if env_token:
+        return env_token
+    try:
+        if TOKEN_FILE.exists():
+            existing = TOKEN_FILE.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing
+    except Exception as exc:
+        log.warning("read api token failed: %s", exc)
+    token = secrets.token_urlsafe(24)
+    try:
+        TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        TOKEN_FILE.write_text(token + "\n", encoding="utf-8")
+        os.chmod(TOKEN_FILE, 0o600)
+        log.info("generated API token at %s (show once via install / docker logs)", TOKEN_FILE)
+    except Exception as exc:
+        log.error("persist api token failed: %s", exc)
+    return token
+
+
+def _extract_bearer(request: Request) -> str:
+    auth = request.headers.get("Authorization") or ""
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    header_token = (request.headers.get("X-Gateway-Token") or "").strip()
+    if header_token:
+        return header_token
+    return (request.query_params.get("token") or "").strip()
+
+
+class GatewayAuthMiddleware(BaseHTTPMiddleware):
+    """保护 /api/* (除 health); 静态控制台仍可加载, 由前端带 Token 调 API。"""
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if path.startswith("/api/") and path not in AUTH_PUBLIC_PATHS:
+            expected = ensure_api_token()
+            provided = _extract_bearer(request)
+            if not provided or not secrets.compare_digest(provided, expected):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "未授权: 需要 Bearer Token (GATEWAY_TOKEN /data/api_token)"},
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+        return await call_next(request)
+
+
+app.add_middleware(GatewayAuthMiddleware)
+
+
+@app.get("/api/health")
+def health():
+    """未鉴权健康检查 (CI / 编排探测)。"""
+    return {"status": "ok", "version": APP_VERSION}
+
+
 # ---------------- 数据模型 (pydantic v2) ----------------
 class Hy2NodeModel(BaseModel):
-    """Hysteria 2 出站节点参数。"""
+    """通用出站节点 (兼容旧 Hy2 字段名; protocol 缺省 hysteria2)。"""
 
     id: str = ""             # 节点唯一 ID (n_xxxxxxxx); 旧状态文件为空, 由 normalize 补齐
     tag: str = "hy2-out"
+    protocol: str = "hysteria2"  # hysteria2 | vless | trojan | shadowsocks
     # server/password 允许空: 无节点时 current_node 需要可校验的空占位,
     # 实际下发前由 _resolve_active_node 拦截 (抛 "未配置可用节点")
     server: str = ""
@@ -82,13 +148,31 @@ class Hy2NodeModel(BaseModel):
     password: str = ""
     sni: str = ""
     insecure: bool = False
-    obfs_type: str = ""      # 为空表示无混淆; 有值时通常为 salamander
+    obfs_type: str = ""      # hy2: salamander; ss: 可镜像 method
     obfs_password: str = ""
     # 带宽仅显式指定时写入配置; None = 缺省 -> BBR 自适应 (v2rayN 导入语义)
     up_mbps: Optional[int] = Field(default=None, ge=0)
     down_mbps: Optional[int] = Field(default=None, ge=0)
     # v2rayN 的 mport/ports 参数 -> sing-box 端口跳跃, 如 "20000:30000" 或 "443:443,8443:8443"
     port_hopping: str = ""
+    # vless / trojan / ss 扩展 (缺省空, 旧 Hy2 状态不受影响)
+    uuid: str = ""
+    flow: str = ""
+    encryption: str = "none"
+    packet_encoding: str = ""
+    transport: str = "tcp"
+    transport_path: str = ""
+    transport_host: str = ""
+    transport_service_name: str = ""
+    tls_enabled: bool = True
+    reality_enabled: bool = False
+    reality_public_key: str = ""
+    reality_short_id: str = ""
+    spider_x: str = ""
+    utls_fingerprint: str = ""
+    method: str = ""
+    plugin: str = ""
+    plugin_opts: str = ""
     source: str = ""           # clipboard / subscription / json / legacy
     created_at: int = 0
 
@@ -101,12 +185,19 @@ class StateModel(BaseModel):
     current_node: Hy2NodeModel = Field(default_factory=Hy2NodeModel)
     nodes: list[Hy2NodeModel] = Field(default_factory=list)
     active_node_id: str = ""
+    # 可选备用节点: 与活跃节点组成 urltest, Hy2(UDP) 失败时可落到 TCP 节点
+    fallback_node_id: str = ""
+    # 通道角色 (字段名兼容旧版): rj45_iface=恒直连网卡, wifi_iface=策略代理网卡
+    # 介质不限: 可为 ethernet / wifi / vmware / bridge
     wifi_iface: str = "wlp2s0"
     rj45_iface: str = "enp3s0"
     vmnet_iface: str = "vmnet1"
     vmnet_subnet: str = "192.168.100.0/24"
-    # Wi-Fi 通道策略 (顶层, 双通道模型):
-    #   whitelist     = 默认走代理, 白名单 SSID 例外直连
+    # 可选多条 VM 上行: [{vm_iface, bind: direct|managed, subnet}]
+    # 缺省时由 vmnet_iface+vmnet_subnet 归一化为一条 bind=managed
+    vm_uplinks: list[dict] = Field(default_factory=list)
+    # 策略通道策略 (顶层):
+    #   whitelist     = 默认走代理, 白名单 SSID 例外直连 (仅 managed 为 wifi 时有意义)
     #   always_proxy  = 强制代理 (忽略白名单)
     #   always_direct = 强制直连
     wifi_policy: Literal["whitelist", "always_proxy", "always_direct"] = "whitelist"
@@ -119,6 +210,7 @@ class NodePatchModel(BaseModel):
     """PATCH /api/nodes/{id} 请求体: 所有字段可选, 只更新显式传入的字段。"""
 
     tag: Optional[str] = None
+    protocol: Optional[str] = None
     server: Optional[str] = None
     port: Optional[int] = Field(default=None, ge=1, le=65535)
     password: Optional[str] = None
@@ -129,6 +221,17 @@ class NodePatchModel(BaseModel):
     up_mbps: Optional[int] = Field(default=None, ge=0)
     down_mbps: Optional[int] = Field(default=None, ge=0)
     port_hopping: Optional[str] = None
+    method: Optional[str] = None
+    uuid: Optional[str] = None
+    flow: Optional[str] = None
+    transport: Optional[str] = None
+    transport_path: Optional[str] = None
+    transport_host: Optional[str] = None
+    reality_enabled: Optional[bool] = None
+    reality_public_key: Optional[str] = None
+    reality_short_id: Optional[str] = None
+    utls_fingerprint: Optional[str] = None
+    tls_enabled: Optional[bool] = None
 
 
 class NodeImportModel(BaseModel):
@@ -177,13 +280,22 @@ def atomic_write_json(path: Path, data: dict, mode: int = 0o600, gid: Optional[i
 
 # ---------------- 多节点状态归一化 ----------------
 NODE_FIELDS = (
-    "tag", "server", "port", "password", "sni", "insecure",
+    "tag", "protocol", "server", "port", "password", "sni", "insecure",
     "obfs_type", "obfs_password", "up_mbps", "down_mbps", "port_hopping",
+    "uuid", "flow", "encryption", "packet_encoding", "transport",
+    "transport_path", "transport_host", "transport_service_name",
+    "tls_enabled", "reality_enabled", "reality_public_key", "reality_short_id",
+    "spider_x", "utls_fingerprint", "method", "plugin", "plugin_opts",
 )
 _NODE_DEFAULTS = {
-    "tag": "", "server": "", "port": 443, "password": "", "sni": "",
+    "tag": "", "protocol": "hysteria2", "server": "", "port": 443, "password": "", "sni": "",
     "insecure": False, "obfs_type": "", "obfs_password": "",
     "up_mbps": None, "down_mbps": None, "port_hopping": "",
+    "uuid": "", "flow": "", "encryption": "none", "packet_encoding": "",
+    "transport": "tcp", "transport_path": "", "transport_host": "",
+    "transport_service_name": "", "tls_enabled": True, "reality_enabled": False,
+    "reality_public_key": "", "reality_short_id": "", "spider_x": "",
+    "utls_fingerprint": "", "method": "", "plugin": "", "plugin_opts": "",
 }
 
 # 延迟测试结果缓存 (仅内存, 不落盘)
@@ -252,6 +364,12 @@ def normalize_state_dict(data: dict) -> dict:
         for key, default in _NODE_DEFAULTS.items():
             if key not in node:
                 node[key] = default
+        proto = str(node.get("protocol") or "hysteria2").strip().lower() or "hysteria2"
+        if proto == "hy2":
+            proto = "hysteria2"
+        if proto == "ss":
+            proto = "shadowsocks"
+        node["protocol"] = proto
         nid = str(node.get("id") or "").strip()
         if not nid or nid in used_ids:
             nid = _new_node_id(used_ids)
@@ -287,6 +405,32 @@ def normalize_state_dict(data: dict) -> dict:
 
     out["nodes"] = nodes
     out["active_node_id"] = active
+
+    # VM 上行: 兼容旧 vmnet_iface/subnet → 单条 managed
+    raw_uplinks = src.get("vm_uplinks")
+    uplinks: list[dict] = []
+    if isinstance(raw_uplinks, list):
+        for item in raw_uplinks:
+            if not isinstance(item, dict):
+                continue
+            vm_iface = str(item.get("vm_iface") or "").strip()
+            bind = str(item.get("bind") or "managed").strip().lower()
+            if bind not in ("direct", "managed"):
+                bind = "managed"
+            subnet = str(item.get("subnet") or "").strip()
+            if vm_iface:
+                uplinks.append({"vm_iface": vm_iface, "bind": bind, "subnet": subnet})
+    if not uplinks:
+        legacy_iface = str(src.get("vmnet_iface") or out.get("vmnet_iface") or "").strip()
+        legacy_subnet = str(src.get("vmnet_subnet") or out.get("vmnet_subnet") or "192.168.100.0/24").strip()
+        if legacy_iface:
+            uplinks = [{"vm_iface": legacy_iface, "bind": "managed", "subnet": legacy_subnet}]
+    out["vm_uplinks"] = uplinks
+    if uplinks:
+        managed = next((u for u in uplinks if u["bind"] == "managed"), uplinks[0])
+        out["vmnet_iface"] = managed["vm_iface"]
+        if managed.get("subnet"):
+            out["vmnet_subnet"] = managed["subnet"]
     return out
 
 
@@ -326,9 +470,18 @@ def _resolve_active_node(state: StateModel) -> Optional[Hy2NodeModel]:
     return None
 
 
-def _public_node(node: dict) -> dict:
-    """节点对外视图 + 内存延迟测试结果。"""
+def _public_node(node: dict, reveal: bool = False) -> dict:
+    """节点对外视图: 默认打码口令; reveal=True 时返回明文 (需已鉴权)。"""
     out = dict(node)
+    pwd = str(out.get("password") or "")
+    obfs = str(out.get("obfs_password") or "")
+    out["password_set"] = bool(pwd.strip())
+    out["obfs_password_set"] = bool(obfs.strip())
+    if not reveal:
+        if pwd:
+            out["password"] = "***"
+        if obfs:
+            out["obfs_password"] = "***"
     with _latency_lock:
         cached = _latency_cache.get(str(node.get("id") or ""))
     if cached:
@@ -346,6 +499,55 @@ def _public_node(node: dict) -> dict:
     return out
 
 
+def _public_state(data: dict, reveal: bool = False) -> dict:
+    """状态 API 视图: 打码节点口令, 永不回传 api_token。"""
+    out = dict(data)
+    out.pop("api_token", None)
+    nodes = out.get("nodes")
+    if isinstance(nodes, list):
+        out["nodes"] = [
+            _public_node(n, reveal=reveal) if isinstance(n, dict) else n for n in nodes
+        ]
+    current = out.get("current_node")
+    if isinstance(current, dict):
+        out["current_node"] = _public_node(current, reveal=reveal)
+    return out
+
+
+def _transport_object(node: Hy2NodeModel) -> Optional[dict]:
+    transport = (node.transport or "tcp").strip().lower()
+    if transport in ("", "tcp"):
+        return None
+    obj: dict = {"type": transport}
+    if transport in ("ws", "http", "httpupgrade") and node.transport_path:
+        obj["path"] = node.transport_path
+    if transport in ("ws", "http", "httpupgrade") and node.transport_host:
+        obj["headers"] = {"Host": node.transport_host}
+    if transport == "grpc" and node.transport_service_name:
+        obj["service_name"] = node.transport_service_name
+    return obj
+
+
+def _tls_object(node: Hy2NodeModel, *, force: bool = False) -> Optional[dict]:
+    enabled = force or bool(node.tls_enabled) or bool(node.reality_enabled)
+    if not enabled:
+        return None
+    tls: dict = {
+        "enabled": True,
+        "server_name": node.sni if node.sni else node.server,
+        "insecure": bool(node.insecure),
+    }
+    if node.utls_fingerprint:
+        tls["utls"] = {"enabled": True, "fingerprint": node.utls_fingerprint}
+    if node.reality_enabled:
+        tls["reality"] = {
+            "enabled": True,
+            "public_key": node.reality_public_key,
+            "short_id": node.reality_short_id or "",
+        }
+    return tls
+
+
 def build_hy2_outbound(node: Hy2NodeModel) -> dict:
     """单个 hysteria2 出站 (主配置与延迟测试临时配置共用)。"""
     outbound: dict = {
@@ -356,21 +558,17 @@ def build_hy2_outbound(node: Hy2NodeModel) -> dict:
         "password": node.password,
         "tls": {
             "enabled": True,
-            "server_name": node.sni if node.sni else node.server,  # SNI 为空则回退 server
+            "server_name": node.sni if node.sni else node.server,
             "insecure": node.insecure,
         },
     }
     if node.obfs_type:
         outbound["obfs"] = {"type": node.obfs_type, "password": node.obfs_password}
-    # 带宽仅显式指定时写入: 缺省 = BBR (v2rayN 语义: 链接不带 upmbps/downmbps 即不指定)
     if node.up_mbps:
         outbound["up_mbps"] = node.up_mbps
     if node.down_mbps:
         outbound["down_mbps"] = node.down_mbps
     if node.port_hopping:
-        # v2rayN mport/ports -> sing-box >=1.11 端口跳跃
-        # sing-box 1.11 的 server_ports 要求冒号区间 (如 "20000:30000");
-        # 内部已由 normalize_port_hopping 统一为冒号格式
         outbound["server_ports"] = [
             seg.strip()
             for seg in node.port_hopping.split(",")
@@ -380,12 +578,116 @@ def build_hy2_outbound(node: Hy2NodeModel) -> dict:
     return outbound
 
 
+def build_vless_outbound(node: Hy2NodeModel) -> dict:
+    uuid = (node.uuid or node.password or "").strip()
+    outbound: dict = {
+        "type": "vless",
+        "tag": node.tag,
+        "server": node.server,
+        "server_port": node.port,
+        "uuid": uuid,
+    }
+    if node.flow:
+        outbound["flow"] = node.flow
+    if node.packet_encoding:
+        outbound["packet_encoding"] = node.packet_encoding
+    tls = _tls_object(node)
+    if tls:
+        outbound["tls"] = tls
+    transport = _transport_object(node)
+    if transport:
+        outbound["transport"] = transport
+    return outbound
+
+
+def build_trojan_outbound(node: Hy2NodeModel) -> dict:
+    outbound: dict = {
+        "type": "trojan",
+        "tag": node.tag,
+        "server": node.server,
+        "server_port": node.port,
+        "password": node.password,
+    }
+    tls = _tls_object(node, force=True)
+    if tls:
+        outbound["tls"] = tls
+    transport = _transport_object(node)
+    if transport:
+        outbound["transport"] = transport
+    return outbound
+
+
+def build_shadowsocks_outbound(node: Hy2NodeModel) -> dict:
+    method = (node.method or node.obfs_type or "").strip()
+    outbound: dict = {
+        "type": "shadowsocks",
+        "tag": node.tag,
+        "server": node.server,
+        "server_port": node.port,
+        "method": method,
+        "password": node.password,
+    }
+    if node.plugin:
+        outbound["plugin"] = node.plugin
+        if node.plugin_opts:
+            outbound["plugin_opts"] = node.plugin_opts
+    return outbound
+
+
+def build_outbound(node: Hy2NodeModel) -> dict:
+    """按 protocol 分发 sing-box outbound。"""
+    proto = (node.protocol or "hysteria2").strip().lower() or "hysteria2"
+    if proto in ("hysteria2", "hy2"):
+        return build_hy2_outbound(node)
+    if proto == "vless":
+        return build_vless_outbound(node)
+    if proto == "trojan":
+        return build_trojan_outbound(node)
+    if proto in ("shadowsocks", "ss"):
+        return build_shadowsocks_outbound(node)
+    raise ValueError(f"不支持的协议: {proto}")
+
+
+def _find_node_by_id(state: StateModel, node_id: str) -> Optional[Hy2NodeModel]:
+    nid = str(node_id or "").strip()
+    if not nid:
+        return None
+    for node in state.nodes:
+        if node.id == nid and node.server.strip() and node.password.strip():
+            return node
+    return None
+
+
 def build_singbox_config(state: StateModel) -> dict:
     """按状态中的活跃节点生成 sing-box 1.11.x (legacy DNS schema) 运行配置。"""
     node = _resolve_active_node(state)
     if node is None:
         raise ValueError("未配置可用节点")
-    hy2_outbound = build_hy2_outbound(node)
+    primary = build_outbound(node)
+    fallback = _find_node_by_id(state, getattr(state, "fallback_node_id", "") or "")
+    if fallback and fallback.id != node.id:
+        # 主备 urltest: 探测失败自动落到 TCP 备用 (抗公司网禁 UDP)
+        fb_out = build_outbound(fallback)
+        # 避免 tag 冲突
+        if fb_out["tag"] == primary["tag"]:
+            fb_out["tag"] = fallback.tag + "-fb"
+        outbounds_extra = [primary, fb_out]
+        final_tag = "auto-out"
+        urltest = {
+            "type": "urltest",
+            "tag": final_tag,
+            "outbounds": [primary["tag"], fb_out["tag"]],
+            "url": "https://www.gstatic.com/generate_204",
+            "interval": "3m",
+            "tolerance": 100,
+        }
+        route_final = final_tag
+        dns_detour = final_tag
+        proxy_outbounds = outbounds_extra + [urltest]
+    else:
+        route_final = node.tag
+        dns_detour = node.tag
+        proxy_outbounds = [primary]
 
     import ipaddress as _ipaddress
 
@@ -420,7 +722,7 @@ def build_singbox_config(state: StateModel) -> dict:
                 # 国外域名经隧道 DoH 解析: 本链路实测 UDP 53 会出现 5-10s
                 # 超时 (丢包后重传不可控), 而 DoH 走 TCP 443 有重传保障,
                 # 冷启动约 0.5-0.8s, 命中缓存后约 1 RTT; TCP 443 也几乎不被节点封。
-                {"tag": "proxy-dns", "address": "https://1.1.1.1/dns-query", "detour": node.tag},
+                {"tag": "proxy-dns", "address": "https://1.1.1.1/dns-query", "detour": dns_detour},
             ],
             "rules": dns_rules,
             "final": "proxy-dns",
@@ -429,46 +731,24 @@ def build_singbox_config(state: StateModel) -> dict:
             {
                 "type": "tproxy",
                 "tag": "tproxy-in",
-                "listen": "::",                 # 双栈监听, 端口由状态文件驱动
+                "listen": "::",
                 "listen_port": state.tproxy_port,
                 "sniff": True,
-                # 只嗅探、不覆盖目标地址。覆盖会把 metadata.Destination 变成域名,
-                # 导致 geoip-cn 规则(按 IP 匹配)永远不命中, 中国 IP 全被塞进隧道
-                # (实测 5k+ 次被节点 rejected)。DNS 污染改由下面的 hijack-dns
-                # 拆分解析解决, 客户端拿到的一定是干净 IP。
                 "sniff_override_destination": False,
             }
         ],
-        "outbounds": [hy2_outbound, {"type": "direct", "tag": "direct"},
-                      # dns-out 出站: 把 protocol=dns 的包移交上方拆分 DNS 模块应答。
-                      # 必须用本 legacy 形态 —— 1.11 的 action:"hijack-dns" 在 legacy
-                      # DNS schema 下不生效, DNS 包会被地理规则当普通流量分流:
-                      # 发往国内 DNS(如 223.5.5.5)直连取污染缓存, 发往国外 DNS 走隧道,
-                      # 表现为"不同上游拿到不同答案"且被污染域名永远解析到假 IP
-                      {"type": "dns", "tag": "dns-out"}],
-        # 地理分流 (v2rayN 式"绕过大陆"): 中国域名/IP 直连, 其余走 Hysteria 2 隧道;
-        # 规则集为镜像内置本地文件, 运行时零下载依赖
+        "outbounds": proxy_outbounds + [
+            {"type": "direct", "tag": "direct"},
+            {"type": "dns", "tag": "dns-out"},
+        ],
         "route": {
             "auto_detect_interface": True,
             "rules": [
-                # DNS 劫持双保险 —— 端口级强制 + 协议嗅探兜底:
-                # 1) port:53 规则不依赖载荷嗅探, 直接命中, 杜绝 UDP DNS
-                #    "嗅探竞态漏网后被 geoip 规则当普通流量转发"的污染路径
-                #    (实测表现为: 查询已被劫持记录, 但 gemini 等域名仍解析到
-                #    轮换假 IP, 且 POSTROUTING 计数器抓到明文 53 端口包出主机)
-                # 2) protocol:dns 兜底非 53 端口的 DNS 形态
-                # 两者都移交 dns-out → 拆分 DNS 应答: 国内域名走 223.5.5.5,
-                # 国外域名走隧道内 DNS (防污染), 客户端只拿干净 IP
                 {"port": 53, "outbound": "dns-out"},
                 {"protocol": "dns", "outbound": "dns-out"},
-                # Windows 联网探测走直连, 否则节点拒绝该域名时 Windows 会
-                # 把整条链路标记为"无 Internet", 浏览器表现为完全没网
                 {"domain_suffix": [".msftconnecttest.com", ".msftncsi.com"],
                  "outbound": "direct"},
-                # Google 域族走隧道 (先于 geosite-cn, 理由见 dns_rules 处注释):
-                # 被 geosite-cn 收录的 google 域名若按"中国域名直连"处理,
-                # 目标是全球被墙 IP, 必超时 —— VM Chrome 后台服务反复失败实测根因
-                {"domain_keyword": _google_keywords, "outbound": node.tag},
+                {"domain_keyword": _google_keywords, "outbound": route_final},
                 {"rule_set": ["geosite-cn"], "outbound": "direct"},
                 {"rule_set": ["geoip-cn"], "outbound": "direct"},
             ],
@@ -478,7 +758,7 @@ def build_singbox_config(state: StateModel) -> dict:
                 {"type": "local", "tag": "geoip-cn", "format": "binary",
                  "path": f"{RULE_SET_DIR}/geoip-cn.srs"},
             ],
-            "final": node.tag,
+            "final": route_final,
         },
     }
 
@@ -871,11 +1151,11 @@ def rule_guard_loop() -> None:
 
 # ---------------- API 路由 (先于静态挂载注册) ----------------
 @app.get("/api/state")
-def get_state():
-    """返回归一化后的状态文件完整内容; 未初始化时给出标记。"""
+def get_state(reveal: bool = False):
+    """返回归一化后的状态; 默认打码节点口令。"""
     if not STATE_FILE.exists():
         return {"status": "uninitialized"}
-    return _load_state_dict()
+    return _public_state(_load_state_dict(), reveal=reveal)
 
 
 def proxy_switch_env() -> dict:
@@ -1080,12 +1360,42 @@ def _redact_text(text: str) -> str:
 
 
 @app.get("/api/nodes")
-def list_nodes():
-    """节点列表 + 活跃节点 + 内存中的延迟测试结果。"""
+def list_nodes(reveal: bool = False):
+    """节点列表 + 活跃/备用节点 + 内存中的延迟测试结果; 默认打码口令。"""
     data = _load_state_dict()
     return {
         "active_node_id": data.get("active_node_id", ""),
-        "nodes": [_public_node(node) for node in data["nodes"]],
+        "fallback_node_id": data.get("fallback_node_id", ""),
+        "nodes": [_public_node(node, reveal=reveal) for node in data["nodes"]],
+    }
+
+
+@app.post("/api/nodes/{node_id}/fallback")
+def set_fallback_node(node_id: str):
+    """设置或清除 urltest 备用节点; node_id='-' 或 'none' 表示清除。"""
+    data = _load_state_dict(persist=False)
+    raw = str(node_id or "").strip()
+    if raw in ("-", "none", "clear", ""):
+        data["fallback_node_id"] = ""
+    else:
+        target = next((n for n in data["nodes"] if n["id"] == raw), None)
+        if target is None:
+            raise HTTPException(status_code=404, detail="节点不存在")
+        if raw == data.get("active_node_id"):
+            raise HTTPException(status_code=422, detail="备用节点不能与活跃节点相同")
+        data["fallback_node_id"] = raw
+    data = normalize_state_dict(data)
+    try:
+        state = StateModel.model_validate(data)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"状态非法: {exc}")
+    # 有活跃节点时重载配置以生效 urltest; 否则只落盘
+    restart = _resolve_active_node(state) is not None
+    message = commit_state(state, restart=restart)
+    return {
+        "status": "success",
+        "message": message,
+        "fallback_node_id": data.get("fallback_node_id", ""),
     }
 
 
@@ -1491,7 +1801,7 @@ def test_node_latency(node: Hy2NodeModel) -> dict:
                     "secret": secret,
                 }
             },
-            "outbounds": [build_hy2_outbound(test_node), {"type": "direct", "tag": "direct"}],
+            "outbounds": [build_outbound(test_node), {"type": "direct", "tag": "direct"}],
             "route": {"final": tag},
         }
         # 临时配置文件由 tempfile 命名 (目录 mkdtemp + 文件名自动生成,
@@ -1722,30 +2032,141 @@ def proxy_switch(body: ProxyActionModel):
 
 
 # ---------------- 网卡枚举与连通性测试 ----------------
-def list_host_interfaces() -> list[dict]:
-    """枚举宿主网络接口。
+def _parse_vmware_networking() -> dict[str, dict]:
+    """解析 /etc/vmware/networking → {vmnetN: {mode, bridge}}。"""
+    path = Path("/etc/vmware/networking")
+    result: dict[str, dict] = {}
+    if not path.is_file():
+        return result
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return result
+    current: Optional[str] = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # answer VNET_N_NAME vmnetN / answer VNET_N_VIRTUALDEV vmnetN
+        m = re.search(r"VNET_(\d+)_NAME\s+(\S+)", line, re.I)
+        if m:
+            current = m.group(2)
+            result.setdefault(current, {"mode": "", "bridge": ""})
+            continue
+        m = re.search(r"VNET_(\d+)_VIRTUALDEV\s+(\S+)", line, re.I)
+        if m:
+            current = m.group(2)
+            result.setdefault(current, {"mode": "", "bridge": ""})
+            continue
+        if current is None:
+            # answer VNET_1_BRIDGED yes / HOSTONLY / NAT
+            continue
+        if re.search(r"VNET_\d+_BRIDGED\s+yes", line, re.I):
+            result[current]["mode"] = "bridged"
+        elif re.search(r"VNET_\d+_HOSTONLYNETWORKING\s+yes", line, re.I):
+            result[current]["mode"] = "hostonly"
+        elif re.search(r"VNET_\d+_NAT\s+yes", line, re.I):
+            result[current]["mode"] = "nat"
+        m = re.search(r"VNET_\d+_BRIDGE\s+(\S+)", line, re.I)
+        if m:
+            result[current]["bridge"] = m.group(1)
+            result[current]["mode"] = result[current].get("mode") or "bridged"
+    # 常见默认: vmnet0 bridged, vmnet1 hostonly, vmnet8 nat
+    for name, defaults in (("vmnet0", "bridged"), ("vmnet1", "hostonly"), ("vmnet8", "nat")):
+        if name not in result and Path(f"/sys/class/net/{name}").exists():
+            result[name] = {"mode": defaults, "bridge": ""}
+    return result
 
-    容器以 host 网络模式运行, /sys/class/net 即宿主视图;
-    kind 用于前端下拉分组 (以太网/无线/VMware/网桥/隧道/回环)。
+
+def _iface_ipv4(name: str) -> str:
+    try:
+        r = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show", "dev", name],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode != 0:
+            return ""
+        m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+/\d+)", r.stdout)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
+def _iface_operstate(name: str) -> str:
+    try:
+        return Path(f"/sys/class/net/{name}/operstate").read_text(encoding="utf-8").strip()
+    except Exception:
+        return "unknown"
+
+
+def list_host_interfaces() -> list[dict]:
+    """枚举宿主网络接口 (含 enrichment: 地址/桥接标注/建议角色)。
+
+    容器以 host 网络模式运行, /sys/class/net 即宿主视图。
     """
+    vmware = _parse_vmware_networking()
     base = Path("/sys/class/net")
     out: list[dict] = []
     if base.is_dir():
         for p in sorted(base.iterdir()):
             name = p.name
             if name.startswith("veth") or (p / "bridge").is_dir():
-                kind = "bridge"          # docker / libvirt 虚拟网桥及 veth
+                kind = "bridge"
             elif (p / "phy80211").exists():
                 kind = "wifi"
             elif (p / "tun_flags").exists() or name.startswith(("tun", "tap", "wg", "zt")):
-                kind = "tunnel"          # 内核 tun_flags 存在即为 tun/tap 设备
+                kind = "tunnel"
             elif name.startswith("vmnet"):
                 kind = "vmware"
             elif name == "lo":
                 kind = "loopback"
             else:
                 kind = "ethernet"
-            out.append({"name": name, "kind": kind})
+            ipv4 = _iface_ipv4(name)
+            operstate = _iface_operstate(name)
+            label_parts = [name]
+            bridge_to = ""
+            vm_mode = ""
+            if kind == "vmware":
+                info = vmware.get(name) or {}
+                vm_mode = str(info.get("mode") or "")
+                bridge_to = str(info.get("bridge") or "")
+                if vm_mode == "bridged" and bridge_to:
+                    label_parts.append(f"桥接 → {bridge_to}")
+                elif vm_mode == "bridged":
+                    label_parts.append("桥接")
+                elif vm_mode == "hostonly":
+                    label_parts.append("Host-Only")
+                elif vm_mode == "nat":
+                    label_parts.append("NAT")
+                else:
+                    label_parts.append("VMware")
+            elif kind == "wifi":
+                label_parts.append("Wi-Fi")
+            elif kind == "ethernet":
+                label_parts.append("以太网")
+            elif kind == "bridge":
+                label_parts.append("网桥")
+            if ipv4:
+                label_parts.append(ipv4)
+            if operstate and operstate not in ("unknown",):
+                label_parts.append(operstate.upper())
+            suggest = ""
+            if kind == "vmware":
+                if vm_mode == "bridged":
+                    suggest = "direct"
+                elif vm_mode == "hostonly":
+                    suggest = "managed"
+            out.append({
+                "name": name,
+                "kind": kind,
+                "label": " · ".join(label_parts),
+                "ipv4": ipv4,
+                "operstate": operstate,
+                "bridge_to": bridge_to,
+                "vm_mode": vm_mode,
+                "suggest_role": suggest,
+            })
     order = {"ethernet": 0, "wifi": 1, "vmware": 2, "bridge": 3, "tunnel": 4, "other": 5, "loopback": 6}
     out.sort(key=lambda x: (order.get(x["kind"], 9), x["name"]))
     return out
@@ -1753,8 +2174,39 @@ def list_host_interfaces() -> list[dict]:
 
 @app.get("/api/interfaces")
 def get_interfaces():
-    """供控制台网卡下拉选择: 返回宿主机全部网络接口及分类。"""
-    return {"interfaces": list_host_interfaces()}
+    """供控制台网卡下拉: 接口列表 + 建议的 VM 双网卡映射。"""
+    ifaces = list_host_interfaces()
+    by_name = {i["name"]: i for i in ifaces}
+    suggestions: list[dict] = []
+    for i in ifaces:
+        if i["kind"] != "vmware":
+            continue
+        if i.get("suggest_role") == "direct":
+            suggestions.append({
+                "vm_iface": i["name"],
+                "bind": "direct",
+                "subnet": "",
+                "reason": f"{i['name']} 桥接物理口 → 建议绑定恒直连通道",
+            })
+        elif i.get("suggest_role") == "managed":
+            subnet = "192.168.100.0/24" if i["name"] == "vmnet1" else ""
+            if i.get("ipv4") and "/" in i["ipv4"]:
+                # 粗略: x.y.z.w/24 → x.y.z.0/24
+                ip, prefix = i["ipv4"].split("/", 1)
+                parts = ip.split(".")
+                if len(parts) == 4 and prefix == "24":
+                    subnet = f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+            suggestions.append({
+                "vm_iface": i["name"],
+                "bind": "managed",
+                "subnet": subnet or "192.168.100.0/24",
+                "reason": f"{i['name']} Host-Only/策略上行 → 建议绑定策略通道",
+            })
+    return {
+        "interfaces": ifaces,
+        "suggestions": suggestions,
+        "note": "通道角色自选: Direct=恒直连, Managed=策略代理; 不限定 RJ45/Wi-Fi",
+    }
 
 
 @app.post("/api/nettest")
@@ -1946,8 +2398,15 @@ if WEB_DIR.is_dir():
 
 # ---------------- 启动入口 ----------------
 def main() -> None:
-    web_host = os.environ.get("WEB_HOST", "0.0.0.0")
+    allow_lan = (os.environ.get("ALLOW_LAN") or "").strip().lower() in ("1", "true", "yes", "on")
+    default_host = "0.0.0.0" if allow_lan else "127.0.0.1"
+    web_host = os.environ.get("WEB_HOST", default_host)
     web_port = int(os.environ.get("WEB_PORT", "8080"))
+    token = ensure_api_token()
+    log.info(
+        "API auth enabled (token length=%d); bind %s:%d (ALLOW_LAN=%s)",
+        len(token), web_host, web_port, allow_lan,
+    )
 
     # 启动恢复: 状态文件存在则归一化并生成配置; 无活跃节点时不写坏配置
     if STATE_FILE.exists():

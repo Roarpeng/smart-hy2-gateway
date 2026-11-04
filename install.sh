@@ -48,6 +48,7 @@ DST_DISPATCHER="$DISPATCHER_DIR/99-wifi-proxy.sh"
 
 STATE_DIR=/opt/hy2-gateway/data
 STATE_FILE="$STATE_DIR/gateway_state.json"
+TOKEN_FILE="$STATE_DIR/api_token"
 
 # --- root 检查 ---
 if [[ $EUID -ne 0 ]]; then
@@ -171,6 +172,23 @@ EOF
     echo "     (current_node 为占位值: 后端下发节点前 sing-box 不启动, 属预期行为)"
 fi
 
+# --- API Token (控制台 /api 鉴权; 不覆盖已有) ---
+if [[ -f "$TOKEN_FILE" ]] && [[ -s "$TOKEN_FILE" ]]; then
+    echo "[跳过] API Token 已存在: $TOKEN_FILE"
+else
+    umask 077
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -base64 24 | tr -d '\n' > "$TOKEN_FILE"
+    else
+        head -c 32 /dev/urandom | base64 | tr -d '\n' > "$TOKEN_FILE"
+    fi
+    echo >> "$TOKEN_FILE"
+    chown root:root "$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+    echo "[OK] 已生成 API Token: $TOKEN_FILE"
+fi
+INSTALL_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE" 2>/dev/null || true)"
+
 # --- JSON 合法性校验 (尽力) ---
 if command -v jq >/dev/null 2>&1; then
     if ! jq empty "$STATE_FILE" >/dev/null 2>&1; then
@@ -195,11 +213,16 @@ cat <<EOF
  安装完成。后续步骤:
    1. 启动后端容器 (仓库部署目录 /opt/hy2-gateway):
         docker compose up -d --build
-   2. 打开管理控制台:
-        http://$HOST_IP:8080
-   3. 查看 Wi-Fi 事件与代理切换日志:
+        # 可选: ALLOW_LAN=1 GATEWAY_TOKEN=... docker compose up -d --build
+   2. 打开管理控制台 (默认仅本机; 局域网需 ALLOW_LAN=1):
+        http://127.0.0.1:8080
+        # 或 http://$HOST_IP:8080 (需 ALLOW_LAN=1)
+   3. 控制台 API Token (写入浏览器或 Authorization: Bearer):
+        $INSTALL_TOKEN
+        (文件: $TOKEN_FILE — 请妥善保管, 勿提交到 git)
+   4. 查看 Wi-Fi 事件与代理切换日志:
         journalctl -t HY2_DISPATCH -t HY2_PROXY -t HY2_RULESET --since today
-   4. 手动验证:
+   5. 手动验证:
         proxy-switch.sh status
         proxy-switch.sh on  && proxy-switch.sh status
         proxy-switch.sh off && proxy-switch.sh status

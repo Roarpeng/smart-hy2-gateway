@@ -42,6 +42,7 @@ const appState = {
   },
   nodes: [],                  // /api/nodes 节点快照 (snake_case 原样保存)
   activeNodeId: '',           // 活跃节点 id
+  fallbackNodeId: '',         // urltest 备用节点 id
   nodeLatency: {},            // id -> { status: idle|testing|ok|fail, latency_ms, error }
   editingNodeId: null,        // 正在编辑的节点 id
   nodeSearch: ''              // 节点列表前端搜索关键词
@@ -66,16 +67,90 @@ let DEMO_MODE = false;        // true = 后端不可用，全部操作退回本�
 let DEMO_TOAST_SHOWN = false; // 「已切换演示模式」提示全局只弹一次
 const API_TIMEOUT_MS = 2500;      // 常规只读请求
 const API_LONG_TIMEOUT_MS = 40000; // 下发/切换类请求：需覆盖 check+重启的最坏耗时
+const TOKEN_STORAGE_KEY = 'hy2_gateway_token';
 let statusPollTimer = null;
 let demoReconnectTimer = null;    // 演示模式下周期探测后端，恢复可达时自动回在线
+
+function getGatewayToken() {
+  try {
+    return (localStorage.getItem(TOKEN_STORAGE_KEY) || '').trim();
+  } catch (err) {
+    return '';
+  }
+}
+
+function setGatewayToken(token) {
+  const value = String(token || '').trim();
+  try {
+    if (value) localStorage.setItem(TOKEN_STORAGE_KEY, value);
+    else localStorage.removeItem(TOKEN_STORAGE_KEY);
+  } catch (err) { /* ignore quota / private mode */ }
+}
+
+function showAuthGate(message) {
+  const gate = document.getElementById('auth-gate');
+  const err = document.getElementById('auth-error');
+  const input = document.getElementById('auth-token-input');
+  if (!gate) return;
+  gate.hidden = false;
+  if (err) {
+    if (message) {
+      err.hidden = false;
+      err.textContent = message;
+    } else {
+      err.hidden = true;
+      err.textContent = '';
+    }
+  }
+  if (input) {
+    input.value = getGatewayToken();
+    setTimeout(() => input.focus(), 50);
+  }
+}
+
+function hideAuthGate() {
+  const gate = document.getElementById('auth-gate');
+  if (gate) gate.hidden = true;
+}
+
+async function submitAuthToken() {
+  const input = document.getElementById('auth-token-input');
+  const token = input ? input.value.trim() : '';
+  if (!token) {
+    showAuthGate('请输入 API Token');
+    return;
+  }
+  setGatewayToken(token);
+  try {
+    const res = await apiFetch('/api/status');
+    if (res.status === 401) {
+      showAuthGate('Token 无效，请核对 data/api_token');
+      return;
+    }
+    hideAuthGate();
+    showToast('鉴权成功', 'success');
+    await bootstrapFromBackend();
+  } catch (err) {
+    showAuthGate('无法连接后端，请确认容器已启动');
+  }
+}
 
 // fetch 包装：默认 2500ms 超时；任何网络层失败 -> 进入演示模式
 async function apiFetch(path, opts = {}, timeoutMs = API_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(path, { ...opts, signal: controller.signal });
-    markOnline(); // 能收到 HTTP 响应（含 4xx/5xx）即视为后端可达
+    const headers = new Headers(opts.headers || {});
+    const token = getGatewayToken();
+    if (token && !headers.has('Authorization')) {
+      headers.set('Authorization', `Bearer ${token}`);
+    }
+    const res = await fetch(path, { ...opts, headers, signal: controller.signal });
+    if (res.status === 401 && path !== '/api/health') {
+      showAuthGate('需要有效的 API Token');
+    } else {
+      markOnline(); // 能收到 HTTP 响应（含其它 4xx/5xx）即视为后端可达
+    }
     return res;
   } catch (err) {
     enterDemoMode();
@@ -245,6 +320,9 @@ function mapApiStateToApp(data) {
   if (typeof data.active_node_id === 'string') {
     appState.activeNodeId = data.active_node_id;
   }
+  if (typeof data.fallback_node_id === 'string') {
+    appState.fallbackNodeId = data.fallback_node_id;
+  }
 
   const n = data.current_node;
   if (n) {
@@ -269,9 +347,15 @@ function mapApiStateToApp(data) {
 function fillNetworkForm() {
   ensureIfaceOption(document.getElementById('cfg-rj45-dev'), appState.network.rj45Dev);
   ensureIfaceOption(document.getElementById('cfg-wifi-dev'), appState.network.wifiDev);
+  ensureIfaceOption(document.getElementById('cfg-vmnet-dev'), appState.network.vmnetDev);
   document.getElementById('cfg-rj45-dev').value = appState.network.rj45Dev;
   document.getElementById('cfg-wifi-dev').value = appState.network.wifiDev;
+  const vmSel = document.getElementById('cfg-vmnet-dev');
+  if (vmSel) vmSel.value = appState.network.vmnetDev;
+  const vmSubnet = document.getElementById('cfg-vmnet-subnet');
+  if (vmSubnet) vmSubnet.value = appState.network.vmnetSubnet || '192.168.100.0/24';
   document.getElementById('cfg-wifi-policy').value = appState.network.wifiPolicy;
+  updateWhitelistAvailability();
   document.getElementById('cfg-tproxy-port').value = appState.network.tproxyPort;
   document.getElementById('cfg-fwmark').value = appState.network.fwmark;
   document.getElementById('cfg-table').value = appState.network.table;
@@ -313,8 +397,13 @@ function buildApplyPayload() {
     },
     wifi_iface: appState.network.wifiDev,
     rj45_iface: appState.network.rj45Dev,
-    vmnet_iface: appState.network.vmnetDev || 'vmnet1', // UI 无输入框, 保留后端状态值
+    vmnet_iface: appState.network.vmnetDev || 'vmnet1',
     vmnet_subnet: appState.network.vmnetSubnet || '192.168.100.0/24',
+    vm_uplinks: [{
+      vm_iface: appState.network.vmnetDev || 'vmnet1',
+      bind: 'managed',
+      subnet: appState.network.vmnetSubnet || '192.168.100.0/24'
+    }],
     tproxy_port: parseInt(appState.network.tproxyPort, 10) || 12345,
     fwmark: parseFwmarkToInt(appState.network.fwmark),
     table: parseInt(appState.network.table, 10) || 100,
@@ -649,6 +738,7 @@ function normalizeNode(n, index) {
   return {
     id: raw.id || `legacy-${index ?? 0}`,
     tag: raw.tag || '未命名节点',
+    protocol: raw.protocol || 'hysteria2',
     server: raw.server || '',
     port: Number.isFinite(parseInt(raw.port, 10)) ? parseInt(raw.port, 10) : 443,
     password: raw.password || '',
@@ -659,6 +749,8 @@ function normalizeNode(n, index) {
     up_mbps: raw.up_mbps ?? null,
     down_mbps: raw.down_mbps ?? null,
     port_hopping: raw.port_hopping || '',
+    method: raw.method || '',
+    reality_enabled: !!raw.reality_enabled,
     source: raw.source || '',
     created_at: raw.created_at || 0,
     latency_ms: (typeof raw.latency_ms === 'number') ? raw.latency_ms : null,
@@ -765,6 +857,7 @@ async function fetchNodes(fallbackState) {
       if (data && Array.isArray(data.nodes)) {
         appState.nodes = data.nodes.map((n, i) => normalizeNode(n, i));
         appState.activeNodeId = typeof data.active_node_id === 'string' ? data.active_node_id : '';
+        appState.fallbackNodeId = typeof data.fallback_node_id === 'string' ? data.fallback_node_id : '';
         syncLatencyFromNodes();
         syncCurrentNodeFromActive();
         renderNodeList();
@@ -892,8 +985,19 @@ function buildNodeRow(n) {
   flags.className = 'node-flags';
   const proto = document.createElement('span');
   proto.className = 'node-flag';
-  proto.textContent = 'Hysteria 2 · QUIC';
+  const protoLabels = {
+    hysteria2: 'Hysteria 2 · QUIC', hy2: 'Hysteria 2 · QUIC',
+    vless: 'VLESS', trojan: 'Trojan', shadowsocks: 'Shadowsocks', ss: 'Shadowsocks'
+  };
+  const p = String(n.protocol || 'hysteria2').toLowerCase();
+  proto.textContent = protoLabels[p] || p;
   flags.appendChild(proto);
+  if (n.id && n.id === appState.fallbackNodeId) {
+    const fb = document.createElement('span');
+    fb.className = 'node-flag';
+    fb.textContent = '备用';
+    flags.appendChild(fb);
+  }
   if (n.insecure) {
     const f = document.createElement('span');
     f.className = 'node-flag';
@@ -920,10 +1024,17 @@ function buildNodeRow(n) {
   actions.className = 'node-actions';
   const activateBtn = makeNodeButton('启用', 'btn btn-small btn-primary', () => activateNode(n.id), isActive);
   if (isActive) activateBtn.title = '当前活跃节点';
+  const isFallback = n.id === appState.fallbackNodeId;
+  const fallbackBtn = makeNodeButton(
+    isFallback ? '取消备用' : '设为备用',
+    'btn btn-small',
+    () => setFallbackNode(isFallback ? '' : n.id)
+  );
+  fallbackBtn.title = '与活跃节点组成 urltest；UDP 不可用时可落到 TCP 备用';
   const testBtn = makeNodeButton('测试', 'btn btn-small', () => testNode(n.id), latState.status === 'testing');
   const editBtn = makeNodeButton('编辑', 'btn btn-small', () => openNodeEditor(n.id));
   const delBtn = makeNodeButton('删除', 'btn btn-small btn-danger', () => deleteNode(n.id));
-  actions.append(activateBtn, testBtn, editBtn, delBtn);
+  actions.append(activateBtn, fallbackBtn, testBtn, editBtn, delBtn);
 
   row.append(main, latency, actions);
   return row;
@@ -949,7 +1060,7 @@ function renderNodeList() {
   if (!total) {
     const empty = document.createElement('p');
     empty.className = 'node-empty';
-    empty.textContent = '暂无节点，请在上方导入 v2rayN 分享链接或订阅';
+    empty.textContent = '暂无节点，请导入 hy2 / vless / trojan / ss 分享链接或订阅';
     container.appendChild(empty);
     return;
   }
@@ -1001,11 +1112,20 @@ function updateRouteStage() {
   const portEl = document.getElementById('route-port-out');
   if (portEl) portEl.textContent = n ? String(n.port || 443) : '未配置';
 
-  // 协议: 有活跃节点才标识 Hysteria 2 · QUIC (hy2 传输层恒为 QUIC/UDP)
+  // 协议徽章: 按节点 protocol 显示
   const protoEl = document.getElementById('route-proto');
   if (protoEl) {
-    protoEl.textContent = n ? 'Hysteria 2 · QUIC' : '未配置';
-    protoEl.title = n ? 'Hysteria 2 · QUIC (UDP) 传输' : '';
+    const labels = {
+      hysteria2: 'Hysteria 2 · QUIC',
+      hy2: 'Hysteria 2 · QUIC',
+      vless: 'VLESS',
+      trojan: 'Trojan',
+      shadowsocks: 'Shadowsocks',
+      ss: 'Shadowsocks'
+    };
+    const p = n ? String(n.protocol || 'hysteria2').toLowerCase() : '';
+    protoEl.textContent = n ? (labels[p] || p || '未知协议') : '未配置';
+    protoEl.title = n ? `出站协议 ${protoEl.textContent}` : '';
   }
 
   const tag = document.getElementById('route-node-tag');
@@ -1120,6 +1240,29 @@ async function activateNode(id) {
     return true;
   } catch (err) {
     return false; // apiFetch 已进入演示模式并提示
+  }
+}
+
+async function setFallbackNode(id) {
+  if (DEMO_MODE) {
+    showToast('演示模式需后端在线', 'warning');
+    return;
+  }
+  const target = id ? id : '-';
+  try {
+    const res = await apiFetch(`/api/nodes/${encodeURIComponent(target)}/fallback`, {
+      method: 'POST'
+    }, API_LONG_TIMEOUT_MS);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || (data.status && data.status !== 'success')) {
+      showToast(`设置备用失败: ${extractApiError(data)}`, 'warning');
+      return;
+    }
+    appState.fallbackNodeId = data.fallback_node_id || '';
+    showToast(appState.fallbackNodeId ? '已设为备用节点 (urltest)' : '已清除备用节点', 'success');
+    await fetchNodes();
+  } catch (err) {
+    /* apiFetch 已处理 */
   }
 }
 
@@ -1567,6 +1710,14 @@ async function deleteNode(id) {
 function saveNetworkCardSettings() {
   appState.network.rj45Dev = document.getElementById('cfg-rj45-dev').value;
   appState.network.wifiDev = document.getElementById('cfg-wifi-dev').value;
+  const vmSel = document.getElementById('cfg-vmnet-dev');
+  const vmSubnet = document.getElementById('cfg-vmnet-subnet');
+  if (vmSel) appState.network.vmnetDev = vmSel.value;
+  if (vmSubnet) appState.network.vmnetSubnet = vmSubnet.value.trim() || '192.168.100.0/24';
+  if (appState.network.rj45Dev && appState.network.rj45Dev === appState.network.wifiDev) {
+    showToast('恒直连与策略代理不能选择同一网卡', 'warning');
+    return;
+  }
   appState.network.wifiPolicy = document.getElementById('cfg-wifi-policy').value;
   appState.network.tproxyPort = parseInt(document.getElementById('cfg-tproxy-port').value, 10);
   appState.network.fwmark = document.getElementById('cfg-fwmark').value.trim() || '0x1';
@@ -1588,17 +1739,26 @@ const IFACE_KIND_LABELS = {
   tunnel: '隧道', loopback: '回环', other: '其他'
 };
 const IFACE_DEMO_LIST = [
-  { name: 'enp3s0', kind: 'ethernet' }, { name: 'enp55s0', kind: 'ethernet' }, { name: 'eno1', kind: 'ethernet' },
-  { name: 'wlp2s0', kind: 'wifi' }, { name: 'wlo1', kind: 'wifi' }, { name: 'wlan0', kind: 'wifi' },
-  { name: 'vmnet1', kind: 'vmware' }, { name: 'vmnet8', kind: 'vmware' },
-  { name: 'br0', kind: 'bridge' }, { name: 'virbr0', kind: 'bridge' },
-  { name: 'tun0', kind: 'tunnel' }, { name: 'lo', kind: 'loopback' }
+  { name: 'enp3s0', kind: 'ethernet', label: 'enp3s0 · 以太网' },
+  { name: 'enp55s0', kind: 'ethernet', label: 'enp55s0 · 以太网' },
+  { name: 'eno1', kind: 'ethernet', label: 'eno1 · 以太网' },
+  { name: 'wlp2s0', kind: 'wifi', label: 'wlp2s0 · Wi-Fi' },
+  { name: 'wlo1', kind: 'wifi', label: 'wlo1 · Wi-Fi' },
+  { name: 'wlan0', kind: 'wifi', label: 'wlan0 · Wi-Fi' },
+  { name: 'vmnet0', kind: 'vmware', label: 'vmnet0 · 桥接', suggest_role: 'direct' },
+  { name: 'vmnet1', kind: 'vmware', label: 'vmnet1 · Host-Only', suggest_role: 'managed' },
+  { name: 'vmnet8', kind: 'vmware', label: 'vmnet8 · NAT' },
+  { name: 'br0', kind: 'bridge', label: 'br0 · 网桥' },
+  { name: 'virbr0', kind: 'bridge', label: 'virbr0 · 网桥' }
 ];
+let IFACE_SUGGESTIONS = [];
+let IFACE_CACHE = IFACE_DEMO_LIST;
 
-// 各网卡字段允许的接口类型 (下拉只列各自该选的, 不混入无关接口)
+// 通道角色可选物理/虚拟网卡 (排除回环与隧道)
 const IFACE_FIELD_KINDS = {
-  'cfg-rj45-dev': ['ethernet'],   // 通道A · 有线: 物理以太网卡
-  'cfg-wifi-dev': ['wifi']        // 通道B · 无线: 无线网卡
+  'cfg-rj45-dev': ['ethernet', 'wifi', 'vmware', 'bridge'],
+  'cfg-wifi-dev': ['ethernet', 'wifi', 'vmware', 'bridge'],
+  'cfg-vmnet-dev': ['vmware', 'bridge']
 };
 
 // select 中保证存在指定值的选项 (后端列表未含当前值时补一项, 不丢配置)
@@ -1613,28 +1773,29 @@ function ensureIfaceOption(sel, value) {
 }
 
 function populateInterfaceSelects(interfaces) {
+  IFACE_CACHE = Array.isArray(interfaces) ? interfaces : IFACE_DEMO_LIST;
   Object.entries(IFACE_FIELD_KINDS).forEach(([fieldId, kinds]) => {
     const sel = document.getElementById(fieldId);
     if (!sel) return;
-    const pool = interfaces.filter(i => kinds.includes(i.kind));
-    const usePool = pool.length ? pool : interfaces; // 无匹配类型时回落全列表
+    const pool = IFACE_CACHE.filter(i => kinds.includes(i.kind));
+    const usePool = pool.length ? pool : IFACE_CACHE.filter(i => i.kind !== 'loopback' && i.kind !== 'tunnel');
 
     const groups = {};
     usePool.forEach(i => {
-      (groups[i.kind] = groups[i.kind] || []).push(i.name);
+      (groups[i.kind] = groups[i.kind] || []).push(i);
     });
 
     const current = sel.value;
     sel.innerHTML = '';
     Object.keys(IFACE_KIND_LABELS).forEach(kind => {
-      const names = groups[kind];
-      if (!names || !names.length) return;
+      const items = groups[kind];
+      if (!items || !items.length) return;
       const og = document.createElement('optgroup');
       og.label = IFACE_KIND_LABELS[kind];
-      names.forEach(n => {
+      items.forEach(i => {
         const opt = document.createElement('option');
-        opt.value = n;
-        opt.textContent = n;
+        opt.value = i.name;
+        opt.textContent = i.label || i.name;
         og.appendChild(opt);
       });
       sel.appendChild(og);
@@ -1644,10 +1805,53 @@ function populateInterfaceSelects(interfaces) {
       sel.value = current;
     }
   });
+  updateWhitelistAvailability();
+  const note = document.getElementById('vm-suggest-note');
+  if (note && IFACE_SUGGESTIONS.length) {
+    note.textContent = '建议: ' + IFACE_SUGGESTIONS.map(s => `${s.vm_iface}→${s.bind}`).join(' · ');
+  }
+}
+
+function updateWhitelistAvailability() {
+  const wifiSel = document.getElementById('cfg-wifi-dev');
+  const note = document.getElementById('whitelist-note');
+  const box = document.getElementById('whitelist-tag-box');
+  const addRow = document.querySelector('.whitelist-add');
+  if (!wifiSel) return;
+  const name = wifiSel.value;
+  const meta = IFACE_CACHE.find(i => i.name === name);
+  const isWifi = meta ? meta.kind === 'wifi' : /wl|wlan/i.test(name);
+  if (note) {
+    note.textContent = isWifi
+      ? '仅当策略为「白名单例外」时生效。命中的 SSID 直接绕过隧道。'
+      : '当前策略网卡不是 Wi‑Fi：SSID 白名单不适用，请用「强制代理/强制直连」或手动开关代理。';
+  }
+  if (box) box.style.opacity = isWifi ? '1' : '0.45';
+  if (addRow) addRow.style.opacity = isWifi ? '1' : '0.45';
+}
+
+function applySuggestedVmUplinks() {
+  if (!IFACE_SUGGESTIONS.length) {
+    showToast('暂无 VM 映射建议 (未检测到 vmnet 或 VMware 配置)', 'info');
+    return;
+  }
+  const managed = IFACE_SUGGESTIONS.find(s => s.bind === 'managed') || IFACE_SUGGESTIONS[0];
+  const sel = document.getElementById('cfg-vmnet-dev');
+  const subnet = document.getElementById('cfg-vmnet-subnet');
+  if (sel && managed.vm_iface) {
+    ensureIfaceOption(sel, managed.vm_iface);
+    sel.value = managed.vm_iface;
+  }
+  if (subnet && managed.subnet) subnet.value = managed.subnet;
+  showToast(`已填入建议: ${managed.vm_iface} (${managed.bind})`, 'success');
 }
 
 async function refreshInterfaces() {
   if (DEMO_MODE) {
+    IFACE_SUGGESTIONS = [
+      { vm_iface: 'vmnet0', bind: 'direct', subnet: '', reason: '演示' },
+      { vm_iface: 'vmnet1', bind: 'managed', subnet: '192.168.100.0/24', reason: '演示' }
+    ];
     populateInterfaceSelects(IFACE_DEMO_LIST);
     showToast('演示模式: 已载入常见网卡名称列表', 'info');
     return;
@@ -1657,6 +1861,7 @@ async function refreshInterfaces() {
     if (res.ok) {
       const data = await res.json().catch(() => null);
       if (data && Array.isArray(data.interfaces) && data.interfaces.length) {
+        IFACE_SUGGESTIONS = Array.isArray(data.suggestions) ? data.suggestions : [];
         populateInterfaceSelects(data.interfaces);
         return;
       }
@@ -1664,7 +1869,7 @@ async function refreshInterfaces() {
     populateInterfaceSelects(IFACE_DEMO_LIST);
     showToast('后端网卡列表为空, 已回落常见名称', 'warning');
   } catch (err) {
-    populateInterfaceSelects(IFACE_DEMO_LIST); // 进演示模式前的最后兜底
+    populateInterfaceSelects(IFACE_DEMO_LIST);
   }
 }
 
@@ -1777,6 +1982,15 @@ window.addEventListener('load', async function () {
   });
   requestAnimationFrame(() => requestAnimationFrame(() => document.body.classList.add('live')));
 
+  const authBtn = document.getElementById('auth-save-btn');
+  if (authBtn) authBtn.addEventListener('click', submitAuthToken);
+  const authInput = document.getElementById('auth-token-input');
+  if (authInput) {
+    authInput.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') submitAuthToken();
+    });
+  }
+
   // 1) 演示态初始化 (后端不可用时的完整兜底)
   fillNodeForm(appState.currentNode);
   renderNodeList();
@@ -1789,7 +2003,7 @@ window.addEventListener('load', async function () {
   const initialTab = TAB_TITLES[location.hash.slice(1)] ? location.hash.slice(1) : 'node';
   switchTab(initialTab);
 
-  // 3) 尝试接入真实后端; 失败静默保持演示态
+  // 3) 尝试接入真实后端; 401 时弹出 Token 门禁
   await bootstrapFromBackend();
   refreshInterfaces(); // 非阻塞: 后端在线则载入宿主真实网卡
 });

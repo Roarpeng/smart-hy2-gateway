@@ -100,9 +100,16 @@ if [[ -z "$INTERFACE" || -z "$ACTION" ]]; then
     exit 0
 fi
 
-# 只处理目标 Wi-Fi 接口; 有线 enp3s0 / vmnet1 等其他接口的事件直接忽略
+# 只处理状态文件中的「策略代理」接口事件
 if [[ "$INTERFACE" != "$wifi_iface" ]]; then
     exit 0
+fi
+
+# 非 Wi-Fi 介质: SSID 白名单无意义; 仅 always_* 或 up 时按 always_proxy 语义由 WebUI 管理。
+# 若接口无 phy80211, 仍允许 always_proxy/always_direct 在 up/down 时切换。
+managed_is_wifi=0
+if [[ -e "/sys/class/net/${wifi_iface}/phy80211" ]]; then
+    managed_is_wifi=1
 fi
 
 case "$ACTION" in
@@ -125,6 +132,10 @@ case "$ACTION" in
                 if [[ "$wifi_policy" != "whitelist" && -n "$wifi_policy" ]]; then
                     log "WARN: wifi_policy='$wifi_policy' 非法 (期望 whitelist|always_proxy|always_direct), 按 whitelist 处理"
                 fi
+                if [[ "$managed_is_wifi" -ne 1 ]]; then
+                    # 非 Wi-Fi 策略网卡: 无 SSID 语义, whitelist 等价于 always_proxy
+                    proxy_ctl on "策略网卡非 Wi-Fi, whitelist 按强制代理处理"
+                else
                 ssid="$ssid_now"
                 if [[ -z "$ssid" ]]; then
                     # 刻意收紧 (相对早期原型): SSID 为空 => 不可信 => 开代理。
@@ -135,7 +146,8 @@ case "$ACTION" in
                 elif ssid_whitelisted "$ssid"; then
                     proxy_ctl off "SSID '$ssid' 命中白名单, 走直连"
                 else
-                    proxy_ctl on "SSID '$ssid' 不在白名单, 走 Hysteria 2 隧道"
+                    proxy_ctl on "SSID '$ssid' 不在白名单, 走隧道"
+                fi
                 fi
                 ;;
         esac

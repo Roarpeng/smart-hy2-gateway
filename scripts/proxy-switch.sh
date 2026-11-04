@@ -64,8 +64,12 @@ pick() {
 TPROXY_PORT="$(pick TPROXY_PORT tproxy_port 12345)"
 FWMARK="$(pick FWMARK fwmark 1)"
 TABLE="$(pick TABLE table 100)"
+# 通道角色: RJ45_DEV/WIFI_DEV 为历史环境变量名, 语义=恒直连/策略代理 (介质不限)
+# 亦接受 DIRECT_DEV / MANAGED_DEV 覆盖
 RJ45_DEV="$(pick RJ45_DEV rj45_iface enp3s0)"
 WIFI_DEV="$(pick WIFI_DEV wifi_iface wlp2s0)"
+[[ -n "${DIRECT_DEV:-}" ]] && RJ45_DEV="$DIRECT_DEV"
+[[ -n "${MANAGED_DEV:-}" ]] && WIFI_DEV="$MANAGED_DEV"
 VMNET_IFACE="$(pick VMNET_IFACE vmnet_iface vmnet1)"
 VMNET_SUBNET="$(pick VMNET_SUBNET vmnet_subnet 192.168.100.0/24)"
 SINGBOX_UID="$(pick SINGBOX_UID singbox_uid 930)"
