@@ -2,8 +2,11 @@
 Description=Ensure VMware vmnet device nodes exist before any VM starts
 Documentation=file:/usr/local/bin/vmnet-ensure.sh
 ConditionPathExists=/usr/lib/vmware/bin/vmware-vmx
-After=vmware.service
-Wants=vmware.service
+# 时序关键: 设备节点必须在 vmware.service (vmware-networks --start) 之前就绪。
+# 若反序 (After), 开机节点缺失时 vmnet1 的 netifup 会被跳过, 接口永不创建,
+# 后补节点也无法救回 —— 表现为虚拟机断网 (2026-11-07 故障根因)。
+# 接口级兜底 (节点在但接口缺) 由 hy2-vmnet1-dhcp.service 的重启自愈负责。
+Before=vmware.service hy2-vmnet1-dhcp.service
 
 [Service]
 Type=oneshot

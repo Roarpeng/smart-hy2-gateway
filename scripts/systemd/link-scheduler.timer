@@ -1,0 +1,10 @@
+[Unit]
+Description=link-scheduler 每 2 分钟探测直连节点健康并按需切换
+
+[Timer]
+OnCalendar=*:0/2
+Persistent=true
+RandomizedDelaySec=5
+
+[Install]
+WantedBy=timers.target

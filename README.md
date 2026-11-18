@@ -33,7 +33,7 @@ flowchart TB
         RULES["iptables mangle + 策略路由<br/>ipset hy2_cn 中国 IP 内核直连<br/>HY2_PRE → TPROXY :12345<br/>HY2_OUT → MARK 1<br/>fwmark 1 · table 100 → lo"]
         MASQ["ip_forward + MASQUERADE<br/>off 态直连兜底"]
 
-        subgraph DOCKER["Docker 容器 hy2-gateway（network_mode:host · privileged · NET_ADMIN）"]
+        subgraph DOCKER["Docker 容器 hy2-gateway（network_mode:host · cap_add: NET_ADMIN / NET_RAW / ...）"]
             SB["sing-box 1.11.x<br/>TProxy :12345 · 多协议出站 · UID 930"]
             API["FastAPI :8080<br/>Bearer Token · Web 控制台"]
         end
@@ -66,7 +66,7 @@ flowchart TB
     API -->|"读写状态"| STATE
     API -->|"sing-box check 通过后重启"| SB
     TIMER -->|".srs 投递 + ipset swap"| SB
-    TIMER -->|"每周 /api/apply 优雅重载"| API
+    TIMER -->|"每周 /api/reload 优雅重载"| API
     RULES -.->|"hy2_cn 命中: 中国 IP 内核直连"| WLP
 ```
 
@@ -79,9 +79,9 @@ flowchart TB
   - **节点管理**：导入 `hy2://` `vless://` `trojan://` `ss://`、base64 订阅、订阅 URL、sing-box JSON；启用 / 备用 / 延迟测试 / 编辑删除
   - **双通道**：网卡下拉（含虚拟网卡标签）、策略三态、白名单、VM 上网映射
   - **运行状态**：sing-box / TProxy / 策略 / Wi‑Fi 读数，手动启停，连通性诊断
-- **REST API**（除 `/api/health` 外需 Bearer Token）：`/api/state` · `/api/apply` · `/api/status` · `/api/proxy` · `/api/interfaces` · `/api/nettest` · `/api/egress` · `/api/nodes*`（含 `…/fallback`）· `/api/nodes/test`
+- **REST API**（除 `/api/health` 外需 Bearer Token）：`/api/state` · `/api/apply` · `/api/settings`（PATCH） · `/api/reload`（POST） · `/api/status` · `/api/proxy` · `/api/interfaces` · `/api/nettest` · `/api/egress` · `/api/nodes*`（含 `…/fallback`）· `/api/nodes/test`
 - **地理分流（绕过大陆）**：通道策略 → ipset `hy2_cn` 内核直连 → sing-box geosite/geoip；DNS 国内/隧道拆分。规则集镜像内置、每周自动更新。
-- **规则集每周自动更新（systemd timer）**：`hy2-ruleset-update.timer` 每周一 04:30 触发（±10 分钟随机抖动，`Persistent=true` 错过补跑）执行 `ruleset-update.sh`：从 SagerNet 官方（sing-geosite / sing-geoip 的 rule-set 分支）下载 `geosite-cn.srs` / `geoip-cn.srs` → 尺寸校验 → 原子替换仓库 `ruleset/` → `docker cp` 投递容器 `/usr/local/share/sing-box/` → 从同一份 `geoip-cn.srs` 用 `sing-box rule-set decompile` 导出 CIDR、原子重建 ipset `hy2_cn`（单一数据源）→ 若代理在开则确保 match 规则在位 → 经后端 `/api/apply` 触发 sing-box 优雅重载。全程 fail-safe：下载失败或校验不过即保留现有规则集，重载前 `sing-box check` 通过才重启进程，坏文件不破坏运行态。`install.sh` 一并安装脚本与 timer（`enable --now`）、检查 `curl`/`jq`/`ipset` 依赖，并在安装尾声 best-effort 首跑一次。
+- **规则集每周自动更新（systemd timer）**：`hy2-ruleset-update.timer` 每周一 04:30 触发（±10 分钟随机抖动，`Persistent=true` 错过补跑）执行 `ruleset-update.sh`：从 SagerNet 官方（sing-geosite / sing-geoip 的 rule-set 分支）下载 `geosite-cn.srs` / `geoip-cn.srs` → 尺寸校验 → 原子替换仓库 `ruleset/` → `docker cp` 投递容器 `/usr/local/share/sing-box/` → 从同一份 `geoip-cn.srs` 用 `sing-box rule-set decompile` 导出 CIDR、原子重建 ipset `hy2_cn`（单一数据源）→ 若代理在开则确保 match 规则在位 → 经后端 `/api/reload`（带 Bearer Token）触发 sing-box 优雅重载。全程 fail-safe：下载失败或校验不过即保留现有规则集，重载前 `sing-box check` 通过才重启进程，坏文件不破坏运行态。`install.sh` 一并安装脚本与 timer（`enable --now`）、检查 `curl`/`jq`/`ipset` 依赖，并在安装尾声 best-effort 首跑一次。
 - **规则守护（rule-guard）**：dispatcher 每次决策落盘期望态，后端每 30s 将 iptables 实况对齐——任何原因（容器重建、系统事件）导致的规则丢失在一个周期内自动恢复；Wi-Fi 波动断连不清规则。
 - **Host-Only 虚拟机直连兜底**：代理关闭时脚本确保 `ip_forward` + MASQUERADE，虚拟机不断网。
 - **VMware 虚拟网络兜底（vmnet-guard）**：`/dev` 为 tmpfs，`vmware.service` 创建 `/dev/vmnetN` 存在时序空档——虚拟机若在节点就绪前启动，vmx 会报 `MACVNetPortOpenDevice: can't open vmnet device` 并把网卡标记为 `startdisconnected` 后**永不重试**，表现为虚拟机永久断网而宿主侧 iptables/路由全部正常，极难定位。`vmnet-guard.service` 开机等待 `vmware.service` 后就绪检查、按主设备号 119 补建 `/dev/vmnet0/1/8`（幂等，不触碰已存在节点），`install.sh` 一并安装启用；非 VMware 宿主由 `ConditionPathExists` 自动跳过。诊断依据：`ls -l /proc/$(pgrep -f bin/vmware-vmx | head -1)/fd | grep vmnet`，只有 `vmnet0` 即代理网卡未接入。
@@ -134,13 +134,13 @@ smart-hy2-gateway/（部署目录 = /opt/hy2-gateway）
 │   ├── fonts/                       Switzer WOFF2 与授权说明
 ├── data/                            运行时状态 (含节点口令, 已 gitignore)
 ├── tests/
-│   └── test_node_parser.py          解析器公共契约单元测试 (标准库 unittest)
-├── docs/
-│   ├── deploy.md                    部署运维手册 (验证清单/切换测试/排障/卸载)
-│   ├── vmware-setup.md              VMware 虚拟网络与虚拟机双网卡配置
-│   └── screenshot-console.png · screenshot-mobile.png
-└── smart_hysteria_2_gateway_architecture_management_console.html
-                                     原始设计原型 (归档参考, 实际以 web/ 为准)
+│   ├── test_node_parser.py          解析器公共契约单元测试
+│   └── test_backend_app.py          后端 API、鉴权、口令保护与 SSRF 单元测试
+└── docs/
+    ├── deploy.md                    部署运维手册 (验证清单/切换测试/排障/卸载)
+    ├── bare-metal.md                纯宿主部署精简路径
+    ├── vmware-setup.md              VMware 虚拟网络与虚拟机双网卡配置
+    └── screenshot-console.png · screenshot-mobile.png
 ```
 
 ## 安全须知
@@ -149,7 +149,7 @@ smart-hy2-gateway/（部署目录 = /opt/hy2-gateway）
 - **默认本机监听**：Web 默认绑定 `127.0.0.1`；需要局域网访问时设置 `ALLOW_LAN=1`（仍须携带 Token）。
 - **明文口令**：`data/gateway_state.json` 以明文保存全部节点口令，权限 600，仅 root 可读，已列入 `.gitignore`——**严禁提交或拷贝到不可信介质**。API 响应默认打码口令。
 - **订阅拉取 SSRF 防护**：订阅 URL 仅允许 `http/https`，后端在发起请求前拒绝私网、回环、链路本地地址；同时限制超时与响应大小，避免被用作内网探测或内存耗尽入口。
-- **特权容器**：`network_mode: host` + `privileged` 等价于直接操作宿主网络栈，只能在自有可信设备上部署。
+- **最小特权能力集**：容器移除 `privileged: true`，采用 `network_mode: host` + `cap_add: NET_ADMIN / NET_RAW / NET_BIND_SERVICE / SETUID / SETGID / CHOWN` 最小特权能力集操作宿主网络栈，仍应只在自有可信设备上部署。
 - **仅接管 IPv4**：双栈 Wi-Fi 下 IPv6 直连出站；如需封死请对 Wi-Fi 连接 `nmcli connection modify "<名>" ipv6.method disabled`。
 - **排障恢复**：`sudo /usr/local/bin/proxy-switch.sh off` 一键清规则恢复直连。
 - 漏洞披露见 [SECURITY.md](SECURITY.md)。赞助 / 赞赏：GitHub Sponsors（软件 MIT 免费，不卖节点）。

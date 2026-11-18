@@ -19,14 +19,30 @@ CONF=/etc/vmware/vmnet1/dhcpd/dhcpd.conf
 LEASES=/etc/vmware/vmnet1/dhcpd/dhcpd.leases
 
 # 等待 VMware 创建 vmnet1 宿主接口（最多 30 秒）
+iface_up() { ip link show vmnet1 >/dev/null 2>&1; }
 for _ in $(seq 1 30); do
-    if ip link show vmnet1 >/dev/null 2>&1; then
-        break
-    fi
+    iface_up && break
     sleep 1
 done
 
-if ! ip link show vmnet1 >/dev/null 2>&1; then
+# 接口缺失自愈: 若开机时 /dev/vmnet1 节点晚于 vmware-networks --start 就绪,
+# vmnet1 的 netifup 会被跳过。此处补跑一次; 当 vmnet hub 状态残留时
+# netifup 会报 "Already bridged" 并以非零退出, 但接口实际会创建,
+# 故以 "接口存在" 为准, 不信任其退出码。
+if ! iface_up && [ -e /dev/vmnet1 ] && [ -x /usr/bin/vmnet-netifup ]; then
+    /usr/bin/vmnet-netifup -s 6 -d /var/run/vmnet-netifup-vmnet1.pid \
+        /dev/vmnet1 vmnet1 || true
+    # netifup 正常路径会按 /etc/vmware/networking 配置 host-only IP; 若因
+    # 竞态漏配则兜底补上网关地址 (幂等, 已存在时报错忽略)
+    ip addr add 192.168.100.1/24 dev vmnet1 2>/dev/null || true
+    ip link set vmnet1 up 2>/dev/null || true
+    for _ in $(seq 1 10); do
+        iface_up && break
+        sleep 1
+    done
+fi
+
+if ! iface_up; then
     echo "vmnet1 接口不存在，无法启动 DHCP" >&2
     exit 1
 fi

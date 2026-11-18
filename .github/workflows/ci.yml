@@ -14,9 +14,11 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: pip install -r requirements.txt pytest
+        run: pip install -r requirements.txt pytest httpx
       - name: Unit tests
-        run: python -m pytest tests/ -q
+        run: python -m pytest tests/ -v
+      - name: Shell syntax check
+        run: bash -n install.sh entrypoint.sh scripts/*.sh
       - name: Import backend module
         run: python -c "import ast; ast.parse(open('backend_app.py').read()); ast.parse(open('node_parser.py').read())"
 

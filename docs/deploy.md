@@ -70,9 +70,9 @@ docker compose up -d --build
 
 容器要点：
 
-- 容器名 `hy2-gateway`，`network_mode: host` + `privileged` + `NET_ADMIN`，直接操作宿主网络栈。
+- 容器名 `hy2-gateway`，`network_mode: host` + `cap_add (NET_ADMIN / NET_RAW 等)`，以最小特权能力集直接操作宿主网络栈。
 - sing-box 1.11.x 以 TProxy `:12345` 接收透明代理流量，Hysteria 2 (QUIC) 出站；以 UID 930 + `setcap cap_net_admin` 运行。
-- FastAPI WebUI 监听 `:8080`，托管 `web/index.html`，提供 `/api/state`、`/api/apply`、`/api/status`、`/api/proxy`、`/api/interfaces`（宿主网卡枚举，供下拉选择）、`/api/nettest`（宿主机视角分段连通性诊断），以及节点管理接口 `/api/nodes`、`/api/nodes/import`、`/api/nodes/{id}/activate`、`PATCH/DELETE /api/nodes/{id}`、`/api/nodes/test`。
+- FastAPI WebUI 监听 `:8080`，托管 `web/index.html`，提供 `/api/state`、`/api/apply`、`/api/settings`、`/api/reload`、`/api/status`、`/api/proxy`、`/api/interfaces`（宿主网卡枚举，供下拉选择）、`/api/nettest`（宿主机视角分段连通性诊断），以及节点管理接口 `/api/nodes`、`/api/nodes/import`、`/api/nodes/{id}/activate`、`PATCH/DELETE /api/nodes/{id}`、`/api/nodes/test`。
 - 挂载 `./data:/data`（状态与 sing-box 配置）。Wi-Fi 事件感知在宿主 dispatcher 侧完成，容器不挂载 dbus。
 
 确认容器运行：
@@ -130,13 +130,13 @@ ip rule
 ip route show table 100
 ```
 
-**mangle 链 HY2_PRE**——应有私网 RETURN 规则、`-m set --match-set hy2_cn dst -j RETURN`（第 2 条，中国 IP 内核层直连、免进 TProxy）和 TCP/UDP TPROXY `:12345` 规则：
+**mangle 链 HY2_PRE**——按顺序包含：本机 `lo` fwmark 接管、TCP/UDP 53 DNS 劫持入 TProxy、`--dst-type LOCAL` 防本机入站回包自劫持、保留网段（含 `100.64.0.0/10` CGNAT）绕行 RETURN、`-m set --match-set hy2_cn dst -j RETURN`（中国 IP 内核层直连、免进 TProxy）和末尾 TCP/UDP TPROXY `:12345` 规则：
 
 ```bash
 iptables -t mangle -S HY2_PRE
 ```
 
-**mangle 链 HY2_OUT**——首规则应为 `-m owner --uid-owner 930 -j RETURN`（放行 sing-box 自身流量防回环），其后为私网 RETURN、`hy2_cn` 匹配 RETURN（第 3 条）与 MARK 规则：
+**mangle 链 HY2_OUT**——首规则应为 `-m owner --uid-owner 930 -j RETURN`（放行 sing-box 自身流量防回环），其后为 TCP/UDP 53 DNS 标记、`--dst-type LOCAL` 绕行、保留网段（含 `100.64.0.0/10` CGNAT）RETURN、`hy2_cn` 匹配 RETURN 与末尾 MARK 规则：
 
 ```bash
 iptables -t mangle -L HY2_OUT | head
@@ -160,23 +160,25 @@ journalctl -t HY2_DISPATCH -t HY2_PROXY --since -10min
 docker logs hy2-gateway
 ```
 
-**WebUI 后端健康**——应返回 JSON 状态：
+**WebUI 后端健康**——`/api/health` 免鉴权，其余 `/api/*` 需携带 Bearer Token：
 
 ```bash
-curl http://127.0.0.1:8080/api/status
+TOKEN=$(sudo tr -d '[:space:]' < /opt/hy2-gateway/data/api_token)
+curl http://127.0.0.1:8080/api/health
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/status
 ```
 
 **网卡枚举与连通性诊断**——interfaces 返回宿主全部网卡（控制台下拉数据源），nettest 做 DNS/直连/节点分段探测：
 
 ```bash
-curl http://127.0.0.1:8080/api/interfaces
-curl -X POST http://127.0.0.1:8080/api/nettest -H 'Content-Type: application/json' -d '{"target":"www.google.com"}'
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/interfaces
+curl -X POST http://127.0.0.1:8080/api/nettest -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"target":"www.google.com"}'
 ```
 
 **节点管理 API**——应返回节点列表、启用状态与标签：
 
 ```bash
-curl -s http://127.0.0.1:8080/api/nodes | jq
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/nodes | jq
 ```
 
 **批量导入与去重**——在控制台节点管理页依次验证：
@@ -189,8 +191,8 @@ curl -s http://127.0.0.1:8080/api/nodes | jq
 
 ```bash
 # {id} 替换为 /api/nodes 返回的节点 id
-curl -X POST http://127.0.0.1:8080/api/nodes/{id}/activate
-curl -X POST http://127.0.0.1:8080/api/nodes/test | jq
+curl -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/nodes/{id}/activate
+curl -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/nodes/test | jq
 ```
 
 预期：目标节点在 `/api/nodes` 中变为启用状态；延迟测试对节点发起真实 Hysteria 2 握手，不可达节点返回失败/超时，不依赖 ICMP。
@@ -225,7 +227,7 @@ curl -s ifconfig.me && echo    # 同上对照
 地理分流的规则集（geosite-cn / geoip-cn）与内核直连 ipset `hy2_cn` 由 systemd 定时任务自动保鲜。为什么要定时更新：规则集镜像内置保证首次启动零外联，但 CN 域名/IP 列表随时间变化，需要每周刷新；且 `.srs` 投递 sing-box 与 CIDR 重建 ipset 来自**同一份 `geoip-cn.srs`**（单一数据源，内核层与用户态判定不会不一致）。
 
 - **触发**：`hy2-ruleset-update.timer` 每周一 04:30（±10 分钟随机抖动，避免更新源扎堆；`Persistent=true`，宿主机关机错过后下次开机补跑）。
-- **单次流程**：从 SagerNet 官方（[sing-geosite](https://gitlab.com/SagerNet/sing-geosite) / [sing-geoip](https://gitlab.com/SagerNet/sing-geoip) 的 rule-set 分支）下载 `geosite-cn.srs` / `geoip-cn.srs` → 尺寸校验 → 原子替换仓库 `ruleset/` → `docker cp` 投递容器 `/usr/local/share/sing-box/` → 用 `sing-box rule-set decompile` 从同一份 `geoip-cn.srs` 导出 CIDR、原子重建 ipset `hy2_cn`（swap 后既有 iptables 规则即时命中新数据，无需重载规则）→ 若代理在开则确保 `hy2_cn` match 规则在位 → 经后端 `/api/apply` 触发 sing-box 优雅重载。
+- **单次流程**：从 SagerNet 官方（[sing-geosite](https://gitlab.com/SagerNet/sing-geosite) / [sing-geoip](https://gitlab.com/SagerNet/sing-geoip) 的 rule-set 分支）下载 `geosite-cn.srs` / `geoip-cn.srs` → 尺寸校验 → 原子替换仓库 `ruleset/` → `docker cp` 投递容器 `/usr/local/share/sing-box/` → 用 `sing-box rule-set decompile` 从同一份 `geoip-cn.srs` 导出 CIDR、原子重建 ipset `hy2_cn`（swap 后既有 iptables 规则即时命中新数据，无需重载规则）→ 若代理在开则确保 `hy2_cn` match 规则在位 → 经后端 `/api/reload` 触发 sing-box 优雅重载。
 - **fail-safe**：下载失败或尺寸校验不过则保留现有规则集、不动运行态；重载前先过 `sing-box check`，坏文件不会重启进程；`proxy-switch.sh` 绝不 create/destroy/flush `hy2_cn`，ipset 数据只由本更新脚本维护。
 
 验证（宿主机执行）：
@@ -306,7 +308,7 @@ nmcli device wifi connect "AnotherNet" password "<密码>"
 | Wi-Fi 已连白名单，但 `ip rule` 仍有 fwmark 0x1，虚拟机流量仍走代理 | TProxy 规则残留（dispatcher 未触发或脚本执行中断）；若 `wifi_policy=always_proxy` 则属预期行为（见下一行） | 手动执行 `sudo /usr/local/bin/proxy-switch.sh off` 清除；再检查 `journalctl -t HY2_DISPATCH --since -10min` 是否有对应事件 |
 | 切了白名单不生效 / 连白名单 SSID 仍走代理 | `wifi_policy` 处于 `always_proxy`（强制代理，忽略白名单） | 控制台「双通道」页切回「白名单例外」（whitelist）模式并点「保存网卡配置」；随后切换一次 Wi-Fi 触发 dispatcher 重新决策 |
 | 国外站突然全打不开（如 YouTube 超时），国内正常 | TProxy 规则被第三方意外清除（容器重建/系统事件），流量全部直连被墙 | **rule-guard 会在 30 秒内自动恢复**，`docker logs hy2-gateway \| grep rule-guard` 可见恢复记录；若未恢复：手动 `sudo /usr/local/bin/proxy-switch.sh on`，并检查 `/opt/hy2-gateway/data/last_decision` 期望态文件 |
-| 容器反复重启或起不来 | 镜像构建失败（sing-box 下载不通）或 privileged/权限不足 | `docker logs hy2-gateway` 查看具体报错；构建阶段下载 sing-box 失败时重跑 `docker compose up -d --build`，或修改 compose 的 `build.args.SINGBOX_VERSION`；确认 `privileged: true` 与 `cap_add: NET_ADMIN` 生效 |
+| 容器反复重启或起不来 | 镜像构建失败（sing-box 下载不通）或权限能力集不足 | `docker logs hy2-gateway` 查看具体报错；构建阶段下载 sing-box 失败时重跑 `docker compose up -d --build`，或修改 compose 的 `build.args.SINGBOX_VERSION`；确认 `cap_add: NET_ADMIN / NET_RAW` 等能力生效 |
 | 代理关闭（off 态）时虚拟机无法上网 | `ip_forward` 未开启或 MASQUERADE 未生效，Host-Only 流量无人转发 | 重放 `sudo /usr/local/bin/proxy-switch.sh off`（脚本会确保 ip_forward=1 与 MASQUERADE）；检查 `iptables -t nat -S | grep MASQUERADE` 与 `sysctl net.ipv4.ip_forward` |
 | 虚拟机 DNS 解析异常或缓慢 | TProxy 同时截获 UDP，DNS（UDP 53）查询也经 Hysteria 2 隧道由远端解析，属预期行为；若 DNS 服务器位于私网则直连 | 虚拟机 DNS 改用公共地址 `1.1.1.1`、`8.8.8.8`；确认节点侧可正常解析；私网 DNS 会命中 RETURN 规则直连，需保证该网段可达 |
 | 订阅 URL 导入失败 / 拉取超时 | 地址命中 SSRF 防护（私网、回环、链路本地）；不是 http/https；目标站要求特定 UA 或宿主网络不通；内容实为 Clash YAML | 改用公网 http/https 订阅；确认宿主机 DNS 与出网；拉取 UA 固定为 `v2rayN/6.60`，服务端有额外校验时改用分享链接或 base64；Clash YAML 不支持，转换后导入 |

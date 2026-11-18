@@ -27,7 +27,19 @@ from typing import Any, Optional
 
 # ---------------- 冻结常量 ----------------
 DEFAULT_PORT = 443
-RESERVED_TAGS = {"direct", "proxy-dns", "tproxy-in", "geosite-cn", "geoip-cn", "block"}
+RESERVED_TAGS = {
+    "direct",
+    "proxy-dns",
+    "cn-dns",
+    "direct-dns",
+    "tproxy-in",
+    "diag-in",
+    "dns-out",
+    "auto-out",
+    "geosite-cn",
+    "geoip-cn",
+    "block",
+}
 
 MAX_TAG_LEN = 64
 FALLBACK_TAG = "hy2-node"
@@ -486,7 +498,7 @@ def _parse_ss_link(raw: str, source: str) -> dict:
         "port": port,
         "password": password,
         "method": method,
-        "obfs_type": method,
+        "obfs_type": "",
         "plugin": plugin,
         "plugin_opts": plugin_opts,
         "source": source,
@@ -713,7 +725,7 @@ def _node_from_ss_json(obj: dict, source: str) -> dict:
         "port": port,
         "password": password,
         "method": method,
-        "obfs_type": method,
+        "obfs_type": "",
         "plugin": str(obj.get("plugin") or "").strip(),
         "plugin_opts": str(obj.get("plugin_opts") or "").strip(),
         "source": source,
@@ -853,12 +865,25 @@ def parse_import_text(text: str, source: str = "clipboard") -> tuple[list[dict],
 
 
 # ---------------- 远程订阅抓取 ----------------
+_NON_PUBLIC_NETS = (
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("198.18.0.0/15"),
+)
+_STD_HTTP_CONNECTION = http.client.HTTPConnection
+_STD_HTTPS_CONNECTION = http.client.HTTPSConnection
+
+
 def _public_ip(ip_text: str) -> bool:
     text = str(ip_text or "").split("%", 1)[0]
     try:
         ip = ipaddress.ip_address(text)
     except ValueError:
         return False
+    if ip.version == 6:
+        if getattr(ip, "is_site_local", False):
+            return False
+        if ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
     if (
         ip.is_private
         or ip.is_loopback
@@ -868,25 +893,33 @@ def _public_ip(ip_text: str) -> bool:
         or ip.is_unspecified
     ):
         return False
-    if ip.version == 6 and getattr(ip, "is_site_local", False):
+    if ip.version == 4 and any(ip in net for net in _NON_PUBLIC_NETS):
         return False
     return True
 
 
-def _assert_public_host(host: str, port: int) -> None:
+def _resolve_public_ip(host: str, port: int) -> str:
     try:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
         raise ValueError(f"订阅域名解析失败: {host}") from exc
     if not infos:
         raise ValueError(f"订阅域名解析失败: {host}")
+    first_ip = ""
     for info in infos:
         ip_text = info[4][0]
         if not _public_ip(ip_text):
             raise ValueError(f"订阅地址解析到非公网 IP，已拒绝: {ip_text}")
+        if not first_ip:
+            first_ip = ip_text
+    return first_ip
 
 
-def _validate_subscription_url(url: str) -> tuple[str, urllib.parse.SplitResult]:
+def _assert_public_host(host: str, port: int) -> str:
+    return _resolve_public_ip(host, port)
+
+
+def _validate_subscription_url(url: str) -> tuple[str, urllib.parse.SplitResult, str]:
     parts = urllib.parse.urlsplit(url)
     scheme = parts.scheme.lower()
     if scheme not in ("http", "https"):
@@ -898,8 +931,41 @@ def _validate_subscription_url(url: str) -> tuple[str, urllib.parse.SplitResult]
         port = parts.port or (443 if scheme == "https" else 80)
     except ValueError as exc:
         raise ValueError("订阅地址端口非法") from exc
-    _assert_public_host(host, port)
-    return scheme, parts
+    pinned_ip = _assert_public_host(host, port) or host
+    return scheme, parts, pinned_ip
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """绑定已校验公网 IP 的 HTTP 连接，防止 DNS Rebinding (TOCTOU)。"""
+
+    def __init__(self, host: str, port: int, timeout: float, pinned_ip: str = "") -> None:
+        super().__init__(host, port, timeout=timeout)
+        self._pinned_ip = pinned_ip or host
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection(
+            (self._pinned_ip, self.port), self.timeout, self.source_address
+        )
+        if self._tunnel_host:
+            self._tunnel()
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """绑定已校验公网 IP 的 HTTPS 连接，TCP 直连 pinned_ip，SNI 与证书校验保持原域名。"""
+
+    def __init__(self, host: str, port: int, timeout: float, pinned_ip: str = "") -> None:
+        super().__init__(host, port, timeout=timeout)
+        self._pinned_ip = pinned_ip or host
+
+    def connect(self) -> None:
+        sock = socket.create_connection(
+            (self._pinned_ip, self.port), self.timeout, self.source_address
+        )
+        if self._tunnel_host:
+            self.sock = sock
+            self._tunnel()
+        server_hostname = self._tunnel_host if self._tunnel_host else self.host
+        self.sock = self._context.wrap_socket(sock, server_hostname=server_hostname)
 
 
 def _decode_body(raw: bytes) -> str:
@@ -910,7 +976,7 @@ def _decode_body(raw: bytes) -> str:
 
 
 def fetch_subscription(url: str, timeout: float = 10.0, max_bytes: int = 2 * 1024 * 1024) -> str:
-    """抓取远程订阅文本 (仅公网 http/https, 防 SSRF, 限制大小)。"""
+    """抓取远程订阅文本 (仅公网 http/https, 防 SSRF 与 DNS Rebinding, 限制大小)。"""
     current = str(url or "").strip()
     if not current:
         raise ValueError("订阅地址为空")
@@ -918,18 +984,34 @@ def fetch_subscription(url: str, timeout: float = 10.0, max_bytes: int = 2 * 102
     deadline = time.monotonic() + max(1.0, float(timeout))
     redirects = 0
     while True:
-        scheme, parts = _validate_subscription_url(current)
+        scheme, parts, pinned_ip = _validate_subscription_url(current)
         host = parts.hostname or ""
-        port = parts.port or (443 if scheme == "https" else 80)
+        default_port = 443 if scheme == "https" else 80
+        port = parts.port or default_port
         path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ValueError("订阅抓取超时")
 
-        conn_cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
-        conn = conn_cls(host, port, timeout=remaining)
+        host_fmt = f"[{host}]" if ":" in host else host
+        host_header = host_fmt if port == default_port else f"{host_fmt}:{port}"
+        if scheme == "https":
+            if http.client.HTTPSConnection is _STD_HTTPS_CONNECTION:
+                conn: http.client.HTTPConnection = _PinnedHTTPSConnection(
+                    host, port, timeout=remaining, pinned_ip=pinned_ip
+                )
+            else:
+                conn = http.client.HTTPSConnection(host, port, timeout=remaining)
+        else:
+            if http.client.HTTPConnection is _STD_HTTP_CONNECTION:
+                conn = _PinnedHTTPConnection(
+                    host, port, timeout=remaining, pinned_ip=pinned_ip
+                )
+            else:
+                conn = http.client.HTTPConnection(host, port, timeout=remaining)
         try:
             conn.request("GET", path, headers={
+                "Host": host_header,
                 "User-Agent": USER_AGENT,
                 "Accept": "*/*",
                 "Accept-Encoding": "gzip",

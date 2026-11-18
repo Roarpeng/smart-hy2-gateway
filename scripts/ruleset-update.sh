@@ -19,14 +19,12 @@
 #        -> 临时集填充 -> ipset swap 原子切换 -> destroy 临时集
 #      swap 后内核里已有 iptables 规则即时命中新数据, 无需改规则
 #   6. 代理当前 on (存在 HY2_PRE 链) 时 ensure 两条 mangle match-set RETURN
-#      规则, 与 proxy-switch.sh 插入的规则逐字一致:
-#        iptables -t mangle -I HY2_PRE 2 -m set --match-set hy2_cn dst -j RETURN
-#        iptables -t mangle -I HY2_OUT 3 -m set --match-set hy2_cn dst -j RETURN
+#      规则, 动态定位保留网段 (-d 0.0.0.0/8) 所在行号并在其前插入:
+#        iptables -t mangle -I HY2_PRE <pos> -m set --match-set hy2_cn dst -j RETURN
+#        iptables -t mangle -I HY2_OUT <pos> -m set --match-set hy2_cn dst -j RETURN
 #      (-C 检查不带位置; 已存在则跳过)
-#   7. 探活后端 API -> GET /api/state -> 剔除后端附加的 "status" 键
-#      -> POST /api/apply 回传, 触发 sing-box 重建配置 -> check -> 重启,
-#      让新 geosite 生效。已核实 backend_app.py: /api/state 归一化返回
-#      与 POST /api/apply 的 StateModel 同构 (含节点 id), 可直接回传。
+#   7. 探活后端 API (/api/health) -> 带 Authorization: Bearer <token> 调用
+#      POST /api/reload, 触发 sing-box 热重载配置与 ipset 同步, 让新规则集生效。
 #
 # 失败语义:
 #   - 下载/校验/仓库落盘失败 -> exit 1 (systemd failed)
@@ -55,6 +53,12 @@ RULESET_DIR="$REPO_DIR/ruleset"
 CONTAINER=hy2-gateway
 CONTAINER_RULESET_DIR=/usr/local/share/sing-box
 NEW_SET="${CHNROUTE_SET}_new"
+
+# 阿里云段补丁: 上游 geoip-cn.srs 缺失的中国网段 (2026-11-07 实测 8.130.x
+# 阿里云北京段未收录, 阿里系遥测被灌进隧道)。与 backend_app.py 的
+# EXTRA_CN_CIDRS 同源, 两处改动必须同步 (本脚本每周重建 hy2_cn, 会冲掉
+# 后端启动时追加的补丁段)。
+EXTRA_CN_CIDRS=("8.128.0.0/10")
 
 # ---------------------------------------------------------------------------
 # 基础工具 (log 风格与 proxy-switch.sh 一致)
@@ -159,6 +163,11 @@ rebuild_ipset() {
         return 0
     fi
 
+    # 追加上游数据缺口补丁 (EXTRA_CN_CIDRS, 见头部注释; 灌入用 -exist, 重复无害)
+    for cidr in "${EXTRA_CN_CIDRS[@]}"; do
+        printf '%s\n' "$cidr" >> "$cidr_file"
+    done
+
     # 临时集: hash:net family inet maxelem 65536
     ipset create "$NEW_SET" hash:net family inet maxelem 65536 -exist 2>/dev/null || true
     ipset flush "$NEW_SET" 2>/dev/null || true
@@ -193,14 +202,18 @@ rebuild_ipset
 #    失败必须如实 WARN —— 不能"吞掉错误仍报已插入"
 # ---------------------------------------------------------------------------
 ensure_cn_rule() {
-    # ensure_cn_rule <链> <插入位次>
-    # 位次与 proxy-switch.sh 构建序一致: HY2_PRE=4 (RJ45,DNS:53 之后),
-    # HY2_OUT=5 (UID,RJ45,DNS:53 之后) —— 必须后于 DNS 劫持(否则国内 DNS
-    # 查询被内核放行绕过劫持)、先于 catch-all
-    local chain="$1" pos="$2"
+    # ensure_cn_rule <链> <默认插入位次>
+    # 动态定位保留网段首条 (-d 0.0.0.0/8) 所在行号 (去掉首行 -N 后的 1-based 序号),
+    # 在其前插入中国 IP 直连规则; 找不到时回退传入的默认位次
+    local chain="$1" default_pos="$2" pos=""
     if iptables -t mangle -C "$chain" -m set --match-set "$CHNROUTE_SET" dst -j RETURN 2>/dev/null; then
         return 0  # 已在位
     fi
+    pos="$(iptables -t mangle -S "$chain" 2>/dev/null | awk '
+        /^-N / { next }
+        /^-A / { idx++; if ($0 ~ /-d 0\.0\.0\.0\/8([[:space:]]|$)/) { print idx; exit } }
+    ' || true)"
+    [[ -n "$pos" ]] || pos="$default_pos"
     if iptables -t mangle -I "$chain" "$pos" -m set --match-set "$CHNROUTE_SET" dst -j RETURN 2>/dev/null; then
         log "已插入: $chain 位${pos} -m set --match-set $CHNROUTE_SET dst -j RETURN"
     else
@@ -219,32 +232,25 @@ fi
 # 6. 触发 sing-box 重载 (让新 geosite 生效; 不允许 docker restart)
 # ---------------------------------------------------------------------------
 reload_singbox() {
-    local state_json=""
+    local TOKEN="${GATEWAY_TOKEN:-}"
+    if [[ -z "$TOKEN" && -r "$REPO_DIR/data/api_token" ]]; then
+        TOKEN="$(tr -d '[:space:]' < "$REPO_DIR/data/api_token" 2>/dev/null || true)"
+    fi
 
-    if ! curl -fsS -m 8 "$API/api/status" >/dev/null 2>&1; then
+    curl -fsS -m 8 "$API/api/health" >/dev/null 2>&1 || {
         log "WARN: 后端 API 不可达 ($API), 规则集已就位, sing-box 下次重启生效"
         return 0
+    }
+
+    local auth_args=()
+    if [[ -n "$TOKEN" ]]; then
+        auth_args=(-H "Authorization: Bearer $TOKEN")
     fi
 
-    state_json="$(curl -fsS -m 8 "$API/api/state" 2>/dev/null || true)"
-    if [[ -z "$state_json" ]] || ! command -v jq >/dev/null 2>&1; then
-        log "WARN: 无法获取/规整 /api/state, 规则集已就位, sing-box 下次重启生效"
-        return 0
-    fi
-
-    # 剔除后端附加的 "status" 标记键 (仅未初始化时出现, StateModel 无此字段);
-    # 规整后为空对象 (未初始化) 则不回传, 避免凭空生成空状态文件
-    state_json="$(printf '%s' "$state_json" | jq -c 'if (type == "object") then del(.status) else empty end' 2>/dev/null || true)"
-    if ! printf '%s' "$state_json" | jq -e 'type == "object" and length > 0' >/dev/null 2>&1; then
-        log "WARN: /api/state 为空/未初始化, 跳过重载 (规则集已就位, sing-box 下次重启生效)"
-        return 0
-    fi
-
-    if printf '%s' "$state_json" | curl -fsS -m 40 -X POST -H 'Content-Type: application/json' \
-            -d @- "$API/api/apply" >/dev/null 2>&1; then
-        log "sing-box 已重载 (/api/apply): 新 geosite-cn/geoip-cn 已生效"
+    if curl -fsS -m 40 -X POST "${auth_args[@]}" "$API/api/reload" >/dev/null 2>&1; then
+        log "sing-box 已重载 (/api/reload): 新 geosite-cn/geoip-cn 已生效"
     else
-        log "WARN: /api/apply 回传失败, 规则集已就位, sing-box 下次重启生效"
+        log "WARN: /api/reload 触发失败, 规则集已就位, sing-box 下次重启生效"
     fi
 }
 reload_singbox

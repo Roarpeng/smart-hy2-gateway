@@ -481,6 +481,7 @@ main { flex: 1; }
    Forms
    ============================================================ */
 .field { display: block; min-width: 0; }
+.field[hidden], [data-proto][hidden] { display: none !important; }
 .field > span {
   display: block;
   margin-bottom: 7px;

@@ -16,10 +16,12 @@
 #      本服务重写 dhcpd.conf 后自带网关 192.168.100.1 与 DNS。
 #      非 VMware 宿主由 unit 的 ConditionPathExists 自动跳过。
 #   7. 安装 vmnet 设备兜底 (vmnet-ensure.sh + vmnet-guard.service)
-#      /dev 为 tmpfs, 重启即清空; 若虚拟机在 /dev/vmnetN 就绪前启动, vmx 会
-#      报 "MACVNetPortOpenDevice: can't open vmnet device" 并把网卡标记为
-#      startdisconnected 后永不重试 —— 表现为虚拟机永久断网, 且宿主侧
-#      iptables/路由全部正常, 极难定位。本单元开机补建缺失的设备节点。
+#      /dev 为 tmpfs, 重启即清空; 若 vmware-networks --start 早于节点就绪,
+#      vmnet1 的 netifup 会被跳过 (接口永不创建), 虚拟机网卡则被标记为
+#      startdisconnected 永不重试 —— 表现为虚拟机永久断网, 且宿主侧
+#      iptables/路由全部正常, 极难定位。
+#      双层防护: 本单元先于 vmware.service 补建设备节点 (节点先行);
+#      接口级缺失由 hy2-vmnet1-dhcp.service 重启自愈补跑 netifup。
 #      非 VMware 宿主由 unit 的 ConditionPathExists 自动跳过。
 #   8. 安装尾声 best-effort 首跑一次 ruleset-update.sh (离线失败只 WARN)
 #
@@ -81,6 +83,18 @@ fi
 install -m 755 -o root -g root "$SRC_PROXY_SWITCH" "$DST_PROXY_SWITCH"
 echo "[OK] 已安装: $DST_PROXY_SWITCH"
 
+# --- 持久化内核参数 (/etc/sysctl.d/99-hy2-gateway.conf) ---
+mkdir -p /etc/sysctl.d
+cat > /etc/sysctl.d/99-hy2-gateway.conf <<'EOF'
+net.ipv4.ip_forward = 1
+net.ipv4.ip_nonlocal_bind = 1
+net.core.default_qdisc = fq
+EOF
+chown root:root /etc/sysctl.d/99-hy2-gateway.conf
+chmod 644 /etc/sysctl.d/99-hy2-gateway.conf
+sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-hy2-gateway.conf >/dev/null 2>&1 || true
+echo "[OK] 已写入并加载内核参数: /etc/sysctl.d/99-hy2-gateway.conf"
+
 # --- 安装 NetworkManager dispatcher 钩子 ---
 mkdir -p "$DISPATCHER_DIR"
 install -m 755 -o root -g root "$SRC_DISPATCHER" "$DST_DISPATCHER"
@@ -134,7 +148,7 @@ if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
     if [[ ! -e /dev/vmnet1 ]] && [[ ! -x /usr/lib/vmware/bin/vmware-vmx ]]; then
         echo "[跳过] 未检测到 VMware (无 /dev/vmnet1 与 vmware-vmx), 已安装单元但不启用"
     elif systemctl enable --now vmnet-guard.service 2>/dev/null; then
-        echo "[OK] 已安装并启用: vmnet-guard.service (开机补建 /dev/vmnet0/1/8)"
+        echo "[OK] 已安装并启用: vmnet-guard.service (先于 vmware.service 补建 /dev/vmnet0/1/8)"
     else
         echo "警告: vmnet-guard.service 启用失败, 请检查 systemd 环境" >&2
     fi

@@ -17,3 +17,7 @@ venv/
 
 # 本地会话数据 (记忆/临时稿, 不入库)
 .workbuddy/
+
+# 本地二进制缓存 (CI 自动拉取或使用本地缓存)
+vendor/sing-box
+!vendor/.gitkeep

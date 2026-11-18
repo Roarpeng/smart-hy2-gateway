@@ -62,9 +62,32 @@ SINGBOX_GID = 930
 CHECK_TIMEOUT = 15         # sing-box check 超时 (秒)
 SWITCH_TIMEOUT = 30        # proxy-switch.sh 执行超时 (秒)
 STABLE_UPTIME = 60         # 存活超过该秒数则重置崩溃退避
+# 上游 geoip-cn.srs 缺失的中国网段补丁 (2026-11-07 断网取证: 8.130.222.161
+# 阿里云北京段未收录, 全天 direct 出站仅 67 次, 阿里系遥测整段灌进隧道)。
+# sync_chnroute_ipset 与 build_singbox_config 两侧共用;
+# scripts/ruleset-update.sh 的 EXTRA_CN_CIDRS 必须与此保持一致。
+EXTRA_CN_CIDRS = ["8.128.0.0/10"]
+# 隧道故障看门狗: sing-box 日志出现特征行 = QUIC 空闲死亡 / 流耗尽。
+# 依据 2026-11-07 取证: 隧道 UDP 流周期性死亡 (quic 收不到服务器任何包,
+# 本机链路与国内直连全程正常), 全量 DoH-over-tunnel 重试风暴随即打爆单连接
+# 流上限 (too many open streams), 国外流量冻结数分钟才自愈。看门狗把恢复
+# 压缩为秒级重启 sing-box。阈值按死亡时刻实测密度 (~11 条/10s) 留安全余量。
+TUNNEL_FAILURE_PATTERNS = ("too many open streams", "no recent network activity")
+WATCHDOG_WINDOW_S = 30.0        # 特征行滑动统计窗口
+WATCHDOG_THRESHOLD = 6          # 窗口内达到该条数即判定故障风暴
+WATCHDOG_MIN_INTERVAL_S = 60.0  # 两次看门狗重启的最小间隔 (防振荡)
+WATCHDOG_START_GRACE_S = 30.0   # spawn 后宽限期, 启动噪声不计数
 LAST_DECISION_FILE = Path("/data/last_decision")  # proxy-switch on/off 落盘的期望态
 CURRENT_SSID_FILE = Path("/data/current_ssid")    # 宿主 dispatcher 落盘的当前 SSID
 GUARD_INTERVAL = 30        # 规则守护巡检周期 (秒)
+REDACTED_SECRET = "***"
+_DIAG_USER = os.environ.get("DIAG_SOCKS_USER", "diag")
+_DIAG_PASS = os.environ.get("DIAG_SOCKS_PASS") or secrets.token_urlsafe(16)
+_DIAG_PORT = int(os.environ.get("DIAG_SOCKS_PORT", "19090"))
+AUTO_HEAL_INTERVAL_S = 120.0
+AUTO_HEAL_FAIL_THRESHOLD = 2
+AUTO_HEAL_COOLDOWN_S = 600.0
+_state_lock = threading.RLock()
 # API 鉴权: 环境变量 GATEWAY_TOKEN 优先; 否则读/写 /data/api_token
 # 监听: 默认 127.0.0.1; ALLOW_LAN=1 时绑定 0.0.0.0
 AUTH_PUBLIC_PATHS = frozenset({"/api/health"})
@@ -105,7 +128,7 @@ def _extract_bearer(request: Request) -> str:
     header_token = (request.headers.get("X-Gateway-Token") or "").strip()
     if header_token:
         return header_token
-    return (request.query_params.get("token") or "").strip()
+    return ""
 
 
 class GatewayAuthMiddleware(BaseHTTPMiddleware):
@@ -222,16 +245,37 @@ class NodePatchModel(BaseModel):
     down_mbps: Optional[int] = Field(default=None, ge=0)
     port_hopping: Optional[str] = None
     method: Optional[str] = None
+    plugin: Optional[str] = None
+    plugin_opts: Optional[str] = None
     uuid: Optional[str] = None
     flow: Optional[str] = None
+    encryption: Optional[str] = None
+    packet_encoding: Optional[str] = None
     transport: Optional[str] = None
     transport_path: Optional[str] = None
     transport_host: Optional[str] = None
+    transport_service_name: Optional[str] = None
     reality_enabled: Optional[bool] = None
     reality_public_key: Optional[str] = None
     reality_short_id: Optional[str] = None
+    spider_x: Optional[str] = None
     utls_fingerprint: Optional[str] = None
     tls_enabled: Optional[bool] = None
+
+
+class SettingsPatchModel(BaseModel):
+    """PATCH /api/settings 请求体: 仅更新通道/网络/白名单配置。"""
+
+    whitelist: Optional[list[str]] = None
+    wifi_iface: Optional[str] = None
+    rj45_iface: Optional[str] = None
+    vmnet_iface: Optional[str] = None
+    vmnet_subnet: Optional[str] = None
+    vm_uplinks: Optional[list[dict]] = None
+    wifi_policy: Optional[Literal["whitelist", "always_proxy", "always_direct"]] = None
+    tproxy_port: Optional[int] = Field(default=None, ge=1, le=65535)
+    fwmark: Optional[int] = None
+    table: Optional[int] = None
 
 
 class NodeImportModel(BaseModel):
@@ -261,21 +305,34 @@ class NetTestModel(BaseModel):
 
 # ---------------- 工具函数 ----------------
 def atomic_write_json(path: Path, data: dict, mode: int = 0o600, gid: Optional[int] = None) -> None:
-    """tmp + rename 原子落盘; 创建即带目标权限, 避免半成品文件暴露密码。"""
-    tmp = path.with_name(path.name + ".tmp")
-    # O_CREAT 即带 mode, 不经过 644 中间态; chmod 兜底清理历史残留的同名 tmp
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(json.dumps(data, indent=2, ensure_ascii=False))
-    if gid is not None:
-        # 容器内以 root 运行: 授权 singbox 组读取 (sing-box 以 UID 930 运行);
-        # 非 root 环境 (本机自测) 无法 chown, 保留当前属组即可
-        try:
-            os.chown(tmp, 0, gid)
-        except PermissionError:
-            log.warning("chown gid=%s failed (non-root?), keep current owner: %s", gid, path)
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    """NamedTemporaryFile + replace 原子落盘; 唯一临时文件消除并发竞争。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = f.name
+            f.write(json.dumps(data, indent=2, ensure_ascii=False))
+            f.flush()
+        if gid is not None:
+            # 容器内以 root 运行: 授权 singbox 组读取 (sing-box 以 UID 930 运行);
+            # 非 root 环境 (本机自测) 无法 chown, 保留当前属组即可
+            try:
+                os.chown(tmp_path, 0, gid)
+            except PermissionError:
+                log.warning("chown gid=%s failed (non-root?), keep current owner: %s", gid, path)
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except Exception:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
+        raise
 
 
 # ---------------- 多节点状态归一化 ----------------
@@ -370,6 +427,10 @@ def normalize_state_dict(data: dict) -> dict:
         if proto == "ss":
             proto = "shadowsocks"
         node["protocol"] = proto
+        if proto == "shadowsocks":
+            if not str(node.get("method") or "").strip() and str(node.get("obfs_type") or "").strip():
+                node["method"] = str(node["obfs_type"]).strip()
+            node["obfs_type"] = ""
         nid = str(node.get("id") or "").strip()
         if not nid or nid in used_ids:
             nid = _new_node_id(used_ids)
@@ -479,9 +540,9 @@ def _public_node(node: dict, reveal: bool = False) -> dict:
     out["obfs_password_set"] = bool(obfs.strip())
     if not reveal:
         if pwd:
-            out["password"] = "***"
+            out["password"] = REDACTED_SECRET
         if obfs:
-            out["obfs_password"] = "***"
+            out["obfs_password"] = REDACTED_SECRET
     with _latency_lock:
         cached = _latency_cache.get(str(node.get("id") or ""))
     if cached:
@@ -703,15 +764,24 @@ def build_singbox_config(state: StateModel) -> dict:
     # 先于 geosite-cn 规则命中。
     _google_keywords = ["google", "gstatic"]
 
+    node_domains: list[str] = []
+    candidate_hosts = [str(node.server or "").strip()]
+    if fallback and fallback.id != node.id:
+        candidate_hosts.append(str(fallback.server or "").strip())
+    for host in candidate_hosts:
+        if not host or host in node_domains:
+            continue
+        try:
+            _ipaddress.ip_address(host)   # 字面量 IP: 无需自解析规则
+        except ValueError:
+            node_domains.append(host)
+
     dns_rules: list[dict] = [
         {"domain_keyword": _google_keywords, "server": "proxy-dns"},
         {"rule_set": ["geosite-cn"], "server": "cn-dns"},
     ]
-    node_host = str(node.server or "").strip()
-    try:
-        _ipaddress.ip_address(node_host)   # 字面量 IP: 无需自解析规则
-    except ValueError:
-        dns_rules.append({"domain": [node_host], "server": "cn-dns"})
+    if node_domains:
+        dns_rules.insert(0, {"domain": node_domains, "server": "cn-dns"})
 
     return {
         "log": {"level": "info", "timestamp": True},
@@ -719,10 +789,12 @@ def build_singbox_config(state: StateModel) -> dict:
         "dns": {
             "servers": [
                 {"tag": "cn-dns", "address": "udp://223.5.5.5", "detour": "direct"},
-                # 国外域名经隧道 DoH 解析: 本链路实测 UDP 53 会出现 5-10s
-                # 超时 (丢包后重传不可控), 而 DoH 走 TCP 443 有重传保障,
-                # 冷启动约 0.5-0.8s, 命中缓存后约 1 RTT; TCP 443 也几乎不被节点封。
-                {"tag": "proxy-dns", "address": "https://1.1.1.1/dns-query", "detour": dns_detour},
+                # 国外域名经隧道 TCP 解析 (2026-11-15 定案, 三版演进):
+                # v1 DoH: 隧道重建后长连接僵死 -> 弃
+                # v2 udp://8.8.8.8: 大吞吐打满链路后 UDP 小包先死 (TCP 靠重传活着) -> 弃
+                # v3 tcp://8.8.8.8: 走隧道 TCP 转发路径 (实测大流量下依然健康,
+                #    ip-api 200/1s), 每查询独立连接无僵死面, TCP 重传保障可靠性。
+                {"tag": "proxy-dns", "address": "tcp://8.8.8.8", "detour": dns_detour},
             ],
             "rules": dns_rules,
             "final": "proxy-dns",
@@ -735,7 +807,17 @@ def build_singbox_config(state: StateModel) -> dict:
                 "listen_port": state.tproxy_port,
                 "sniff": True,
                 "sniff_override_destination": False,
-            }
+            },
+            # 诊断入口 (2026-11-18): 宿主 link-scheduler 经此测"存量连接"吞吐 —
+            # 握手探测(/api/nodes/test)每次新建连接, 测不到 DPI 咬合下的在用
+            # QUIC 连接劣化; 此入口与用户流量共用同一批出站连接, 吞吐即真实体验。
+            {
+                "type": "mixed",
+                "tag": "diag-in",
+                "listen": "127.0.0.1",
+                "listen_port": _DIAG_PORT,
+                "users": [{"username": _DIAG_USER, "password": _DIAG_PASS}],
+            },
         ],
         "outbounds": proxy_outbounds + [
             {"type": "direct", "tag": "direct"},
@@ -750,6 +832,7 @@ def build_singbox_config(state: StateModel) -> dict:
                  "outbound": "direct"},
                 {"domain_keyword": _google_keywords, "outbound": route_final},
                 {"rule_set": ["geosite-cn"], "outbound": "direct"},
+                {"ip_cidr": EXTRA_CN_CIDRS, "outbound": "direct"},
                 {"rule_set": ["geoip-cn"], "outbound": "direct"},
             ],
             "rule_set": [
@@ -778,18 +861,31 @@ def run_singbox_check(config_file: Optional[Path] = None) -> tuple[bool, str]:
 
 # ---------------- 下发事务 ----------------
 def _write_bytes_atomic(path: Path, data: bytes, mode: int, gid: Optional[int] = None) -> None:
-    """字节级原子写 (回滚用); 与 atomic_write_json 同样的权限策略。"""
-    tmp = path.with_name(path.name + ".rollback")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
-    if gid is not None:
-        try:
-            os.chown(tmp, 0, gid)
-        except PermissionError:
-            pass
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    """字节级原子写 (回滚用); 与 atomic_write_json 同样的权限策略与唯一临时文件。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=str(path.parent),
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = f.name
+            f.write(data)
+            f.flush()
+        if gid is not None:
+            try:
+                os.chown(tmp_path, 0, gid)
+            except PermissionError:
+                pass
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except Exception:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
+        raise
 
 
 def _restore_bytes(path: Path, data: Optional[bytes], mode: int, gid: Optional[int] = None) -> None:
@@ -893,10 +989,14 @@ class SingBoxManager:
     def __init__(self) -> None:
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
         self._stopping = False        # 主动停机标志 (区别于意外退出)
         self._config_valid = False    # 当前 singbox.json 是否通过 check
         self._backoff = 1.0           # 崩溃重启退避秒数
         self._spawned_at = 0.0
+        self._wd_lock = threading.Lock()
+        self._wd_hits: list[float] = []   # 隧道故障特征行时间戳 (滑动窗口)
+        self._wd_last_restart = 0.0       # 上次看门狗重启时刻 (monotonic)
 
     def is_running(self) -> bool:
         proc = self._proc
@@ -916,47 +1016,92 @@ class SingBoxManager:
             shell=False,  # argv 列表直传, 不经 shell; 参数均为内部常量
             user=SINGBOX_UID,
             group=SINGBOX_GID,
+            stdout=subprocess.PIPE,   # 日志经泵线程转发, 同时喂隧道故障看门狗
+            stderr=subprocess.STDOUT,
         )
+        threading.Thread(target=self._pump_output, args=(self._proc,),
+                         name="singbox-log-pump", daemon=True).start()
 
     def start(self) -> bool:
         """拉起 sing-box; 配置文件缺失或已存活时不动作。"""
-        with self._lock:
-            if self.is_running():
-                return True
-            if not SINGBOX_CONFIG_FILE.exists():
-                return False
-            self._stopping = False
-            try:
-                self._spawn()
-            except Exception as exc:
-                log.error("sing-box spawn failed: %s", exc)
-                return False
-        # 常驻监控线程只起一次
-        if not getattr(self, "_monitor_on", False):
-            self._monitor_on = True
-            threading.Thread(target=self._monitor_loop, name="singbox-monitor", daemon=True).start()
-        return self.is_running()
+        with self._lifecycle_lock:
+            with self._lock:
+                if self.is_running():
+                    return True
+                if not SINGBOX_CONFIG_FILE.exists():
+                    return False
+                self._stopping = False
+                try:
+                    self._spawn()
+                except Exception as exc:
+                    log.error("sing-box spawn failed: %s", exc)
+                    return False
+            # 常驻监控线程只起一次
+            if not getattr(self, "_monitor_on", False):
+                self._monitor_on = True
+                threading.Thread(target=self._monitor_loop, name="singbox-monitor", daemon=True).start()
+            return self.is_running()
 
     def stop(self) -> None:
         """主动停机: terminate -> 超时 kill。"""
-        with self._lock:
-            self._stopping = True
-        proc = self._proc
-        if proc is not None and proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        with self._lifecycle_lock:
+            with self._lock:
+                self._stopping = True
+            proc = self._proc
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
                 try:
-                    proc.wait(timeout=5)
+                    proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
-                    pass
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
 
     def restart(self) -> bool:
-        self.stop()
-        time.sleep(0.3)  # 留出端口释放时间
-        return self.start()
+        with self._lifecycle_lock:
+            self.stop()
+            time.sleep(0.3)  # 留出端口释放时间
+            return self.start()
+
+    def _pump_output(self, proc: subprocess.Popen) -> None:
+        """转发 sing-box 日志到容器 stdout (维持 docker logs 可读), 并统计
+        隧道故障特征行驱动看门狗。循环内的异常必须吞掉: 泵停转会把管道写满,
+        sing-box 阻塞在写日志上 = 整条隧道停摆。"""
+        try:
+            stream = proc.stdout
+            if stream is None:
+                return
+            for raw in iter(stream.readline, b""):
+                try:
+                    os.write(1, raw)
+                except OSError:
+                    pass
+                line = raw.decode("utf-8", "replace")
+                if any(p in line for p in TUNNEL_FAILURE_PATTERNS):
+                    self._watchdog_hit()
+        except Exception:
+            pass  # 进程退出 (readline 返回 b"") 或管道破裂: 静默结束
+
+    def _watchdog_hit(self) -> None:
+        """单条故障特征行入账; 滑动窗口内密度超阈值 -> 重启 sing-box 自愈。"""
+        now = time.monotonic()
+        if now - self._spawned_at < WATCHDOG_START_GRACE_S:
+            return
+        with self._wd_lock:
+            hits = self._wd_hits + [now]
+            hits = [t for t in hits if t > now - WATCHDOG_WINDOW_S]
+            self._wd_hits = hits
+            if len(hits) < WATCHDOG_THRESHOLD:
+                return
+            if now - self._wd_last_restart < WATCHDOG_MIN_INTERVAL_S:
+                return
+            self._wd_hits = []
+            self._wd_last_restart = now
+        log.warning("singbox-watchdog: 隧道故障风暴 (%d 条特征行/%.0fs), 重启 sing-box 自愈",
+                    WATCHDOG_THRESHOLD, WATCHDOG_WINDOW_S)
+        self.restart()
 
     def _monitor_loop(self) -> None:
         """后台守护: 意外退出且配置有效 -> 指数退避自动重启; 主动 stop 只挂起。"""
@@ -1069,7 +1214,7 @@ def _dns_hijack_rules_ok() -> bool:
                              capture_output=True, text=True, timeout=5)
         out = subprocess.run(["iptables", "-t", "mangle", "-S", "HY2_OUT"],
                              capture_output=True, text=True, timeout=5)
-        nat = subprocess.run(["iptables", "-t", "nat", "-S", "POSTROUTING"],
+        nat = subprocess.run(["iptables", "-t", "nat", "-S"],
                              capture_output=True, text=True, timeout=5)
         if pre.returncode != 0 or out.returncode != 0 or nat.returncode != 0:
             return True
@@ -1099,9 +1244,9 @@ def _dns_hijack_rules_ok() -> bool:
         try:
             state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
             vmnet_subnet = str(state.get("vmnet_subnet") or "192.168.100.0/24")
-            wifi_iface = str(state.get("wifi_iface") or "wlo1")
+            wifi_iface = str(state.get("wifi_iface") or "wlp2s0")
         except Exception:
-            vmnet_subnet, wifi_iface = "192.168.100.0/24", "wlo1"
+            vmnet_subnet, wifi_iface = "192.168.100.0/24", "wlp2s0"
         masq_ok = any(
             ("-j MASQUERADE" in l) and (f"-s {vmnet_subnet} " in l) and (f"-o {wifi_iface} " in l)
             for l in nat.stdout.splitlines()
@@ -1184,6 +1329,7 @@ def proxy_switch_env() -> dict:
         val = data.get(key)
         if val not in (None, ""):
             env[env_name] = str(val)
+    env["VM_UPLINKS_JSON"] = json.dumps(data.get("vm_uplinks") or [], ensure_ascii=False)
     return env
 
 
@@ -1237,6 +1383,10 @@ def sync_chnroute_ipset() -> bool:
         if not cidrs:
             log.warning("chnroute: decompile 结果无 IPv4 CIDR, 保留现有集合")
             return False
+        # 补上游数据缺口 (EXTRA_CN_CIDRS, 见常量注释)
+        for extra in EXTRA_CN_CIDRS:
+            if extra not in cidrs:
+                cidrs.append(extra)
 
         # 临时集填充 -> swap 原子换表: 内核中已有 iptables 规则即时命中新数据
         new_set = f"{set_name}_new"
@@ -1257,16 +1407,30 @@ def sync_chnroute_ipset() -> bool:
             return False
         log.info("chnroute: ipset %s 已重建 (%d 条 IPv4 CIDR)", set_name, len(cidrs))
 
-        # 代理在开时确保 mangle 匹配规则在位 (位次与 proxy-switch.sh 构建序一致:
-        # HY2_PRE=4 / HY2_OUT=5, 后于 DNS 劫持、先于 catch-all)
+        # 代理在开时确保 mangle 匹配规则在位 (动态读取 -d 0.0.0.0/8 所在位次插入,
+        # 回退 HY2_PRE=4 / HY2_OUT=5, 后于 DNS 劫持、先于保留段/catch-all)
         if is_proxy_active():
-            for chain, pos in (("HY2_PRE", "4"), ("HY2_OUT", "5")):
+            for chain, default_pos in (("HY2_PRE", "4"), ("HY2_OUT", "5")):
                 chk = subprocess.run(
                     ["iptables", "-t", "mangle", "-C", chain,
                      "-m", "set", "--match-set", set_name, "dst", "-j", "RETURN"],
                     capture_output=True, timeout=5,
                 )
                 if chk.returncode != 0:
+                    pos = default_pos
+                    try:
+                        dump = subprocess.run(
+                            ["iptables", "-t", "mangle", "-S", chain],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        if dump.returncode == 0 and isinstance(dump.stdout, str) and dump.stdout:
+                            lines = [ln for ln in dump.stdout.splitlines() if ln.strip()]
+                            for idx, ln in enumerate(lines[1:], start=1):
+                                if "-d 0.0.0.0/8" in ln:
+                                    pos = str(idx)
+                                    break
+                    except Exception:
+                        pass
                     subprocess.run(
                         ["iptables", "-t", "mangle", "-I", chain, pos,
                          "-m", "set", "--match-set", set_name, "dst", "-j", "RETURN"],
@@ -1309,45 +1473,148 @@ def reapply_proxy_rules() -> str:
         return f"网络规则重载异常: {exc}"
 
 
+def _restore_node_redacted_secrets(node: dict, ref_node: Optional[dict]) -> None:
+    """若传入节点的口令字段为脱敏哨兵 '***', 用磁盘已存节点的真实口令回填, 绝不将 '***' 落盘。"""
+    ref = ref_node if isinstance(ref_node, dict) else {}
+    if node.get("password") == REDACTED_SECRET:
+        real_pwd = str(ref.get("password") or "")
+        node["password"] = real_pwd if real_pwd != REDACTED_SECRET else ""
+    if node.get("obfs_password") == REDACTED_SECRET:
+        real_obfs = str(ref.get("obfs_password") or "")
+        node["obfs_password"] = real_obfs if real_obfs != REDACTED_SECRET else ""
+    if node.get("uuid") == REDACTED_SECRET:
+        real_uuid = str(ref.get("uuid") or ref.get("password") or "")
+        node["uuid"] = real_uuid if real_uuid != REDACTED_SECRET else ""
+    proto = str(node.get("protocol") or ref.get("protocol") or "hysteria2").strip().lower()
+    if proto == "vless":
+        pwd = str(node.get("password") or "").strip()
+        uid = str(node.get("uuid") or "").strip()
+        if pwd and pwd != REDACTED_SECRET and (not uid or uid == REDACTED_SECRET):
+            node["uuid"] = pwd
+        elif uid and uid != REDACTED_SECRET and (not pwd or pwd == REDACTED_SECRET):
+            node["password"] = uid
+
+
 @app.post("/api/apply")
 def apply_state(state: StateModel):
     """保存状态 -> 归一化 -> 校验配置 -> 事务下发 (旧前端只传 current_node 也兼容)。"""
-    data = state.model_dump()
-    # 旧前端 payload 不含 nodes 字段: 保留已有多节点列表, 并把 current_node 的改动
-    # 合并到当前活跃节点 (否则一次"保存设置"会把导入的节点列表清空)
-    if "nodes" not in state.model_fields_set and "active_node_id" not in state.model_fields_set:
+    with _state_lock:
+        data = state.model_dump()
         try:
             stored = _load_state_dict(persist=False)
         except HTTPException:
             stored = None
-        if stored and stored.get("nodes"):
-            active = str(stored.get("active_node_id") or "")
-            dumped = data.get("current_node") or {}
-            incoming = {k: dumped[k] for k in state.current_node.model_fields_set if k in dumped}
-            for node in stored["nodes"]:
-                if node.get("id") == active:
-                    for key in NODE_FIELDS:
-                        if key in incoming:
-                            node[key] = incoming[key]
-                    break
-            data["nodes"] = stored["nodes"]
-            data["active_node_id"] = active
-    data = normalize_state_dict(data)
-    try:
-        normalized = StateModel.model_validate(data)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"状态参数非法: {exc}")
-    message = commit_state(normalized, restart=True)
-    network_message = reapply_proxy_rules()
-    # 每周规则更新走 /api/apply 回传, 顺带刷新内核直连集 (数据源同源)
-    chnroute_ok = sync_chnroute_ipset()
-    has_active = _resolve_active_node(normalized) is not None
-    return {
-        "status": "success",
-        "message": message,
-        "network_message": network_message,
-        "singbox_valid": has_active,
-    }
+        stored_nodes = (stored.get("nodes") or []) if isinstance(stored, dict) else []
+        stored_by_id = {
+            str(n.get("id")): n for n in stored_nodes if isinstance(n, dict) and n.get("id")
+        }
+        stored_active_id = str((stored or {}).get("active_node_id") or "")
+        stored_current = (stored or {}).get("current_node")
+        if not isinstance(stored_current, dict):
+            stored_current = {}
+        stored_active_node = stored_by_id.get(stored_active_id) or stored_current
+
+        if isinstance(data.get("current_node"), dict):
+            cur = data["current_node"]
+            cur_id = str(cur.get("id") or "").strip()
+            ref_cur = stored_by_id.get(cur_id) if cur_id in stored_by_id else stored_active_node
+            _restore_node_redacted_secrets(cur, ref_cur)
+
+        # 旧前端 payload 不含 nodes 字段: 保留已有多节点列表, 并把 current_node 的改动
+        # 合并到当前活跃节点 (否则一次"保存设置"会把导入的节点列表清空)
+        if "nodes" not in state.model_fields_set and "active_node_id" not in state.model_fields_set:
+            if stored and stored.get("nodes"):
+                active = stored_active_id
+                dumped = data.get("current_node") or {}
+                incoming = {k: dumped[k] for k in state.current_node.model_fields_set if k in dumped}
+                for node in stored["nodes"]:
+                    if node.get("id") == active:
+                        for key in NODE_FIELDS:
+                            if key in incoming:
+                                node[key] = incoming[key]
+                        _restore_node_redacted_secrets(node, stored_active_node)
+                        break
+                data["nodes"] = stored["nodes"]
+                data["active_node_id"] = active
+        else:
+            for node in data.get("nodes") or []:
+                if not isinstance(node, dict):
+                    continue
+                nid = str(node.get("id") or "").strip()
+                ref = stored_by_id.get(nid)
+                if ref is None and len(data.get("nodes") or []) == 1:
+                    ref = stored_active_node
+                _restore_node_redacted_secrets(node, ref)
+
+        data = normalize_state_dict(data)
+        try:
+            normalized = StateModel.model_validate(data)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"状态参数非法: {exc}")
+        message = commit_state(normalized, restart=True)
+        network_message = reapply_proxy_rules()
+        # 每周规则更新走 /api/apply 回传, 顺带刷新内核直连集 (数据源同源)
+        chnroute_ok = sync_chnroute_ipset()
+        has_active = _resolve_active_node(normalized) is not None
+        return {
+            "status": "success",
+            "message": message,
+            "network_message": network_message,
+            "singbox_valid": has_active,
+        }
+
+
+@app.patch("/api/settings")
+def update_settings(patch: SettingsPatchModel):
+    """轻量更新通道/网络/白名单设置, 不触碰节点列表与节点口令。"""
+    with _state_lock:
+        data = _load_state_dict(persist=False)
+        old_tproxy_port = int(data.get("tproxy_port") or 12345)
+        updates = patch.model_dump(exclude_unset=True)
+        for key, value in updates.items():
+            if value is not None:
+                data[key] = value
+        if "vm_uplinks" not in updates and ("vmnet_iface" in updates or "vmnet_subnet" in updates):
+            data["vm_uplinks"] = []
+        data = normalize_state_dict(data)
+        try:
+            state = StateModel.model_validate(data)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"状态参数非法: {exc}")
+        has_active = _resolve_active_node(state) is not None
+        restart = has_active and (state.tproxy_port != old_tproxy_port)
+        message = commit_state(state, restart=restart)
+        network_message = reapply_proxy_rules()
+        return {
+            "status": "success",
+            "message": message,
+            "network_message": network_message,
+            "singbox_valid": has_active,
+        }
+
+
+@app.post("/api/reload")
+def reload_gateway():
+    """热重载地理分流规则集 (ipset hy2_cn + sing-box 配置与进程)。"""
+    with _state_lock:
+        chnroute_ok = sync_chnroute_ipset()
+        data = _load_state_dict(persist=False)
+        try:
+            state = StateModel.model_validate(data)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"状态参数非法: {exc}")
+        if _resolve_active_node(state) is not None:
+            msg = commit_state(state, restart=True)
+            restarted = True
+        else:
+            msg = "未配置可用节点，仅同步规则集"
+            restarted = False
+        return {
+            "status": "success",
+            "restarted": restarted,
+            "chnroute_synced": chnroute_ok,
+            "message": msg,
+        }
 
 
 # ---------------- 多节点管理 API ----------------
@@ -1373,237 +1640,275 @@ def list_nodes(reveal: bool = False):
 @app.post("/api/nodes/{node_id}/fallback")
 def set_fallback_node(node_id: str):
     """设置或清除 urltest 备用节点; node_id='-' 或 'none' 表示清除。"""
-    data = _load_state_dict(persist=False)
-    raw = str(node_id or "").strip()
-    if raw in ("-", "none", "clear", ""):
-        data["fallback_node_id"] = ""
-    else:
-        target = next((n for n in data["nodes"] if n["id"] == raw), None)
-        if target is None:
-            raise HTTPException(status_code=404, detail="节点不存在")
-        if raw == data.get("active_node_id"):
-            raise HTTPException(status_code=422, detail="备用节点不能与活跃节点相同")
-        data["fallback_node_id"] = raw
-    data = normalize_state_dict(data)
-    try:
-        state = StateModel.model_validate(data)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"状态非法: {exc}")
-    # 有活跃节点时重载配置以生效 urltest; 否则只落盘
-    restart = _resolve_active_node(state) is not None
-    message = commit_state(state, restart=restart)
-    return {
-        "status": "success",
-        "message": message,
-        "fallback_node_id": data.get("fallback_node_id", ""),
-    }
+    with _state_lock:
+        data = _load_state_dict(persist=False)
+        raw = str(node_id or "").strip()
+        if raw in ("-", "none", "clear", ""):
+            data["fallback_node_id"] = ""
+        else:
+            target = next((n for n in data["nodes"] if n["id"] == raw), None)
+            if target is None:
+                raise HTTPException(status_code=404, detail="节点不存在")
+            if raw == data.get("active_node_id"):
+                raise HTTPException(status_code=422, detail="备用节点不能与活跃节点相同")
+            data["fallback_node_id"] = raw
+        data = normalize_state_dict(data)
+        try:
+            state = StateModel.model_validate(data)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"状态非法: {exc}")
+        # 有活跃节点时重载配置以生效 urltest; 否则只落盘
+        restart = _resolve_active_node(state) is not None
+        message = commit_state(state, restart=restart)
+        return {
+            "status": "success",
+            "message": message,
+            "fallback_node_id": data.get("fallback_node_id", ""),
+        }
 
 
 @app.post("/api/nodes/import")
 def import_nodes(body: NodeImportModel):
     """导入分享链接/base64 订阅/sing-box JSON; 只更新 nodes, 不重启 sing-box。"""
-    text = (body.text or "").strip()
-    url = (body.url or "").strip()
-    if not text and not url:
-        raise HTTPException(status_code=422, detail="text 与 url 不能同时为空")
+    with _state_lock:
+        text = (body.text or "").strip()
+        url = (body.url or "").strip()
+        if not text and not url:
+            raise HTTPException(status_code=422, detail="text 与 url 不能同时为空")
 
-    errors: list[dict] = []
-    source = "clipboard"
-    # 单行 http(s) URL 视为订阅地址
-    if not url and "\n" not in text and re.match(r"(?i)^https?://", text):
-        url, text = text, ""
-    if url:
-        source = "subscription"
-        try:
-            content = fetch_subscription(url)
-        except Exception as exc:
-            content = ""
-            errors.append({"line": None, "input": _redact_text(url), "error": str(exc)[:300]})
-    else:
-        content = text
+        errors: list[dict] = []
+        source = "clipboard"
+        # 单行 http(s) URL 视为订阅地址
+        if not url and "\n" not in text and re.match(r"(?i)^https?://", text):
+            url, text = text, ""
+        if url:
+            source = "subscription"
+            try:
+                content = fetch_subscription(url)
+            except Exception as exc:
+                content = ""
+                errors.append({"line": None, "input": _redact_text(url), "error": str(exc)[:300]})
+        else:
+            content = text
 
-    parsed: list[dict] = []
-    if content:
-        try:
-            parsed, parse_errors = parse_import_text(content, source=source)
-        except Exception as exc:  # 解析器异常不应升级为 500
-            parsed, parse_errors = [], [{
-                "line": None,
-                "input": _redact_text(content),
-                "error": f"解析失败: {str(exc)[:200]}",
-            }]
-        errors.extend(parse_errors)
+        parsed: list[dict] = []
+        if content:
+            try:
+                parsed, parse_errors = parse_import_text(content, source=source)
+            except Exception as exc:  # 解析器异常不应升级为 500
+                parsed, parse_errors = [], [{
+                    "line": None,
+                    "input": _redact_text(content),
+                    "error": f"解析失败: {str(exc)[:200]}",
+                }]
+            errors.extend(parse_errors)
 
-    data = _load_state_dict(persist=False)
-    if parsed:
-        nodes = data["nodes"]
-        by_fp: dict[str, dict] = {}
-        for node in nodes:
-            by_fp.setdefault(node_fingerprint(node), node)
-        used_ids = {str(node.get("id") or "") for node in nodes}
-        imported = 0
-        updated = 0
-        skipped = 0
-        for node in parsed:
-            fp = node_fingerprint(node)
-            existing = by_fp.get(fp)
-            if existing is not None:
-                # 同指纹 -> 更新参数, 保留原 id/created_at
-                for key, value in node.items():
-                    if key in ("id", "created_at"):
-                        continue
-                    existing[key] = value
-                updated += 1
-            else:
-                node["id"] = _new_node_id(used_ids)
-                used_ids.add(node["id"])
-                node["created_at"] = int(time.time())
-                node["source"] = str(node.get("source") or source)
-                nodes.append(node)
-                by_fp[fp] = node
-                imported += 1
+        data = _load_state_dict(persist=False)
+        if parsed:
+            nodes = data["nodes"]
+            by_fp: dict[str, dict] = {}
+            for node in nodes:
+                by_fp.setdefault(node_fingerprint(node), node)
+            used_ids = {str(node.get("id") or "") for node in nodes}
+            imported = 0
+            updated = 0
+            skipped = 0
+            for node in parsed:
+                fp = node_fingerprint(node)
+                existing = by_fp.get(fp)
+                if existing is not None:
+                    # 同指纹 -> 更新参数, 保留原 id/created_at
+                    for key, value in node.items():
+                        if key in ("id", "created_at"):
+                            continue
+                        existing[key] = value
+                    updated += 1
+                else:
+                    node["id"] = _new_node_id(used_ids)
+                    used_ids.add(node["id"])
+                    node["created_at"] = int(time.time())
+                    node["source"] = str(node.get("source") or source)
+                    nodes.append(node)
+                    by_fp[fp] = node
+                    imported += 1
 
-        was_active = bool(data.get("active_node_id"))
-        data = normalize_state_dict(data)
-        atomic_write_json(STATE_FILE, data, mode=0o600)
-        log.info("nodes import: imported=%d updated=%d skipped=%d errors=%d",
-                 imported, updated, skipped, len(errors))
-        message = ""
-        if data["nodes"] and data["active_node_id"] and not was_active:
-            message = "已自动将第一个节点设为活跃节点；sing-box 未重启，请激活节点后生效"
-    else:
-        imported = updated = skipped = 0
-        message = ""
+            was_active = bool(data.get("active_node_id"))
+            data = normalize_state_dict(data)
+            atomic_write_json(STATE_FILE, data, mode=0o600)
+            log.info("nodes import: imported=%d updated=%d skipped=%d errors=%d",
+                     imported, updated, skipped, len(errors))
+            message = ""
+            if data["nodes"] and data["active_node_id"] and not was_active:
+                message = "已自动将第一个节点设为活跃节点；sing-box 未重启，请激活节点后生效"
+        else:
+            imported = updated = skipped = 0
+            message = ""
 
-    result = {
-        "status": "success",
-        "imported": imported,
-        "updated": updated,
-        "skipped": skipped,
-        "errors": errors,
-        "active_node_id": data.get("active_node_id", ""),
-        "nodes": [_public_node(node) for node in data["nodes"]],
-    }
-    if message:
-        result["message"] = message
-    return result
+        result = {
+            "status": "success",
+            "imported": imported,
+            "updated": updated,
+            "skipped": skipped,
+            "errors": errors,
+            "active_node_id": data.get("active_node_id", ""),
+            "nodes": [_public_node(node) for node in data["nodes"]],
+        }
+        if message:
+            result["message"] = message
+        return result
 
 
 @app.post("/api/nodes/{node_id}/activate")
 def activate_node(node_id: str):
     """切换活跃节点并立即下发 (重启 sing-box)。"""
-    data = _load_state_dict(persist=False)
-    target = next((n for n in data["nodes"] if n["id"] == node_id), None)
-    if target is None:
-        raise HTTPException(status_code=404, detail="节点不存在")
-    if not str(target.get("server") or "").strip() or not str(target.get("password") or ""):
-        raise HTTPException(status_code=422, detail="节点缺少服务器或密码")
-    data["active_node_id"] = node_id
-    data = normalize_state_dict(data)
-    try:
-        state = StateModel.model_validate(data)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"节点参数非法: {exc}")
-    message = commit_state(state, restart=True)
-    return {
-        "status": "success",
-        "message": message,
-        "active_node_id": data["active_node_id"],
-    }
-
-
-@app.patch("/api/nodes/{node_id}")
-def patch_node(node_id: str, patch: NodePatchModel):
-    """部分更新节点; 活跃节点改动会立即下发, 非活跃节点只落盘。"""
-    data = _load_state_dict(persist=False)
-    node = next((n for n in data["nodes"] if n["id"] == node_id), None)
-    if node is None:
-        raise HTTPException(status_code=404, detail="节点不存在")
-
-    updates = patch.model_dump(exclude_unset=True)
-    for key, value in updates.items():
-        if key == "tag":
-            used = {n["tag"] for n in data["nodes"] if n["id"] != node_id}
-            node["tag"] = sanitize_tag(str(value or ""), used)
-        elif key == "port_hopping":
-            try:
-                node["port_hopping"] = normalize_port_hopping(str(value or ""))
-            except ValueError as exc:
-                raise HTTPException(status_code=422, detail=str(exc))
-        elif key == "obfs_type":
-            obfs_type = str(value or "").strip().lower()
-            if obfs_type not in ("", "salamander"):
-                raise HTTPException(status_code=422, detail="不支持的混淆类型 (仅支持 salamander)")
-            node["obfs_type"] = obfs_type
-        elif key in ("server", "password"):
-            text = str(value) if value is not None else ""
-            if not text.strip():
-                raise HTTPException(status_code=422, detail=f"{key} 不能为空")
-            if key == "server":
-                text = text.strip()
-                if any(ch.isspace() for ch in text) or "/" in text:
-                    raise HTTPException(status_code=422, detail="服务器地址格式非法")
-            node[key] = text
-        elif key in ("up_mbps", "down_mbps"):
-            if value is None:
-                node[key] = None
-            else:
-                node[key] = int(value)
-        elif key in ("sni", "obfs_password"):
-            node[key] = str(value or "")
-        elif key == "insecure":
-            node["insecure"] = bool(value)
-        elif key == "port":
-            if value is not None:
-                node["port"] = int(value)
-        else:
-            node[key] = value
-
-    if node.get("obfs_type") and not str(node.get("obfs_password") or "").strip():
-        raise HTTPException(status_code=422, detail="启用混淆时必须提供混淆口令")
-
-    data = normalize_state_dict(data)
-    activated = data.get("active_node_id") == node_id
-    if activated:
+    with _state_lock:
+        data = _load_state_dict(persist=False)
+        target = next((n for n in data["nodes"] if n["id"] == node_id), None)
+        if target is None:
+            raise HTTPException(status_code=404, detail="节点不存在")
+        if not str(target.get("server") or "").strip() or not str(target.get("password") or ""):
+            raise HTTPException(status_code=422, detail="节点缺少服务器或密码")
+        data["active_node_id"] = node_id
+        data = normalize_state_dict(data)
         try:
             state = StateModel.model_validate(data)
         except Exception as exc:
             raise HTTPException(status_code=422, detail=f"节点参数非法: {exc}")
         message = commit_state(state, restart=True)
-    else:
-        atomic_write_json(STATE_FILE, data, mode=0o600)
-        message = "节点已更新"
+        return {
+            "status": "success",
+            "message": message,
+            "active_node_id": data["active_node_id"],
+        }
 
-    updated = next((n for n in data["nodes"] if n["id"] == node_id), node)
-    return {
-        "status": "success",
-        "node": _public_node(updated),
-        "activated": activated,
-        "message": message,
-    }
+
+@app.patch("/api/nodes/{node_id}")
+def patch_node(node_id: str, patch: NodePatchModel):
+    """部分更新节点; 活跃节点改动会立即下发, 非活跃节点只落盘。"""
+    with _state_lock:
+        data = _load_state_dict(persist=False)
+        node = next((n for n in data["nodes"] if n["id"] == node_id), None)
+        if node is None:
+            raise HTTPException(status_code=404, detail="节点不存在")
+
+        updates = patch.model_dump(exclude_unset=True)
+        updated_password = False
+        updated_uuid = False
+        for key, value in updates.items():
+            if key in ("password", "obfs_password", "uuid") and value == REDACTED_SECRET:
+                continue
+            if key == "tag":
+                used = {n["tag"] for n in data["nodes"] if n["id"] != node_id}
+                node["tag"] = sanitize_tag(str(value or ""), used)
+            elif key == "port_hopping":
+                try:
+                    node["port_hopping"] = normalize_port_hopping(str(value or ""))
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc))
+            elif key == "obfs_type":
+                node["obfs_type"] = str(value or "").strip().lower()
+            elif key == "server":
+                text = str(value) if value is not None else ""
+                if not text.strip():
+                    raise HTTPException(status_code=422, detail="server 不能为空")
+                text = text.strip()
+                if any(ch.isspace() for ch in text) or "/" in text:
+                    raise HTTPException(status_code=422, detail="服务器地址格式非法")
+                node["server"] = text
+            elif key == "password":
+                text = str(value) if value is not None else ""
+                if not text.strip():
+                    raise HTTPException(status_code=422, detail="password 不能为空")
+                node["password"] = text
+                updated_password = True
+            elif key == "uuid":
+                text = str(value or "").strip()
+                node["uuid"] = text
+                if text:
+                    updated_uuid = True
+            elif key in ("up_mbps", "down_mbps"):
+                if value is None:
+                    node[key] = None
+                else:
+                    node[key] = int(value)
+            elif key in (
+                "sni", "obfs_password", "protocol", "method", "plugin", "plugin_opts",
+                "flow", "encryption", "packet_encoding", "transport", "transport_path",
+                "transport_host", "transport_service_name", "reality_public_key",
+                "reality_short_id", "spider_x", "utls_fingerprint",
+            ):
+                node[key] = str(value or "")
+            elif key in ("insecure", "tls_enabled", "reality_enabled"):
+                node[key] = bool(value)
+            elif key == "port":
+                if value is not None:
+                    node["port"] = int(value)
+            else:
+                node[key] = value
+
+        proto = str(node.get("protocol") or "hysteria2").strip().lower() or "hysteria2"
+        if proto == "vless":
+            if updated_uuid and not updated_password:
+                node["password"] = node["uuid"]
+            elif updated_password and not updated_uuid:
+                node["uuid"] = node["password"]
+            if node.get("reality_enabled") and not str(node.get("reality_public_key") or "").strip():
+                raise HTTPException(status_code=422, detail="Reality 缺少公钥 (pbk)")
+        elif proto in ("hysteria2", "hy2"):
+            obfs_type = str(node.get("obfs_type") or "").strip().lower()
+            if obfs_type not in ("", "salamander"):
+                raise HTTPException(status_code=422, detail="不支持的混淆类型 (仅支持 salamander)")
+            node["obfs_type"] = obfs_type
+            if obfs_type and not str(node.get("obfs_password") or "").strip():
+                raise HTTPException(status_code=422, detail="启用混淆时必须提供混淆口令")
+        elif proto in ("shadowsocks", "ss"):
+            node["obfs_type"] = ""
+            if not str(node.get("method") or "").strip():
+                raise HTTPException(status_code=422, detail="Shadowsocks 节点缺少加密方法")
+
+        data = normalize_state_dict(data)
+        activated = data.get("active_node_id") == node_id
+        if activated:
+            try:
+                state = StateModel.model_validate(data)
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail=f"节点参数非法: {exc}")
+            message = commit_state(state, restart=True)
+        else:
+            atomic_write_json(STATE_FILE, data, mode=0o600)
+            message = "节点已更新"
+
+        updated = next((n for n in data["nodes"] if n["id"] == node_id), node)
+        return {
+            "status": "success",
+            "node": _public_node(updated),
+            "activated": activated,
+            "message": message,
+        }
 
 
 @app.delete("/api/nodes/{node_id}")
 def delete_node(node_id: str):
     """删除非活跃节点; 活跃节点需先切换。"""
-    data = _load_state_dict(persist=False)
-    node = next((n for n in data["nodes"] if n["id"] == node_id), None)
-    if node is None:
-        raise HTTPException(status_code=404, detail="节点不存在")
-    if data.get("active_node_id") == node_id:
-        raise HTTPException(status_code=409, detail="请先切换到其他节点再删除")
+    with _state_lock:
+        data = _load_state_dict(persist=False)
+        node = next((n for n in data["nodes"] if n["id"] == node_id), None)
+        if node is None:
+            raise HTTPException(status_code=404, detail="节点不存在")
+        if data.get("active_node_id") == node_id:
+            raise HTTPException(status_code=409, detail="请先切换到其他节点再删除")
 
-    data["nodes"] = [n for n in data["nodes"] if n["id"] != node_id]
-    data = normalize_state_dict(data)
-    atomic_write_json(STATE_FILE, data, mode=0o600)
-    with _latency_lock:
-        _latency_cache.pop(node_id, None)
-    log.info("nodes delete: %s", node_id)
-    return {
-        "status": "success",
-        "active_node_id": data.get("active_node_id", ""),
-        "nodes": [_public_node(n) for n in data["nodes"]],
-    }
+        data["nodes"] = [n for n in data["nodes"] if n["id"] != node_id]
+        data = normalize_state_dict(data)
+        atomic_write_json(STATE_FILE, data, mode=0o600)
+        with _latency_lock:
+            _latency_cache.pop(node_id, None)
+        log.info("nodes delete: %s", node_id)
+        return {
+            "status": "success",
+            "active_node_id": data.get("active_node_id", ""),
+            "nodes": [_public_node(n) for n in data["nodes"]],
+        }
 
 
 # ---------------- 节点延迟测试 (临时 sing-box 实例 + Clash API) ----------------
@@ -1790,7 +2095,7 @@ def test_node_latency(node: Hy2NodeModel) -> dict:
             "dns": {
                 "servers": [
                     {"tag": "direct-dns", "address": "udp://223.5.5.5", "detour": "direct"},
-                    {"tag": "proxy-dns", "address": "https://1.1.1.1/dns-query", "detour": tag},
+                    {"tag": "proxy-dns", "address": "tcp://8.8.8.8", "detour": tag},
                 ],
                 "rules": dns_rules,
                 "final": "proxy-dns",
@@ -2217,33 +2522,34 @@ def nettest(body: NetTestModel):
     2. 直连 TCP 国内锚点 223.5.5.5:443
     3. 直连 TCP 国际锚点 1.1.1.1:443
     4. 当前节点域名解析
-    5. 节点 UDP 静默探测 (QUIC 服务对垃圾包应静默丢弃;
-       收到 ICMP 拒绝说明端口未开放, 是明确故障信号)
+    5. 节点探测: Hy2 做 UDP 静默探测 (用 _hop_start_port);
+       VLESS/Trojan/Shadowsocks 做 TCP 握手探测
     """
     target = body.target.strip() or "www.google.com"
     results: list[dict] = []
 
-    def add(name: str, label: str, ok, ms: int, detail: str = "") -> None:
-        results.append({"name": name, "label": label, "ok": ok, "ms": ms, "detail": detail})
+    def make_item(name: str, label: str, ok, ms: int, detail: str = "") -> dict:
+        return {"name": name, "label": label, "ok": ok, "ms": ms, "detail": detail}
 
-    def dns_probe(name: str, label: str, host: str) -> str | None:
+    def add(name: str, label: str, ok, ms: int, detail: str = "") -> None:
+        results.append(make_item(name, label, ok, ms, detail))
+
+    def run_dns_probe(name: str, label: str, host: str) -> tuple[dict, str | None]:
         t0 = time.monotonic()
         try:
             infos = socket.getaddrinfo(host, None, socket.AF_INET)
             ip = infos[0][4][0]
-            add(name, label, True, int((time.monotonic() - t0) * 1000), ip)
-            return ip
+            return make_item(name, label, True, int((time.monotonic() - t0) * 1000), ip), ip
         except Exception as exc:
-            add(name, label, False, int((time.monotonic() - t0) * 1000), str(exc)[:90])
-            return None
+            return make_item(name, label, False, int((time.monotonic() - t0) * 1000), str(exc)[:90]), None
 
-    def tcp_probe(name: str, label: str, host: str, port: int) -> None:
+    def run_tcp_probe(name: str, label: str, host: str, port: int) -> dict:
         t0 = time.monotonic()
         try:
             with socket.create_connection((host, port), timeout=3.0):
-                add(name, label, True, int((time.monotonic() - t0) * 1000))
+                return make_item(name, label, True, int((time.monotonic() - t0) * 1000))
         except Exception as exc:
-            add(name, label, False, int((time.monotonic() - t0) * 1000), str(exc)[:90])
+            return make_item(name, label, False, int((time.monotonic() - t0) * 1000), str(exc)[:90])
 
     def udp_probe(name: str, label: str, ip: str, port: int) -> None:
         t0 = time.monotonic()
@@ -2263,28 +2569,44 @@ def nettest(body: NetTestModel):
         except Exception as exc:
             add(name, label, False, int((time.monotonic() - t0) * 1000), str(exc)[:90])
 
-    # 1-3: 基础直连能力
-    dns_probe("dns_target", f"DNS 解析 {target}", target)
-    tcp_probe("tcp_cn", "直连 TCP 223.5.5.5:443 (国内)", "223.5.5.5", 443)
-    tcp_probe("tcp_global", "直连 TCP 1.1.1.1:443 (国际)", "1.1.1.1", 443)
+    # 1-3: 基础直连能力并行探测 (结果顺序保持 dns_target, tcp_cn, tcp_global)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        f_dns = pool.submit(run_dns_probe, "dns_target", f"DNS 解析 {target}", target)
+        f_cn = pool.submit(run_tcp_probe, "tcp_cn", "直连 TCP 223.5.5.5:443 (国内)", "223.5.5.5", 443)
+        f_global = pool.submit(run_tcp_probe, "tcp_global", "直连 TCP 1.1.1.1:443 (国际)", "1.1.1.1", 443)
+        r_dns, _ = f_dns.result()
+        r_cn = f_cn.result()
+        r_global = f_global.result()
+    results.extend([r_dns, r_cn, r_global])
 
-    # 4-5: 当前活跃节点可达性
-    node = None
+    # 4-5: 当前活跃节点可达性 (协议感知)
+    node: dict = {}
     try:
         node = _load_state_dict().get("current_node") or {}
     except Exception:
         pass
     server = str(node.get("server") or "").strip()
-    port = int(node.get("port") or 443)
+    proto = str(node.get("protocol") or "hysteria2").strip().lower() or "hysteria2"
+    is_hy2 = proto in ("hysteria2", "hy2")
+    try:
+        node_model = Hy2NodeModel.model_validate(node) if node else Hy2NodeModel()
+    except Exception:
+        node_model = Hy2NodeModel(port=int(node.get("port") or 443))
+    port = _hop_start_port(node_model) if is_hy2 else int(node.get("port") or 443)
+    probe_label = f"节点 UDP 静默探测 :{port}" if is_hy2 else f"节点 TCP 握手探测 :{port}"
     if server:
-        ip = dns_probe("node_dns", f"节点域名解析 {server}", server)
+        r_node_dns, ip = run_dns_probe("node_dns", f"节点域名解析 {server}", server)
+        results.append(r_node_dns)
         if ip:
-            udp_probe("node_udp", f"节点 UDP 静默探测 :{port}", ip, port)
+            if is_hy2:
+                udp_probe("node_udp", probe_label, ip, port)
+            else:
+                results.append(run_tcp_probe("node_udp", probe_label, ip, port))
         else:
-            add("node_udp", f"节点 UDP 静默探测 :{port}", False, 0, "跳过: 节点域名未解析")
+            add("node_udp", probe_label, False, 0, "跳过: 节点域名未解析")
     else:
         add("node_dns", "节点域名解析", False, 0, "未配置节点 (先在控制台下发)")
-        add("node_udp", "节点 UDP 静默探测", False, 0, "跳过: 未配置节点")
+        add("node_udp", "节点 UDP 静默探测" if is_hy2 else "节点 TCP 握手探测", False, 0, "跳过: 未配置节点")
 
     key_results = [r for r in results if r["name"] in ("dns_target", "tcp_cn")]
     overall = "up" if all(r["ok"] for r in key_results) else ("degraded" if any(r["ok"] for r in results) else "down")
@@ -2308,14 +2630,26 @@ def _parse_public_ip(text: str) -> Optional[str]:
     """从 echo 响应中提取首个公网 IP; 异常内容一律返回 None。"""
     import ipaddress
 
+    non_public_v4 = (
+        ipaddress.ip_network("100.64.0.0/10"),
+        ipaddress.ip_network("198.18.0.0/15"),
+    )
     for token in str(text or "").replace(",", " ").split():
         try:
             addr = ipaddress.ip_address(token)
         except ValueError:
             continue
-        if not (addr.is_private or addr.is_loopback or addr.is_link_local
+        if addr.version == 6:
+            if getattr(addr, "is_site_local", False):
+                continue
+            if addr.ipv4_mapped is not None:
+                addr = addr.ipv4_mapped
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
                 or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
-            return token
+            continue
+        if addr.version == 4 and any(addr in net for net in non_public_v4):
+            continue
+        return token
     return None
 
 
@@ -2381,14 +2715,61 @@ def _egress_probe() -> dict:
 @app.get("/api/egress")
 def get_egress_ip():
     """实测当前出口公网 IP (15s 缓存; 探测本身走真实路径, 结果即所见即所得)。"""
+    now = time.monotonic()
     with _egress_lock:
-        now = time.monotonic()
         if _egress_cache["payload"] and now - _egress_cache["at"] < _EGRESS_TTL:
             return {"status": "success", **_egress_cache["payload"]}
-        payload = _egress_probe()
-        _egress_cache["at"] = now
+    payload = _egress_probe()
+    with _egress_lock:
+        _egress_cache["at"] = time.monotonic()
         _egress_cache["payload"] = payload
     return {"status": "success", **payload}
+
+
+def _is_auto_heal_enabled(raw_state: Optional[dict] = None) -> bool:
+    env_flag = (os.environ.get("AUTO_HEAL_ENABLED") or "").strip().lower()
+    if env_flag in ("1", "true", "yes", "on"):
+        return True
+    if isinstance(raw_state, dict) and bool(raw_state.get("auto_heal_enabled")):
+        return True
+    return False
+
+
+def auto_heal_loop() -> None:
+    """可选后台自愈巡检: 默认关闭, 仅当 AUTO_HEAL_ENABLED=1 或状态文件 auto_heal_enabled=true 时生效。"""
+    fail_streak = 0
+    last_heal_at = 0.0
+    while True:
+        time.sleep(AUTO_HEAL_INTERVAL_S)
+        try:
+            raw = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
+            if not _is_auto_heal_enabled(raw):
+                fail_streak = 0
+                continue
+            data = normalize_state_dict(raw)
+            state = StateModel.model_validate(data)
+            active = _resolve_active_node(state)
+            if active is None or not singbox_manager.is_running():
+                fail_streak = 0
+                continue
+            outcome = test_node_latency(active)
+            if outcome.get("ok"):
+                fail_streak = 0
+                continue
+            fail_streak += 1
+            now = time.monotonic()
+            if fail_streak >= AUTO_HEAL_FAIL_THRESHOLD and (
+                last_heal_at == 0.0 or now - last_heal_at >= AUTO_HEAL_COOLDOWN_S
+            ):
+                log.warning(
+                    "auto-heal: 活跃节点连续 %d 次探测失败 (%s), 重启 sing-box 自愈",
+                    fail_streak, outcome.get("error", ""),
+                )
+                last_heal_at = now
+                fail_streak = 0
+                singbox_manager.restart()
+        except Exception as exc:
+            log.warning("auto-heal: 巡检异常(%s), 下个周期重试", exc)
 
 
 # 静态控制台挂载必须放在所有 API 路由之后
@@ -2441,6 +2822,7 @@ def main() -> None:
 
     # 规则守护线程: 兜底任何意外清除的 TProxy 规则 (期望态见 last_decision)
     threading.Thread(target=rule_guard_loop, name="rule-guard", daemon=True).start()
+    threading.Thread(target=auto_heal_loop, name="auto-heal", daemon=True).start()
     signal.signal(signal.SIGINT, _handle_signal)
 
     log.info("WebUI listening on %s:%d", web_host, web_port)

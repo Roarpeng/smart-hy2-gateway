@@ -26,17 +26,34 @@ const appState = {
   lastEgressAt: 0,            // 出口探测节流时间戳 (ms)
   lastProxyActive: null,      // 上次轮询的代理态; 翻转时强制重测出口 IP
   currentNode: {
+    protocol: 'hysteria2',
     tag: '未命名节点',
     server: '',
     port: 443,
     password: '',
+    uuid: '',
     sni: '',
     insecure: false,
     obfsType: '',
     obfsPassword: '',
     upMbps: null,              // null = 不指定 -> BBR (v2rayN 语义)
     downMbps: null,
-    portHopping: ''            // v2rayN mport/ports -> 端口跳跃
+    portHopping: '',           // v2rayN mport/ports -> 端口跳跃
+    method: '',
+    plugin: '',
+    pluginOpts: '',
+    flow: '',
+    encryption: 'none',
+    packetEncoding: 'xudp',
+    transport: 'tcp',
+    transportPath: '',
+    transportHost: '',
+    transportServiceName: '',
+    tlsEnabled: true,
+    realityEnabled: false,
+    realityPublicKey: '',
+    realityShortId: '',
+    utlsFingerprint: ''
   },
   nodes: [],                  // /api/nodes 节点快照 (snake_case 原样保存)
   activeNodeId: '',           // 活跃节点 id
@@ -377,24 +394,43 @@ function parseFwmarkToInt(val) {
   return parseInt(s, 10) || 0;
 }
 
+// 组装 PATCH /api/settings 的轻量通道与白名单 payload（不触碰节点列表与节点口令）
+function buildSettingsPayload() {
+  return {
+    whitelist: appState.whitelist.slice(),
+    wifi_iface: appState.network.wifiDev,
+    rj45_iface: appState.network.rj45Dev,
+    tproxy_port: parseInt(appState.network.tproxyPort, 10) || 12345,
+    fwmark: parseFwmarkToInt(appState.network.fwmark),
+    table: parseInt(appState.network.table, 10) || 100,
+    wifi_policy: appState.network.wifiPolicy
+  };
+}
+
 // 组装 POST /api/apply 的完整 snake_case payload
 function buildApplyPayload() {
   const num = (v) => Number.isFinite(parseInt(v, 10)) ? parseInt(v, 10) : null;
+  const currentNode = {
+    protocol: appState.currentNode.protocol || 'hysteria2',
+    tag: appState.currentNode.tag,
+    server: appState.currentNode.server,
+    port: parseInt(appState.currentNode.port, 10) || 443,
+    sni: appState.currentNode.sni,
+    insecure: !!appState.currentNode.insecure,
+    obfs_type: appState.currentNode.obfsType || '',
+    up_mbps: num(appState.currentNode.upMbps),        // null = BBR
+    down_mbps: num(appState.currentNode.downMbps),
+    port_hopping: appState.currentNode.portHopping || ''
+  };
+  if (appState.currentNode.password && appState.currentNode.password !== '***') {
+    currentNode.password = appState.currentNode.password;
+  }
+  if (appState.currentNode.obfsPassword !== '***') {
+    currentNode.obfs_password = appState.currentNode.obfsPassword || '';
+  }
   return {
     whitelist: appState.whitelist.slice(),
-    current_node: {
-      tag: appState.currentNode.tag,
-      server: appState.currentNode.server,
-      port: parseInt(appState.currentNode.port, 10) || 443,
-      password: appState.currentNode.password,
-      sni: appState.currentNode.sni,
-      insecure: !!appState.currentNode.insecure,
-      obfs_type: appState.currentNode.obfsType || '',
-      obfs_password: appState.currentNode.obfsPassword || '',
-      up_mbps: num(appState.currentNode.upMbps),        // null = BBR
-      down_mbps: num(appState.currentNode.downMbps),
-      port_hopping: appState.currentNode.portHopping || ''
-    },
+    current_node: currentNode,
     wifi_iface: appState.network.wifiDev,
     rj45_iface: appState.network.rj45Dev,
     // vmnet 字段不随 payload 下发: 后端按默认映射 (vmnet1/192.168.100.0/24 managed)
@@ -404,6 +440,38 @@ function buildApplyPayload() {
     table: parseInt(appState.network.table, 10) || 100,
     wifi_policy: appState.network.wifiPolicy
   };
+}
+
+// 轻量同步通道/白名单配置：优先走 PATCH /api/settings，绝不覆写节点密码；404/405 时回退旧接口
+async function syncSettingsToBackend(localMsg, msgType = 'success') {
+  if (DEMO_MODE) {
+    showToast(localMsg, msgType);
+    return;
+  }
+  try {
+    const res = await apiFetch('/api/settings', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(buildSettingsPayload())
+    }, API_LONG_TIMEOUT_MS);
+    if (res.status === 404 || res.status === 405) {
+      await syncToBackend(localMsg, msgType);
+      return;
+    }
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      const reason = extractApiError(err) || '字段校验未通过';
+      showToast(`配置下发失败 (HTTP ${res.status}): ${reason}`, 'warning');
+      return;
+    }
+    const data = await res.json().catch(() => ({}));
+    showToast(data.message || localMsg, msgType);
+    if (data.singbox_valid === false) {
+      showToast('sing-box 配置校验未通过，请检查参数', 'warning');
+    }
+  } catch (err) {
+    // 网络失败：apiFetch 已进入演示模式并提示；本地状态保持已更新，不回滚
+  }
 }
 
 // 统一写操作同步：本地更新完成后，将完整 state 推送至后端；失败自动落入演示模式
@@ -609,7 +677,7 @@ function addWhitelistSsid() {
     showToast(localMsg, 'success');
     return;
   }
-  syncToBackend(localMsg, 'success');
+  syncSettingsToBackend(localMsg, 'success');
 }
 
 function removeWhitelistSsid(idx) {
@@ -620,18 +688,46 @@ function removeWhitelistSsid(idx) {
     showToast(localMsg, 'info');
     return;
   }
-  syncToBackend(localMsg, 'info');
+  syncSettingsToBackend(localMsg, 'info');
+}
+
+function normalizeProtoValue(proto) {
+  const p = String(proto || 'hysteria2').trim().toLowerCase();
+  if (p === 'hy2' || p === 'hysteria2') return 'hysteria2';
+  if (p === 'ss' || p === 'shadowsocks') return 'shadowsocks';
+  if (p === 'vless') return 'vless';
+  if (p === 'trojan') return 'trojan';
+  return 'hysteria2';
+}
+
+function onEditorProtocolChange() {
+  const protoEl = document.getElementById('node-protocol');
+  const proto = normalizeProtoValue(protoEl ? protoEl.value : 'hysteria2');
+  const pwdLabel = document.getElementById('node-password-label');
+  if (pwdLabel) {
+    pwdLabel.textContent = proto === 'vless' ? 'UUID (认证标识)' : '认证口令 (Auth)';
+  }
+  document.querySelectorAll('#node-edit-tile [data-proto]').forEach(el => {
+    const allowed = String(el.dataset.proto || '')
+      .split(',')
+      .map(s => s.trim().toLowerCase())
+      .filter(Boolean);
+    el.hidden = !allowed.includes(proto);
+  });
 }
 
 function fillNodeForm(node) {
   const n = node || {};
   const pick = (camel, snake, fallback) => (n[camel] !== undefined ? n[camel] : (n[snake] !== undefined ? n[snake] : fallback));
+  const proto = normalizeProtoValue(n.protocol);
   const tag = n.tag ?? '未命名节点';
   document.getElementById('node-badge-tag').textContent = `#${tag}`;
+  const protoEl = document.getElementById('node-protocol');
+  if (protoEl) protoEl.value = proto;
   document.getElementById('node-tag').value = tag;
   document.getElementById('node-server').value = n.server ?? '';
   document.getElementById('node-port').value = n.port ?? 443;
-  document.getElementById('node-password').value = n.password ?? '';
+  document.getElementById('node-password').value = (n.password || n.uuid || '');
   document.getElementById('node-sni').value = n.sni ?? '';
   document.getElementById('node-insecure').value = (n.insecure ? "true" : "false");
   document.getElementById('node-obfs-type').value = pick('obfsType', 'obfs_type', '');
@@ -639,6 +735,26 @@ function fillNodeForm(node) {
   document.getElementById('node-port-hopping').value = pick('portHopping', 'port_hopping', '');
   document.getElementById('node-up').value = pick('upMbps', 'up_mbps', null) ?? '';
   document.getElementById('node-down').value = pick('downMbps', 'down_mbps', null) ?? '';
+
+  const setVal = (id, val) => {
+    const el = document.getElementById(id);
+    if (el) el.value = val ?? '';
+  };
+  setVal('node-method', n.method ?? '');
+  setVal('node-plugin', n.plugin ?? '');
+  setVal('node-plugin-opts', pick('pluginOpts', 'plugin_opts', ''));
+  const trans = String(n.transport || 'tcp').toLowerCase();
+  setVal('node-transport', ['tcp', 'ws', 'grpc', 'http', 'httpupgrade'].includes(trans) ? trans : 'tcp');
+  setVal('node-transport-path', pick('transportPath', 'transport_path', ''));
+  setVal('node-transport-host', pick('transportHost', 'transport_host', ''));
+  setVal('node-transport-service', pick('transportServiceName', 'transport_service_name', ''));
+  setVal('node-flow', n.flow ?? '');
+  setVal('node-fp', pick('utlsFingerprint', 'utls_fingerprint', ''));
+  setVal('node-reality', pick('realityEnabled', 'reality_enabled', false) ? 'true' : 'false');
+  setVal('node-pbk', pick('realityPublicKey', 'reality_public_key', ''));
+  setVal('node-sid', pick('realityShortId', 'reality_short_id', ''));
+
+  onEditorProtocolChange();
 }
 
 function updateLivePreview() {
@@ -713,17 +829,34 @@ function extractApiError(data) {
 function nodeToAppNode(n) {
   if (!n) return { ...appState.currentNode };
   return {
+    protocol: normalizeProtoValue(n.protocol),
     tag: n.tag ?? '未命名节点',
     server: n.server ?? '',
     port: n.port ?? 443,
     password: n.password ?? '',
+    uuid: n.uuid ?? '',
     sni: n.sni ?? '',
     insecure: !!n.insecure,
-    obfsType: n.obfs_type || '',
-    obfsPassword: n.obfs_password || '',
-    upMbps: n.up_mbps ?? null,
-    downMbps: n.down_mbps ?? null,
-    portHopping: n.port_hopping || ''
+    obfsType: n.obfs_type ?? n.obfsType ?? '',
+    obfsPassword: n.obfs_password ?? n.obfsPassword ?? '',
+    upMbps: n.up_mbps ?? n.upMbps ?? null,
+    downMbps: n.down_mbps ?? n.downMbps ?? null,
+    portHopping: n.port_hopping ?? n.portHopping ?? '',
+    method: n.method ?? '',
+    plugin: n.plugin ?? '',
+    pluginOpts: n.plugin_opts ?? n.pluginOpts ?? '',
+    flow: n.flow ?? '',
+    encryption: n.encryption ?? 'none',
+    packetEncoding: n.packet_encoding ?? n.packetEncoding ?? 'xudp',
+    transport: n.transport || 'tcp',
+    transportPath: n.transport_path ?? n.transportPath ?? '',
+    transportHost: n.transport_host ?? n.transportHost ?? '',
+    transportServiceName: n.transport_service_name ?? n.transportServiceName ?? '',
+    tlsEnabled: n.tls_enabled !== undefined ? !!n.tls_enabled : (n.tlsEnabled !== undefined ? !!n.tlsEnabled : true),
+    realityEnabled: !!(n.reality_enabled ?? n.realityEnabled),
+    realityPublicKey: n.reality_public_key ?? n.realityPublicKey ?? '',
+    realityShortId: n.reality_short_id ?? n.realityShortId ?? '',
+    utlsFingerprint: n.utls_fingerprint ?? n.utlsFingerprint ?? ''
   };
 }
 
@@ -733,10 +866,11 @@ function normalizeNode(n, index) {
   return {
     id: raw.id || `legacy-${index ?? 0}`,
     tag: raw.tag || '未命名节点',
-    protocol: raw.protocol || 'hysteria2',
+    protocol: normalizeProtoValue(raw.protocol),
     server: raw.server || '',
     port: Number.isFinite(parseInt(raw.port, 10)) ? parseInt(raw.port, 10) : 443,
     password: raw.password || '',
+    uuid: raw.uuid || '',
     sni: raw.sni || '',
     insecure: !!raw.insecure,
     obfs_type: raw.obfs_type || '',
@@ -745,7 +879,20 @@ function normalizeNode(n, index) {
     down_mbps: raw.down_mbps ?? null,
     port_hopping: raw.port_hopping || '',
     method: raw.method || '',
+    plugin: raw.plugin || '',
+    plugin_opts: raw.plugin_opts || '',
+    flow: raw.flow || '',
+    encryption: raw.encryption || 'none',
+    packet_encoding: raw.packet_encoding || 'xudp',
+    transport: raw.transport || 'tcp',
+    transport_path: raw.transport_path || '',
+    transport_host: raw.transport_host || '',
+    transport_service_name: raw.transport_service_name || '',
+    tls_enabled: raw.tls_enabled !== undefined ? !!raw.tls_enabled : true,
     reality_enabled: !!raw.reality_enabled,
+    reality_public_key: raw.reality_public_key || '',
+    reality_short_id: raw.reality_short_id || '',
+    utls_fingerprint: raw.utls_fingerprint || '',
     source: raw.source || '',
     created_at: raw.created_at || 0,
     latency_ms: (typeof raw.latency_ms === 'number') ? raw.latency_ms : null,
@@ -978,38 +1125,40 @@ function buildNodeRow(n) {
 
   const flags = document.createElement('div');
   flags.className = 'node-flags';
-  const proto = document.createElement('span');
-  proto.className = 'node-flag';
+  const addFlag = (text) => {
+    const f = document.createElement('span');
+    f.className = 'node-flag';
+    f.textContent = text;
+    flags.appendChild(f);
+  };
   const protoLabels = {
     hysteria2: 'Hysteria 2 · QUIC', hy2: 'Hysteria 2 · QUIC',
     vless: 'VLESS', trojan: 'Trojan', shadowsocks: 'Shadowsocks', ss: 'Shadowsocks'
   };
   const p = String(n.protocol || 'hysteria2').toLowerCase();
-  proto.textContent = protoLabels[p] || p;
-  flags.appendChild(proto);
+  addFlag(protoLabels[p] || p);
   if (n.id && n.id === appState.fallbackNodeId) {
-    const fb = document.createElement('span');
-    fb.className = 'node-flag';
-    fb.textContent = '备用';
-    flags.appendChild(fb);
+    addFlag('备用');
+  }
+  if (p === 'vless' || p === 'trojan') {
+    if (p === 'vless' && n.reality_enabled) addFlag('reality');
+    const tr = String(n.transport || 'tcp').toLowerCase();
+    if (tr) addFlag(tr.toUpperCase());
+    if (p === 'vless' && n.flow) addFlag(n.flow);
+    if (p === 'vless' && n.utls_fingerprint) addFlag(`fp=${n.utls_fingerprint}`);
+  }
+  if ((p === 'shadowsocks' || p === 'ss') && n.method) {
+    addFlag(n.method);
+    if (n.plugin) addFlag(`plugin=${n.plugin}`);
   }
   if (n.insecure) {
-    const f = document.createElement('span');
-    f.className = 'node-flag';
-    f.textContent = 'insecure';
-    flags.appendChild(f);
+    addFlag('insecure');
   }
   if (n.obfs_type) {
-    const f = document.createElement('span');
-    f.className = 'node-flag';
-    f.textContent = `obfs=${n.obfs_type}`;
-    flags.appendChild(f);
+    addFlag(`obfs=${n.obfs_type}`);
   }
   if (n.port_hopping) {
-    const f = document.createElement('span');
-    f.className = 'node-flag';
-    f.textContent = `端口跳跃 ${n.port_hopping}`;
-    flags.appendChild(f);
+    addFlag(`端口跳跃 ${n.port_hopping}`);
   }
   if (flags.childNodes.length) main.appendChild(flags);
 
@@ -1107,20 +1256,48 @@ function updateRouteStage() {
   const portEl = document.getElementById('route-port-out');
   if (portEl) portEl.textContent = n ? String(n.port || 443) : '未配置';
 
-  // 协议徽章: 按节点 protocol 显示
+  // 协议徽章与传输层标签: 按节点 protocol 动态计算
+  const protoLabels = {
+    hysteria2: 'Hysteria 2 · QUIC',
+    hy2: 'Hysteria 2 · QUIC',
+    vless: 'VLESS',
+    trojan: 'Trojan',
+    shadowsocks: 'Shadowsocks',
+    ss: 'Shadowsocks'
+  };
+  const p = n ? String(n.protocol || 'hysteria2').toLowerCase() : '';
+  let transLabel = 'QUIC';
+  if (n) {
+    if (p === 'hysteria2' || p === 'hy2') {
+      transLabel = 'QUIC';
+    } else if (p === 'shadowsocks' || p === 'ss') {
+      transLabel = 'TCP/UDP';
+    } else if (p === 'vless' || p === 'trojan') {
+      transLabel = n.reality_enabled ? 'REALITY' : String(n.transport || 'TCP').toUpperCase();
+    } else {
+      transLabel = String(n.transport || 'QUIC').toUpperCase();
+    }
+  }
+
+  const routeTransportEl = document.getElementById('route-transport');
+  if (routeTransportEl) {
+    routeTransportEl.textContent = n ? transLabel : 'QUIC';
+  }
+
   const protoEl = document.getElementById('route-proto');
   if (protoEl) {
-    const labels = {
-      hysteria2: 'Hysteria 2 · QUIC',
-      hy2: 'Hysteria 2 · QUIC',
-      vless: 'VLESS',
-      trojan: 'Trojan',
-      shadowsocks: 'Shadowsocks',
-      ss: 'Shadowsocks'
-    };
-    const p = n ? String(n.protocol || 'hysteria2').toLowerCase() : '';
-    protoEl.textContent = n ? (labels[p] || p || '未知协议') : '未配置';
+    protoEl.textContent = n ? (protoLabels[p] || p || '未知协议') : '未配置';
     protoEl.title = n ? `出站协议 ${protoEl.textContent}` : '';
+  }
+
+  const statusSub = document.getElementById('status-sub');
+  if (statusSub) {
+    const protoShort = {
+      hysteria2: 'Hysteria 2', hy2: 'Hysteria 2',
+      vless: 'VLESS', trojan: 'Trojan',
+      shadowsocks: 'Shadowsocks', ss: 'Shadowsocks'
+    }[p] || (n ? p : 'Hysteria 2');
+    statusSub.textContent = `sing-box 内核 · ${protoShort} · ${n ? transLabel : 'QUIC'}`;
   }
 
   const tag = document.getElementById('route-node-tag');
@@ -1133,7 +1310,7 @@ function updateRouteStage() {
   if (topbarRoute) {
     const viaTag = egOk ? (eg.via === 'tunnel' ? ' · 隧道' : ' · 直连') : '';
     topbarRoute.textContent = n
-      ? `出口 IP ${egOk ? eg.ip : (n.server || '未填写')}${viaTag} · ${n.port || 443} · QUIC`
+      ? `出口 IP ${egOk ? eg.ip : (n.server || '未填写')}${viaTag} · ${n.port || 443} · ${transLabel}`
       : '尚未配置出口节点';
   }
 
@@ -1587,6 +1764,8 @@ function setNodeEditorBusy(busy) {
 }
 
 function buildNodePatchPayload() {
+  const protoEl = document.getElementById('node-protocol');
+  const proto = normalizeProtoValue(protoEl ? protoEl.value : 'hysteria2');
   const tag = document.getElementById('node-tag').value.trim();
   const server = document.getElementById('node-server').value.trim();
   const port = parseInt(document.getElementById('node-port').value, 10);
@@ -1599,22 +1778,78 @@ function buildNodePatchPayload() {
     return null;
   }
   const numOrNull = (id) => {
-    const v = parseInt(document.getElementById(id).value, 10);
+    const el = document.getElementById(id);
+    const v = el ? parseInt(el.value, 10) : NaN;
     return Number.isFinite(v) ? v : null;
   };
-  return {
+  const valOf = (id) => {
+    const el = document.getElementById(id);
+    return el ? el.value.trim() : '';
+  };
+
+  const payload = {
+    protocol: proto,
     tag: tag || server,
     server,
-    port,
-    password: document.getElementById('node-password').value,
-    sni: document.getElementById('node-sni').value.trim(),
-    insecure: document.getElementById('node-insecure').value === 'true',
-    obfs_type: document.getElementById('node-obfs-type').value.trim(),
-    obfs_password: document.getElementById('node-obfs-pass').value,
-    up_mbps: numOrNull('node-up'),
-    down_mbps: numOrNull('node-down'),
-    port_hopping: document.getElementById('node-port-hopping').value.trim()
+    port
   };
+
+  const pwd = document.getElementById('node-password').value;
+  if (pwd && pwd !== '***') {
+    payload.password = pwd;
+    if (proto === 'vless') {
+      payload.uuid = pwd;
+    }
+  }
+
+  if (proto === 'hysteria2') {
+    payload.sni = valOf('node-sni');
+    payload.insecure = document.getElementById('node-insecure').value === 'true';
+    payload.obfs_type = valOf('node-obfs-type');
+    const obfsPass = document.getElementById('node-obfs-pass').value;
+    if (obfsPass !== '***') {
+      payload.obfs_password = obfsPass;
+    }
+    payload.up_mbps = numOrNull('node-up');
+    payload.down_mbps = numOrNull('node-down');
+    payload.port_hopping = valOf('node-port-hopping');
+  } else if (proto === 'shadowsocks') {
+    const method = valOf('node-method');
+    if (!method) {
+      showToast('请填写 Shadowsocks 加密方法', 'warning');
+      return null;
+    }
+    payload.method = method;
+    payload.plugin = valOf('node-plugin');
+    payload.plugin_opts = valOf('node-plugin-opts');
+  } else if (proto === 'vless') {
+    const realityEnabled = valOf('node-reality') === 'true';
+    const pbk = valOf('node-pbk');
+    if (realityEnabled && !pbk) {
+      showToast('启用 Reality 时必须填写 Reality 公钥 (pbk)', 'warning');
+      return null;
+    }
+    payload.sni = valOf('node-sni');
+    payload.insecure = document.getElementById('node-insecure').value === 'true';
+    payload.flow = valOf('node-flow');
+    payload.utls_fingerprint = valOf('node-fp');
+    payload.reality_enabled = realityEnabled;
+    payload.reality_public_key = pbk;
+    payload.reality_short_id = valOf('node-sid');
+    payload.transport = valOf('node-transport') || 'tcp';
+    payload.transport_path = valOf('node-transport-path');
+    payload.transport_host = valOf('node-transport-host');
+    payload.transport_service_name = valOf('node-transport-service');
+  } else if (proto === 'trojan') {
+    payload.sni = valOf('node-sni');
+    payload.insecure = document.getElementById('node-insecure').value === 'true';
+    payload.transport = valOf('node-transport') || 'tcp';
+    payload.transport_path = valOf('node-transport-path');
+    payload.transport_host = valOf('node-transport-host');
+    payload.transport_service_name = valOf('node-transport-service');
+  }
+
+  return payload;
 }
 
 async function saveNodeForm(activateAfter) {
@@ -1719,7 +1954,7 @@ function saveNetworkCardSettings() {
     showToast(localMsg, 'success');
     return;
   }
-  syncToBackend(localMsg, 'success');
+  syncSettingsToBackend(localMsg, 'success');
 }
 
 // ===================================================================
@@ -1736,15 +1971,17 @@ const IFACE_DEMO_LIST = [
   { name: 'wlp2s0', kind: 'wifi', label: 'wlp2s0 · Wi-Fi' },
   { name: 'wlo1', kind: 'wifi', label: 'wlo1 · Wi-Fi' },
   { name: 'wlan0', kind: 'wifi', label: 'wlan0 · Wi-Fi' },
+  { name: 'vmnet1', kind: 'vmware', label: 'vmnet1 · VMware Host-Only' },
+  { name: 'vmnet8', kind: 'vmware', label: 'vmnet8 · VMware NAT' },
   { name: 'br0', kind: 'bridge', label: 'br0 · 网桥' },
   { name: 'virbr0', kind: 'bridge', label: 'virbr0 · 网桥' }
 ];
 let IFACE_CACHE = IFACE_DEMO_LIST;
 
-// 通道角色只选宿主机物理网卡 (以太网/Wi-Fi); 虚拟机上网跟随宿主机, 不再单选虚拟网卡
+// 通道角色支持物理网卡与 VMware/网桥虚拟接口
 const IFACE_FIELD_KINDS = {
-  'cfg-rj45-dev': ['ethernet', 'wifi'],
-  'cfg-wifi-dev': ['ethernet', 'wifi']
+  'cfg-rj45-dev': ['ethernet', 'wifi', 'vmware', 'bridge'],
+  'cfg-wifi-dev': ['ethernet', 'wifi', 'vmware', 'bridge']
 };
 
 // select 中保证存在指定值的选项 (后端列表未含当前值时补一项, 不丢配置)

@@ -17,7 +17,7 @@
 #
 # 事件矩阵:
 #   up | connectivity-change: 按上表策略决策 (always_* 直接短路, 不再看 SSID)
-#   down: 任何策略都关代理 (proxy-switch off 内部会确保 VMnet -> Wi-Fi 直连通路)
+#   down: 保持现有规则 (断网不清规则, 防 Wi-Fi 波动引发规则丢失窗口)
 #   其他动作 (dhcp4-change / vpn-up / ...): 忽略, 直接退出
 #
 # 容错: jq 缺失 / 状态文件缺失或损坏 -> 回落默认值
@@ -68,12 +68,25 @@ proxy_ctl() {
     log "决策: proxy $state ($reason)"
 }
 
-# 当前活动 Wi-Fi 的 SSID; 空串 = 无活动连接 / 隐藏网络 / 尚未就绪
-# nmcli -t 输出形如 "yes:MySSID"; SSID 本身可含冒号, 因此只剥 "yes:" 前缀
-# 必须 LC_ALL=C: 系统 locale 为 zh_CN 时 nmcli 会把 active 列输出成 "是"/"否",
-# 导致 grep '^yes:' 永远落空 -> SSID 被判为空 -> fail-secure 误开代理 (白名单失效)
+# 当前活动 Wi-Fi 的 SSID; 空串 = 无活动连接 / 尚未就绪
+# 1) 优先从目标网卡 $wifi_iface 的活动连接配置读取 802-11-wireless.ssid (支持隐藏网络 Hidden SSID)
+# 2) 回退: 按设备名过滤 nmcli dev wifi 列表, 兼容含冒号 SSID; 最后以 grep -m1 '^yes:' 兜底
+# 必须 LC_ALL=C: 系统 locale 为 zh_CN 时 nmcli 会把 active 列输出成 "是"/"否"
 current_ssid() {
-    local line
+    local conn ssid line
+    conn="$(LC_ALL=C nmcli -g GENERAL.CONNECTION device show "$wifi_iface" 2>/dev/null | head -n1 || true)"
+    if [[ -n "$conn" && "$conn" != "--" ]]; then
+        ssid="$(LC_ALL=C nmcli -g 802-11-wireless.ssid connection show "$conn" 2>/dev/null | head -n1 || true)"
+        if [[ -n "$ssid" ]]; then
+            printf '%s' "$ssid"
+            return 0
+        fi
+    fi
+    line="$(LC_ALL=C nmcli -t -f active,device,ssid dev wifi 2>/dev/null | awk -F: -v dev="$wifi_iface" '$1=="yes" && $2==dev {sub(/^[^:]*:[^:]*:/, ""); print; exit}' || true)"
+    if [[ -n "$line" ]]; then
+        printf '%s' "$line"
+        return 0
+    fi
     line="$(LC_ALL=C nmcli -t -f active,ssid dev wifi 2>/dev/null | grep -m1 '^yes:' || true)"
     printf '%s' "${line#yes:}"
 }

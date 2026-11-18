@@ -93,7 +93,7 @@
                 <div class="path-track"><i></i></div>
                 <div class="path-stop">
                   <span>Internet</span>
-                  <b>QUIC</b>
+                  <b id="route-transport">QUIC</b>
                 </div>
               </div>
               <p class="route-live"><span class="dot" id="route-state-dot"></span><span id="route-state">检测中</span></p>
@@ -158,34 +158,74 @@
                 <span class="badge badge-proxy" id="node-badge-tag">#未命名节点</span>
               </div>
               <div class="grid2">
-                <label class="field field-wide"><span>节点名称 (Tag)</span>
+                <label class="field"><span>出站协议 (Protocol)</span>
+                  <select id="node-protocol" class="select" onchange="onEditorProtocolChange()">
+                    <option value="hysteria2">Hysteria 2 (QUIC)</option>
+                    <option value="vless">VLESS (TCP / Reality / WS / gRPC)</option>
+                    <option value="trojan">Trojan (TLS / WS / gRPC)</option>
+                    <option value="shadowsocks">Shadowsocks (AEAD)</option>
+                  </select></label>
+                <label class="field"><span>节点名称 (Tag)</span>
                   <input type="text" id="node-tag" class="input" placeholder="例如 US_SiliconValley_Node" autocomplete="off" oninput="updateLivePreview()"></label>
                 <label class="field field-wide"><span>服务器域名 / IP (Server Host)</span>
                   <input type="text" id="node-server" class="input" autocomplete="off" spellcheck="false" oninput="updateLivePreview()"></label>
                 <label class="field"><span>服务端口 (Server Port)</span>
                   <input type="number" id="node-port" class="input" value="443" min="1" max="65535" oninput="updateLivePreview()"></label>
-                <label class="field"><span>认证口令 (Auth)</span>
+                <label class="field"><span id="node-password-label">认证口令 (Auth)</span>
                   <span class="row field-inline">
-                    <input type="password" id="node-password" class="input" autocomplete="new-password" oninput="updateLivePreview()">
+                    <input type="password" id="node-password" class="input" placeholder="保持 *** 则不修改原口令" autocomplete="new-password" oninput="updateLivePreview()">
                     <button type="button" class="btn btn-small" onclick="togglePass('node-password', this)">显示</button>
                   </span></label>
-                <label class="field"><span>TLS SNI 伪装域名 (Server Name)</span>
+                <label class="field" data-proto="hysteria2,vless,trojan"><span>TLS SNI 伪装域名 (Server Name)</span>
                   <input type="text" id="node-sni" class="input" autocomplete="off" spellcheck="false" oninput="updateLivePreview()"></label>
-                <label class="field"><span>跳过证书校验 (Insecure)</span>
+                <label class="field" data-proto="hysteria2,vless,trojan"><span>跳过证书校验 (Insecure)</span>
                   <select id="node-insecure" class="select" onchange="updateLivePreview()">
                     <option value="false" selected>false · 严格校验证书</option>
                     <option value="true">true · 允许自签名证书</option>
                   </select></label>
-                <label class="field"><span>混淆协议类型 (Obfs Type)</span>
+                <label class="field" data-proto="hysteria2"><span>混淆协议类型 (Obfs Type)</span>
                   <input type="text" id="node-obfs-type" class="input" placeholder="留空不使用，或 salamander" autocomplete="off" oninput="updateLivePreview()"></label>
-                <label class="field"><span>混淆口令 (Obfs Password)</span>
-                  <input type="text" id="node-obfs-pass" class="input" autocomplete="off" oninput="updateLivePreview()"></label>
-                <label class="field"><span>端口跳跃 (Port Hopping)</span>
+                <label class="field" data-proto="hysteria2"><span>混淆口令 (Obfs Password)</span>
+                  <input type="text" id="node-obfs-pass" class="input" placeholder="保持 *** 则不修改原口令" autocomplete="off" oninput="updateLivePreview()"></label>
+                <label class="field" data-proto="hysteria2"><span>端口跳跃 (Port Hopping)</span>
                   <input type="text" id="node-port-hopping" class="input" placeholder="如 20000:30000 或 20000-30000" autocomplete="off" oninput="updateLivePreview()"></label>
-                <label class="field"><span>下行带宽 (Down Mbps)</span>
+                <label class="field" data-proto="hysteria2"><span>下行带宽 (Down Mbps)</span>
                   <input type="number" id="node-down" class="input" placeholder="留空 = BBR 自动" min="0" oninput="updateLivePreview()"></label>
-                <label class="field"><span>上行带宽 (Up Mbps)</span>
+                <label class="field" data-proto="hysteria2"><span>上行带宽 (Up Mbps)</span>
                   <input type="number" id="node-up" class="input" placeholder="留空 = BBR 自动" min="0" oninput="updateLivePreview()"></label>
+                <label class="field" data-proto="shadowsocks" hidden><span>加密方法 (Method)</span>
+                  <input type="text" id="node-method" class="input" placeholder="aes-256-gcm / chacha20-ietf-poly1305 / 2022-blake3-aes-128-gcm" autocomplete="off" spellcheck="false" oninput="updateLivePreview()"></label>
+                <label class="field" data-proto="shadowsocks" hidden><span>SIP003 插件 (Plugin, 可选)</span>
+                  <input type="text" id="node-plugin" class="input" placeholder="例如 obfs-local 或 v2ray-plugin" autocomplete="off" spellcheck="false" oninput="updateLivePreview()"></label>
+                <label class="field field-wide" data-proto="shadowsocks" hidden><span>插件参数 (Plugin Opts, 可选)</span>
+                  <input type="text" id="node-plugin-opts" class="input" placeholder="例如 obfs=tls;obfs-host=www.bing.com" autocomplete="off" spellcheck="false" oninput="updateLivePreview()"></label>
+                <label class="field" data-proto="vless,trojan" hidden><span>传输层协议 (Transport)</span>
+                  <select id="node-transport" class="select" onchange="updateLivePreview()">
+                    <option value="tcp">tcp (默认直连流)</option>
+                    <option value="ws">ws (WebSocket)</option>
+                    <option value="grpc">grpc (gRPC)</option>
+                    <option value="http">http (H2 / HTTP)</option>
+                    <option value="httpupgrade">httpupgrade</option>
+                  </select></label>
+                <label class="field" data-proto="vless,trojan" hidden><span>传输路径 (Transport Path)</span>
+                  <input type="text" id="node-transport-path" class="input" placeholder="例如 /ws" autocomplete="off" spellcheck="false" oninput="updateLivePreview()"></label>
+                <label class="field" data-proto="vless,trojan" hidden><span>伪装 Host (Transport Host)</span>
+                  <input type="text" id="node-transport-host" class="input" placeholder="例如 cdn.example.com" autocomplete="off" spellcheck="false" oninput="updateLivePreview()"></label>
+                <label class="field" data-proto="vless,trojan" hidden><span>gRPC ServiceName</span>
+                  <input type="text" id="node-transport-service" class="input" placeholder="例如 GunService" autocomplete="off" spellcheck="false" oninput="updateLivePreview()"></label>
+                <label class="field" data-proto="vless" hidden><span>XTLS 流控 (Flow)</span>
+                  <input type="text" id="node-flow" class="input" placeholder="例如 xtls-rprx-vision" autocomplete="off" spellcheck="false" oninput="updateLivePreview()"></label>
+                <label class="field" data-proto="vless" hidden><span>uTLS 指纹 (Fingerprint)</span>
+                  <input type="text" id="node-fp" class="input" placeholder="chrome / firefox / randomized" autocomplete="off" spellcheck="false" oninput="updateLivePreview()"></label>
+                <label class="field" data-proto="vless" hidden><span>启用 Reality</span>
+                  <select id="node-reality" class="select" onchange="updateLivePreview()">
+                    <option value="false" selected>false · 标准 TLS</option>
+                    <option value="true">true · 启用 Reality</option>
+                  </select></label>
+                <label class="field" data-proto="vless" hidden><span>Reality 公钥 (Public Key / pbk)</span>
+                  <input type="text" id="node-pbk" class="input" autocomplete="off" spellcheck="false" oninput="updateLivePreview()"></label>
+                <label class="field" data-proto="vless" hidden><span>Reality ShortId (sid)</span>
+                  <input type="text" id="node-sid" class="input" placeholder="十六进制，可留空" autocomplete="off" spellcheck="false" oninput="updateLivePreview()"></label>
               </div>
               <div class="row node-editor-actions">
                 <button type="button" class="btn btn-small" onclick="cancelNodeEdit()">取消</button>
@@ -335,7 +375,8 @@
                 <pre>journalctl -f -t HY2_DISPATCH -t HY2_PROXY   # 实时决策日志
 /usr/local/bin/proxy-switch.sh status         # 查看规则状态
 sudo /usr/local/bin/proxy-switch.sh off       # 一键恢复直连
-curl -s http://127.0.0.1:8080/api/status      # 后端健康快照</pre>
+curl -s http://127.0.0.1:8080/api/health      # 免鉴权探活
+curl -s -H "Authorization: Bearer $(sudo tr -d '[:space:]' &lt; /opt/hy2-gateway/data/api_token)" http://127.0.0.1:8080/api/status</pre>
               </div>
             </section>
 

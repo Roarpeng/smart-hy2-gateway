@@ -313,11 +313,12 @@ class NodeParserTestCase(unittest.TestCase):
 
     # 14. sanitize_tag：保留字与冲突后缀
     def test_sanitize_tag_reserved_and_conflict(self):
-        reserved = "direct"
-        sanitized = node_parser.sanitize_tag(reserved)
-        self.assertTrue(sanitized)
-        self.assertNotEqual(sanitized, reserved)
-        self.assertNotIn(sanitized, node_parser.RESERVED_TAGS)
+        for reserved in ("direct", "auto-out", "dns-out", "diag-in", "cn-dns", "direct-dns"):
+            with self.subTest(reserved=reserved):
+                sanitized = node_parser.sanitize_tag(reserved)
+                self.assertTrue(sanitized)
+                self.assertNotEqual(sanitized, reserved)
+                self.assertNotIn(sanitized, node_parser.RESERVED_TAGS)
 
         sanitized = node_parser.sanitize_tag("node", {"node"})
         self.assertTrue(sanitized)
@@ -375,7 +376,10 @@ class NodeParserTestCase(unittest.TestCase):
             "http://192.168.1.1/sub",
             "http://10.0.0.1/sub",
             "http://169.254.169.254/latest/meta-data",
+            "http://100.64.0.1/sub",
+            "http://198.18.0.1/sub",
             "http://[::1]/sub",
+            "http://[::ffff:127.0.0.1]/sub",
             "file:///etc/passwd",
             "ftp://example.com/sub",
         ]
@@ -463,7 +467,7 @@ class NodeParserTestCase(unittest.TestCase):
         self.assertEqual(node["server"], "ss.example.com")
         self.assertEqual(node["port"], 8388)
         self.assertEqual(node["method"], "aes-256-gcm")
-        self.assertEqual(node["obfs_type"], "aes-256-gcm")
+        self.assertEqual(node["obfs_type"], "")
         self.assertEqual(node["password"], "ss-secret")
 
     def test_ss_sip002_plain_userinfo(self):

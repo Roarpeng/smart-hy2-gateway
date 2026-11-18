@@ -1,0 +1,8 @@
+[Unit]
+Description=Smart Hy2 Gateway 链路健康探测与连接自愈调度
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/hy2-gateway/scripts/link-scheduler.sh

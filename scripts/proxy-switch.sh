@@ -10,14 +10,14 @@
 #      / net.core.default_qdisc fq (fq 对 QUIC pacing 友好, Hysteria 2 出站)
 #   2. 幂等清理旧规则 (链引用 -> 链 -> ip rule -> 路由表)
 #   3. 策略路由: fwmark -> table -> local 路由回环, 截获交给 sing-box
-#   4. mangle HY2_PRE: RJ45 直连(1) -> DNS:53 劫持(2,3) -> 中国IP集(4)
-#      -> 保留网段 RETURN 绕行 -> catch-all TPROXY
-#   5. HY2_OUT 同构: UID 防回环(1) -> RJ45(2) -> DNS:53 打标(3,4)
+#   4. mangle HY2_PRE: RJ45/直连VM接口(1) -> 本机lo打标TPROXY(2) -> DNS:53 劫持(3)
+#      -> LOCAL本机地址防自劫持(4) -> 中国IP集(5) -> 保留网段 RETURN -> catch-all TPROXY
+#   5. HY2_OUT 同构: UID 防回环(1) -> RJ45/直连VM接口(2) -> DNS:53 打标(3,4)
 #      -> 中国IP集(5) -> 保留网段 -> catch-all MARK
 #      (DNS 必须先于保留网段: 网络推私网 DNS 时按保留段放行会漏出污染)
 #   6. PREROUTING 挂 HY2_PRE (转发流量/虚拟机) + OUTPUT 挂 HY2_OUT (本机)
-#   7. 确保 FORWARD 放行 VMnet 源/回程 (mangle RETURN 绕行的保留网段
-#      流量仍要过 FORWARD 链, Docker 宿主默认策略 DROP 会将其丢弃)
+#   7. 确保 HY2_FWD / HY2_NAT 子链放行 VMnet 源/回程与 MASQUERADE (mangle RETURN
+#      绕行的保留网段与中国IP流量仍要过 FORWARD/NAT)
 #
 # off:
 #   清除全部 TProxy 规则; 并确保 VMnet -> Wi-Fi 直连通路
@@ -84,10 +84,12 @@ CHNROUTE_SET="$(pick CHNROUTE_SET chnroute_set hy2_cn)"
 RESERVED_NETS=(
     0.0.0.0/8
     10.0.0.0/8
+    100.64.0.0/10
     127.0.0.0/8
     169.254.0.0/16
     172.16.0.0/12
     192.168.0.0/16
+    198.18.0.0/15
     224.0.0.0/4
     240.0.0.0/4
 )
@@ -147,32 +149,79 @@ cleanup_tproxy() {
     ipx route flush table "$TABLE"
 }
 
+# 解析 vm_uplinks 列表, 每行输出 "<vm_iface>|<bind>|<subnet>"
+# 优先级: 环境变量 VM_UPLINKS_JSON > STATE_FILE .vm_uplinks > 单条默认 (VMNET_IFACE|managed|VMNET_SUBNET)
+get_vm_uplinks() {
+    local lines=""
+    if command -v jq >/dev/null 2>&1; then
+        if [[ -n "${VM_UPLINKS_JSON:-}" ]]; then
+            lines="$(printf '%s' "$VM_UPLINKS_JSON" | jq -r '
+                if (type == "array") and (length > 0) then
+                    .[] | select(type == "object") | [(.vm_iface // "" | tostring), (.bind // "managed" | tostring), (.subnet // "" | tostring)] | join("|")
+                else empty end
+            ' 2>/dev/null || true)"
+        elif [[ -r "$STATE_FILE" ]]; then
+            lines="$(jq -r '
+                if (type == "object") and (.vm_uplinks | type == "array") and (.vm_uplinks | length > 0) then
+                    .vm_uplinks[] | select(type == "object") | [(.vm_iface // "" | tostring), (.bind // "managed" | tostring), (.subnet // "" | tostring)] | join("|")
+                else empty end
+            ' "$STATE_FILE" 2>/dev/null || true)"
+        fi
+    fi
+    if [[ -z "$lines" ]]; then
+        printf '%s|%s|%s\n' "$VMNET_IFACE" "managed" "$VMNET_SUBNET"
+    else
+        printf '%s\n' "$lines"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # 确保 VMnet 转发直连通路 (on/off 两态都调用):
 #   - off 态: Host-Only 虚拟机直连上网的必经路径
 #   - on 态 : mangle RETURN 绕行的流量仍要走 FORWARD 转发 —— 除保留网段外,
 #             内核层中国 IP 直连 (hy2_cn) 启用后, VM 的国内公网流量也走
-#             这条路径, 而 RETURN 出来的包源地址仍是 192.168.100.x 私网,
+#             这条路径, 而 RETURN 出来的包源地址仍是私网地址,
 #             没有 SNAT 会被上游路由器直接丢弃 (表现为 VM 国内流量黑洞)
+#   - 统一收敛至自定义子链 HY2_FWD (filter) 与 HY2_NAT (nat), 每次刷新先
+#     清空子链再按当前 vm_uplinks 重建, 彻底消除换网卡/子网后的旧规则残留。
 # ---------------------------------------------------------------------------
 ensure_forward_rules() {
-    if ! iptables -C FORWARD -s "$VMNET_SUBNET" -j ACCEPT 2>/dev/null; then
-        run_warn "添加 FORWARD ACCEPT (-s $VMNET_SUBNET)" \
-            iptables -A FORWARD -s "$VMNET_SUBNET" -j ACCEPT
+    ipt -N HY2_FWD
+    ipt -F HY2_FWD
+    if ! iptables -C FORWARD -j HY2_FWD 2>/dev/null; then
+        run_warn "挂载 FORWARD -> HY2_FWD" \
+            iptables -A FORWARD -j HY2_FWD
     fi
-    # 回程放行: 仅放行 -s 方向会挡掉虚拟机流量的回包
-    if ! iptables -C FORWARD -d "$VMNET_SUBNET" -o "$VMNET_IFACE" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; then
-        run_warn "添加 FORWARD ACCEPT 回程 (-d $VMNET_SUBNET -o $VMNET_IFACE)" \
-            iptables -A FORWARD -d "$VMNET_SUBNET" -o "$VMNET_IFACE" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    ipt -t nat -N HY2_NAT
+    ipt -t nat -F HY2_NAT
+    if ! iptables -t nat -C POSTROUTING -j HY2_NAT 2>/dev/null; then
+        run_warn "挂载 POSTROUTING -> HY2_NAT" \
+            iptables -t nat -A POSTROUTING -j HY2_NAT
     fi
-    # SNAT: 所有被 mangle RETURN 放行、经 FORWARD 转发出 $WIFI_DEV 的 VM
-    # 流量 (保留网段 + 中国 IP 内核直连) 都需要伪装成宿主地址才能回包;
-    # 代理 on 时同样必须 —— sing-box 处理的流量自带源地址, 与此规则无关,
-    # 但内核直连绕行的流量只有这一条 NAT 出路
-    if ! iptables -t nat -C POSTROUTING -s "$VMNET_SUBNET" -o "$WIFI_DEV" -j MASQUERADE 2>/dev/null; then
-        run_warn "添加 MASQUERADE ($VMNET_SUBNET -> $WIFI_DEV)" \
-            iptables -t nat -A POSTROUTING -s "$VMNET_SUBNET" -o "$WIFI_DEV" -j MASQUERADE
-    fi
+
+    # 顺带清理可能遗留在 FORWARD 和 POSTROUTING 顶层的旧版非子链规则
+    iptables -D FORWARD -s "$VMNET_SUBNET" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -d "$VMNET_SUBNET" -o "$VMNET_IFACE" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    iptables -t nat -D POSTROUTING -s "$VMNET_SUBNET" -o "$WIFI_DEV" -j MASQUERADE 2>/dev/null || true
+
+    local vm_iface bind subnet out_dev
+    while IFS='|' read -r vm_iface bind subnet; do
+        [[ -n "$subnet" && -n "$vm_iface" ]] || continue
+        if [[ "$bind" == "direct" ]]; then
+            out_dev="$RJ45_DEV"
+        else
+            out_dev="$WIFI_DEV"
+        fi
+        run_warn "添加 HY2_FWD ACCEPT (-s $subnet)" \
+            iptables -A HY2_FWD -s "$subnet" -j ACCEPT
+        run_warn "添加 HY2_FWD ACCEPT 回程 (-d $subnet -o $vm_iface)" \
+            iptables -A HY2_FWD -d "$subnet" -o "$vm_iface" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        if [[ -n "$out_dev" ]]; then
+            run_warn "添加 HY2_NAT MASQUERADE ($subnet -> $out_dev)" \
+                iptables -t nat -A HY2_NAT -s "$subnet" -o "$out_dev" -j MASQUERADE
+        fi
+    done < <(get_vm_uplinks)
 }
 
 # ---------------------------------------------------------------------------
@@ -199,71 +248,163 @@ do_on() {
     run_warn "ip route add local default (table $TABLE)" \
         ip route add local 0.0.0.0/0 dev lo table "$TABLE"
 
-    # 4. mangle 自定义链
-    ipt -t mangle -N HY2_PRE
-    ipt -t mangle -N HY2_OUT
+    # 收集 bind == "direct" 的 VM 接口 (去重且排除与 RJ45_DEV 同名)
+    local direct_vm_ifaces=()
+    local vm_iface bind subnet seen d_if
+    while IFS='|' read -r vm_iface bind subnet; do
+        if [[ "$bind" == "direct" && -n "$vm_iface" && "$vm_iface" != "$RJ45_DEV" ]]; then
+            seen=0
+            for d_if in "${direct_vm_ifaces[@]+"${direct_vm_ifaces[@]}"}"; do
+                [[ "$d_if" == "$vm_iface" ]] && { seen=1; break; }
+            done
+            [[ "$seen" -eq 0 ]] && direct_vm_ifaces+=("$vm_iface")
+        fi
+    done < <(get_vm_uplinks)
 
-    # 5. HY2_PRE (PREROUTING, 虚拟机/转发流量) —— 固定顺序:
-    #    RJ45(1) -> DNS(2,3) -> 中国IP集(4) -> 保留网段 -> catch-all TPROXY
-    # 5.1 通道A 有线硬直连
-    ipt -t mangle -A HY2_PRE -i "$RJ45_DEV" -j RETURN
-
-    # 5.2 DNS 端口劫持 (必须先于保留网段 RETURN):
-    #     网络环境可能把 DHCP DNS 推成路由器/私网地址 (实测 10.x), 按保留
-    #     网段放行的话明文查询根本到不了 sing-box, 直漏上游被污染
-    #     (换网即复发: gemini 解析到轮换假 IP)。53 端口一律进 TProxy,
-    #     由 sing-box 端口级规则移交拆分 DNS 干净应答
-    ipt -t mangle -A HY2_PRE -p udp --dport 53 -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
-    ipt -t mangle -A HY2_PRE -p tcp --dport 53 -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
-
-    # 5.3 内核层中国 IP 直连: 目的地命中 $CHNROUTE_SET 的流量在 mangle 层
-    #     直接 RETURN, 省去"进 sing-box 用户态再按 geoip-cn 判回直连"一跳;
-    #     必须排在 DNS 劫持之后 —— 否则发往国内 DNS 的查询会被内核放行,
-    #     再次绕过劫持。集合缺失仅告警回落 sing-box 判定, 不中断。
-    #     位置固定第 4 条 (ruleset-update.sh 与后端 ensure 逻辑同位插入);
-    #     元素由后端启动/每周 ruleset-update 重建, swap 原子换表即时生效;
-    #     本脚本只做只读匹配, 绝不 create/destroy/flush 该集合。
+    local CN_SET_OK=0
     if command -v ipset >/dev/null 2>&1 && ipset list "$CHNROUTE_SET" >/dev/null 2>&1; then
-        ipt -t mangle -A HY2_PRE -m set --match-set "$CHNROUTE_SET" dst -j RETURN
         CN_SET_OK=1
     else
         log "WARN: ipset $CHNROUTE_SET 不存在, 中国 IP 直连回落 sing-box 判定 (后端启动时会自动重建)"
     fi
 
-    # 5.4 目的地为保留网段 -> RETURN 绕行 (本机/VMnet 访问局域网不进隧道)
-    local net
-    for net in "${RESERVED_NETS[@]}"; do
-        ipt -t mangle -A HY2_PRE -d "$net" -j RETURN
-    done
+    # 4-6. 构建 HY2_PRE 与 HY2_OUT 规则:
+    #      优先尝试 iptables-restore --noflush 原子灌入 mangle 表;
+    #      若不可用或执行失败则无缝回退到逐条 ipt 命令。
+    local restored=0 net
+    if command -v iptables-restore >/dev/null 2>&1 && \
+       [[ "$(dirname "$(command -v iptables 2>/dev/null || echo /sbin/iptables)")" == "$(dirname "$(command -v iptables-restore 2>/dev/null || echo /sbin/iptables-restore)")" ]]; then
+        local restore_buf="*mangle"$'\n'
+        restore_buf+=":HY2_PRE - [0:0]"$'\n'
+        restore_buf+=":HY2_OUT - [0:0]"$'\n'
+        restore_buf+="-F HY2_PRE"$'\n'
+        restore_buf+="-F HY2_OUT"$'\n'
+        # HY2_PRE 顺序:
+        # 1) RJ45 与 direct VM 接口直连
+        if [[ -n "$RJ45_DEV" ]]; then
+            restore_buf+="-A HY2_PRE -i $RJ45_DEV -j RETURN"$'\n'
+        fi
+        for d_if in "${direct_vm_ifaces[@]+"${direct_vm_ifaces[@]}"}"; do
+            restore_buf+="-A HY2_PRE -i $d_if -j RETURN"$'\n'
+        done
+        # 2) 优先拦截 HY2_OUT 打标送回 lo 的本机流量
+        restore_buf+="-A HY2_PRE -i lo -p tcp -m mark --mark $FWMARK -j TPROXY --on-port $TPROXY_PORT --tproxy-mark $FWMARK"$'\n'
+        restore_buf+="-A HY2_PRE -i lo -p udp -m mark --mark $FWMARK -j TPROXY --on-port $TPROXY_PORT --tproxy-mark $FWMARK"$'\n'
+        # 3) DNS:53 劫持 (先于保留网段和 LOCAL 放行)
+        restore_buf+="-A HY2_PRE -p udp --dport 53 -j TPROXY --on-port $TPROXY_PORT --tproxy-mark $FWMARK"$'\n'
+        restore_buf+="-A HY2_PRE -p tcp --dport 53 -j TPROXY --on-port $TPROXY_PORT --tproxy-mark $FWMARK"$'\n'
+        # 4) 本机地址防自劫持 (消除 CGNAT/公网 IP 下外部回包被 catch-all TPROXY 误劫持)
+        restore_buf+="-A HY2_PRE -m addrtype --dst-type LOCAL -j RETURN"$'\n'
+        # 5) 内核层中国 IP 直连
+        if [[ "$CN_SET_OK" -eq 1 ]]; then
+            restore_buf+="-A HY2_PRE -m set --match-set $CHNROUTE_SET dst -j RETURN"$'\n'
+        fi
+        # 6) 保留网段绕行
+        for net in "${RESERVED_NETS[@]}"; do
+            restore_buf+="-A HY2_PRE -d $net -j RETURN"$'\n'
+        done
+        # 7) Catch-all TPROXY
+        restore_buf+="-A HY2_PRE -p tcp -j TPROXY --on-port $TPROXY_PORT --tproxy-mark $FWMARK"$'\n'
+        restore_buf+="-A HY2_PRE -p udp -j TPROXY --on-port $TPROXY_PORT --tproxy-mark $FWMARK"$'\n'
 
-    # 5.5 catch-all: 其余全部交给 sing-box
-    ipt -t mangle -A HY2_PRE -p tcp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
-    ipt -t mangle -A HY2_PRE -p udp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
-    ipt -t mangle -A PREROUTING -j HY2_PRE
+        # HY2_OUT 顺序:
+        # 1) UID 防回环 (首条)
+        restore_buf+="-A HY2_OUT -m owner --uid-owner $SINGBOX_UID -j RETURN"$'\n'
+        # 2) RJ45 与 direct VM 接口直连
+        if [[ -n "$RJ45_DEV" ]]; then
+            restore_buf+="-A HY2_OUT -o $RJ45_DEV -j RETURN"$'\n'
+        fi
+        for d_if in "${direct_vm_ifaces[@]+"${direct_vm_ifaces[@]}"}"; do
+            restore_buf+="-A HY2_OUT -o $d_if -j RETURN"$'\n'
+        done
+        # 3) DNS:53 先于保留网段打标
+        restore_buf+="-A HY2_OUT -p udp --dport 53 -j MARK --set-mark $FWMARK"$'\n'
+        restore_buf+="-A HY2_OUT -p tcp --dport 53 -j MARK --set-mark $FWMARK"$'\n'
+        # 4) 内核层中国 IP 直连
+        if [[ "$CN_SET_OK" -eq 1 ]]; then
+            restore_buf+="-A HY2_OUT -m set --match-set $CHNROUTE_SET dst -j RETURN"$'\n'
+        fi
+        # 5) 保留网段绕行
+        for net in "${RESERVED_NETS[@]}"; do
+            restore_buf+="-A HY2_OUT -d $net -j RETURN"$'\n'
+        done
+        # 6) Catch-all 打标
+        restore_buf+="-A HY2_OUT -p tcp -j MARK --set-mark $FWMARK"$'\n'
+        restore_buf+="-A HY2_OUT -p udp -j MARK --set-mark $FWMARK"$'\n'
+        restore_buf+="COMMIT"$'\n'
 
-    # 6. HY2_OUT (OUTPUT, 本机流量) —— 固定顺序:
-    #    UID 防回环(1) -> RJ45(2) -> DNS(3,4) -> 中国IP集(5) -> 保留网段 -> catch-all MARK
-    ipt -t mangle -A HY2_OUT -o "$RJ45_DEV" -j RETURN
-    # 6.1 DNS 先于保留网段打标 (理由同 5.2: 私网 DNS 也要进拆分 DNS)
-    ipt -t mangle -A HY2_OUT -p udp --dport 53 -j MARK --set-mark "$FWMARK"
-    ipt -t mangle -A HY2_OUT -p tcp --dport 53 -j MARK --set-mark "$FWMARK"
-    # 6.2 内核层中国 IP 直连 (位置固定第 5 条, 与 ensure 逻辑一致)
-    if [[ "${CN_SET_OK:-0}" -eq 1 ]]; then
-        ipt -t mangle -A HY2_OUT -m set --match-set "$CHNROUTE_SET" dst -j RETURN
+        if printf '%s' "$restore_buf" | iptables-restore --noflush 2>/dev/null; then
+            restored=1
+        fi
     fi
-    # 6.3 保留网段绕行
-    for net in "${RESERVED_NETS[@]}"; do
-        ipt -t mangle -A HY2_OUT -d "$net" -j RETURN
-    done
-    # 6.4 catch-all 打标, 由策略路由送回本机 TProxy
-    ipt -t mangle -A HY2_OUT -p tcp -j MARK --set-mark "$FWMARK"
-    ipt -t mangle -A HY2_OUT -p udp -j MARK --set-mark "$FWMARK"
 
-    # 6.5 回环防护 (必须保持为 HY2_OUT 首条规则):
-    #     sing-box 以 UID 930 运行, 其自身出站 (含 cn-dns 上游查询) 若再被
-    #     OUTPUT 劫持会形成 "sing-box -> TProxy -> sing-box -> ..." 死循环
-    ipt -t mangle -I HY2_OUT 1 -m owner --uid-owner "$SINGBOX_UID" -j RETURN
-    ipt -t mangle -A OUTPUT -j HY2_OUT
+    if [[ "$restored" -eq 0 ]]; then
+        # 回退路径: 逐条 ipt 命令构建 HY2_PRE 与 HY2_OUT
+        ipt -t mangle -N HY2_PRE
+        ipt -t mangle -N HY2_OUT
+
+        # 5.1 通道A 有线硬直连 & direct VM 接口直连
+        if [[ -n "$RJ45_DEV" ]]; then
+            ipt -t mangle -A HY2_PRE -i "$RJ45_DEV" -j RETURN
+        fi
+        for d_if in "${direct_vm_ifaces[@]+"${direct_vm_ifaces[@]}"}"; do
+            ipt -t mangle -A HY2_PRE -i "$d_if" -j RETURN
+        done
+
+        # 5.2 优先拦截 HY2_OUT 打标送回 lo 的本机流量
+        ipt -t mangle -A HY2_PRE -i lo -p tcp -m mark --mark "$FWMARK" -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
+        ipt -t mangle -A HY2_PRE -i lo -p udp -m mark --mark "$FWMARK" -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
+
+        # 5.3 DNS 端口劫持 (必须先于保留网段和 LOCAL 放行)
+        ipt -t mangle -A HY2_PRE -p udp --dport 53 -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
+        ipt -t mangle -A HY2_PRE -p tcp --dport 53 -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
+
+        # 5.4 本机地址防自劫持 (外部发往宿主自身 IP 的回包直接交回本机 socket)
+        ipt -t mangle -A HY2_PRE -m addrtype --dst-type LOCAL -j RETURN
+
+        # 5.5 内核层中国 IP 直连
+        if [[ "$CN_SET_OK" -eq 1 ]]; then
+            ipt -t mangle -A HY2_PRE -m set --match-set "$CHNROUTE_SET" dst -j RETURN
+        fi
+
+        # 5.6 目的地为保留网段 -> RETURN 绕行
+        for net in "${RESERVED_NETS[@]}"; do
+            ipt -t mangle -A HY2_PRE -d "$net" -j RETURN
+        done
+
+        # 5.7 catch-all: 其余全部交给 sing-box
+        ipt -t mangle -A HY2_PRE -p tcp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
+        ipt -t mangle -A HY2_PRE -p udp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
+
+        # 6. HY2_OUT (OUTPUT, 本机流量)
+        if [[ -n "$RJ45_DEV" ]]; then
+            ipt -t mangle -A HY2_OUT -o "$RJ45_DEV" -j RETURN
+        fi
+        for d_if in "${direct_vm_ifaces[@]+"${direct_vm_ifaces[@]}"}"; do
+            ipt -t mangle -A HY2_OUT -o "$d_if" -j RETURN
+        done
+        # 6.1 DNS 先于保留网段打标
+        ipt -t mangle -A HY2_OUT -p udp --dport 53 -j MARK --set-mark "$FWMARK"
+        ipt -t mangle -A HY2_OUT -p tcp --dport 53 -j MARK --set-mark "$FWMARK"
+        # 6.2 内核层中国 IP 直连
+        if [[ "$CN_SET_OK" -eq 1 ]]; then
+            ipt -t mangle -A HY2_OUT -m set --match-set "$CHNROUTE_SET" dst -j RETURN
+        fi
+        # 6.3 保留网段绕行
+        for net in "${RESERVED_NETS[@]}"; do
+            ipt -t mangle -A HY2_OUT -d "$net" -j RETURN
+        done
+        # 6.4 catch-all 打标, 由策略路由送回本机 TProxy
+        ipt -t mangle -A HY2_OUT -p tcp -j MARK --set-mark "$FWMARK"
+        ipt -t mangle -A HY2_OUT -p udp -j MARK --set-mark "$FWMARK"
+
+        # 6.5 回环防护 (必须保持为 HY2_OUT 首条规则)
+        ipt -t mangle -I HY2_OUT 1 -m owner --uid-owner "$SINGBOX_UID" -j RETURN
+    fi
+
+    # 幂等确保 PREROUTING -> HY2_PRE 与 OUTPUT -> HY2_OUT 挂载在位
+    iptables -t mangle -C PREROUTING -j HY2_PRE 2>/dev/null || ipt -t mangle -A PREROUTING -j HY2_PRE
+    iptables -t mangle -C OUTPUT -j HY2_OUT 2>/dev/null || ipt -t mangle -A OUTPUT -j HY2_OUT
 
     # 9. FORWARD 放行 (见 ensure_forward_rules 注释: RETURN 绕行流量所需)
     ensure_forward_rules
@@ -341,6 +482,8 @@ do_status() {
         iptables -t mangle -C HY2_PRE -i "$RJ45_DEV" -j RETURN
     report "RJ45 硬直连: HY2_OUT -o $RJ45_DEV RETURN" \
         iptables -t mangle -C HY2_OUT -o "$RJ45_DEV" -j RETURN
+    report "本机地址防自劫持: HY2_PRE -m addrtype --dst-type LOCAL RETURN" \
+        iptables -t mangle -C HY2_PRE -m addrtype --dst-type LOCAL -j RETURN
     report "TCP TPROXY -> :$TPROXY_PORT" \
         iptables -t mangle -C HY2_PRE -p tcp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
     report "UDP TPROXY -> :$TPROXY_PORT" \
@@ -384,12 +527,28 @@ do_status() {
         iptables -t mangle -C HY2_OUT -m set --match-set "$CHNROUTE_SET" dst -j RETURN
     echo
     echo "--- 直连通路 (off 态保障) ---"
-    report "MASQUERADE $VMNET_SUBNET -> $WIFI_DEV" \
-        iptables -t nat -C POSTROUTING -s "$VMNET_SUBNET" -o "$WIFI_DEV" -j MASQUERADE
-    report "FORWARD ACCEPT -s $VMNET_SUBNET" \
-        iptables -C FORWARD -s "$VMNET_SUBNET" -j ACCEPT
-    report "FORWARD ACCEPT 回程 -d $VMNET_SUBNET -o $VMNET_IFACE" \
-        iptables -C FORWARD -d "$VMNET_SUBNET" -o "$VMNET_IFACE" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    report "自定义链 HY2_FWD" iptables -L HY2_FWD
+    report "FORWARD 挂载 HY2_FWD" iptables -C FORWARD -j HY2_FWD
+    report "自定义链 HY2_NAT" iptables -t nat -L HY2_NAT
+    report "POSTROUTING 挂载 HY2_NAT" iptables -t nat -C POSTROUTING -j HY2_NAT
+    if iptables -t nat -C HY2_NAT -s "$VMNET_SUBNET" -o "$WIFI_DEV" -j MASQUERADE >/dev/null 2>&1 || \
+       iptables -t nat -C POSTROUTING -s "$VMNET_SUBNET" -o "$WIFI_DEV" -j MASQUERADE >/dev/null 2>&1; then
+        printf '[在] %s\n' "MASQUERADE $VMNET_SUBNET -> $WIFI_DEV"
+    else
+        printf '[无] %s\n' "MASQUERADE $VMNET_SUBNET -> $WIFI_DEV"
+    fi
+    if iptables -C HY2_FWD -s "$VMNET_SUBNET" -j ACCEPT >/dev/null 2>&1 || \
+       iptables -C FORWARD -s "$VMNET_SUBNET" -j ACCEPT >/dev/null 2>&1; then
+        printf '[在] %s\n' "FORWARD ACCEPT -s $VMNET_SUBNET"
+    else
+        printf '[无] %s\n' "FORWARD ACCEPT -s $VMNET_SUBNET"
+    fi
+    if iptables -C HY2_FWD -d "$VMNET_SUBNET" -o "$VMNET_IFACE" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 || \
+       iptables -C FORWARD -d "$VMNET_SUBNET" -o "$VMNET_IFACE" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1; then
+        printf '[在] %s\n' "FORWARD ACCEPT 回程 -d $VMNET_SUBNET -o $VMNET_IFACE"
+    else
+        printf '[无] %s\n' "FORWARD ACCEPT 回程 -d $VMNET_SUBNET -o $VMNET_IFACE"
+    fi
     echo
     echo "--- 内核参数 ---"
     printf 'net.ipv4.ip_forward       = %s\n' "$(sysctl_value net.ipv4.ip_forward)"
